@@ -1,3 +1,6 @@
+import { originalImplementationMatches } from '../domain/implementation-authority.js';
+import { oracleDigest } from '../oracle/source-evidence.js';
+import { activeNativeLead, nativeLeadReentry, nativeLeadStopped, unresolvedNativeLead, type NativeLeadBoundary } from '../oracle/native-lead.js';
 import { initiateNativeMerge, observeNativeMerge, type NativeMergeHost, type MergeContext } from './merge.js';
 import {
   GOVERNED_PUBLICATION_REENTRY_ACTION,
@@ -20,6 +23,7 @@ import { activeHostedPolicyIdentity, activeLocalPolicyIdentity, applyTransition,
 import { isValidationResultCoherent } from '../domain/validation.js';
 import type { AgentResult, ExecutorIdentity, HostedValidationEvidence, LocalValidationEvidence, Run, Target, ValidationResult } from '../domain/types.js';
 import {
+  appendRunTelemetryEvents,
   createCompletionInputFromResult,
   recordCompletionTelemetry,
   recordSpawnTelemetry,
@@ -28,7 +32,7 @@ import {
 } from '../domain/telemetry.js';
 import { CANCEL_RUN_DECISION, LIVE_HEAD_SYNC_DECISION, REESTABLISH_READINESS_DECISION } from '../domain/decisions.js';
 import { runReviewLoop } from '../reviewers/loop.js';
-import { nativeReviewReentry, parkNativeReview } from '../oracle/native-reviewer.js';
+import { nativeReviewReentry, parkNativeReview, unresolvedNativeReview, nativeReviewWaitKind, historicalReviewUncertainty, settledHistoricalReviewGate } from '../oracle/native-reviewer.js';
 import type { ResolvedExecutionConfiguration } from '../execution-profiles.js';
 import { activeRepairAdmission, generationlessAppServerPredecessor, resolveRepairPredecessor, unfinishedBoundRepairAttempt, type RepairAdmissionSnapshot } from '../domain/repair-admission.js';
 import type { RunStore } from '../store/json-file-store.js';
@@ -110,6 +114,7 @@ function lunaPacketInput(
       evidenceStatus: kind === 'review-repair'
         ? run.reviewResult?.verdict === 'request_changes' ? 'request_changes' : 'failed'
         : run.validationResult?.status === 'failed' ? 'failed' : 'request_changes',
+      ...(activeRepairAdmission(run)?.snapshot.leadDisposition === undefined ? {} : {leadDisposition:activeRepairAdmission(run)!.snapshot.leadDisposition}),
       blockingFindings: validationRepair
         ? []
         : (run.reviewResult?.findings ?? []).filter((finding) => finding.severity === 'blocking')
@@ -120,6 +125,7 @@ function lunaPacketInput(
 
 export interface WorkflowDependencies {
   readonly nativeMergeHost?: NativeMergeHost;
+  readonly nativeLead?: NativeLeadBoundary;
   readonly store: RunStore;
   readonly github: GitHubAdapter;
   readonly implementation: ImplementationAgent;
@@ -137,6 +143,7 @@ export interface WorkflowDependencies {
 }
 
 export interface WorkflowOptions {
+  readonly admittedRun?: Run;
   /** Bounded review attempts before the loop escalates to NEEDS_HUMAN. */
   readonly maxReviewAttempts: number;
   readonly now?: () => string;
@@ -145,11 +152,25 @@ export interface WorkflowOptions {
   /** Called immediately before a model, reviewer, or other delegated execution boundary. */
   readonly onExecutionStart?: () => void;
   readonly assertReviewClaim?: (run: Run) => Promise<void>;
+  readonly assertLeadInitiation?: (run: Run) => Promise<void>;
+  readonly leadObservationOnly?: boolean;
+  readonly nativeCachedOnly?: boolean;
+  readonly nativeRecoveryDecisionOnly?: boolean;
+  readonly withNativeEffectBoundary?: <T>(operation:()=>T)=>T;
+  readonly leadRecoveryConfiguration?: import('../dispatch/config.js').DispatchConfiguration;
   readonly assertMergeInitiation?: (run: Run) => Promise<void>;
   readonly withMergeBoundary?: <T>(operation: () => Promise<T>) => Promise<T>;
   readonly onMergeSubmission?: () => void;
   /** Host admission capability enforced at mutation and publication boundaries. */
   readonly admissionFence?: { readonly registry: MissionAdmissionRegistry; readonly token: AdmissionToken; readonly productionMissionId: string; readonly executionWorkspace?: string };
+}
+
+function assertNativeRepairExecution(run:Run,deps:WorkflowDependencies,options:WorkflowOptions,snapshot?:GitHubLiveSnapshot):void {
+  const receipt=activeRepairAdmission(run)?.snapshot;
+  if(receipt?.leadDisposition) {
+    const owner=options.admissionFence===undefined?undefined:{missionId:options.admissionFence.productionMissionId,laneId:options.admissionFence.token.laneId,generation:options.admissionFence.token.generation};
+    if(oracleDigest(deps.resolveRepairExecutionProfile?.(receipt.executionProfile))!==oracleDigest(receipt.execution) || !isValidationFresh(run,activeValidationConfiguration(deps)) || !snapshot || !deps.reviewer.native?.validate({run,snapshot,owner,assertCurrent:()=>assertPublicationAdmission(options)}) || !deps.nativeLead?.validate({run,snapshot,owner,assertCurrent:()=>assertPublicationAdmission(options),store:deps.store,now:()=>new Date().toISOString(),execution:receipt.execution,maxAttempts:receipt.leadDisposition.identity.repairLimit,onSubmission:r=>r,consumed:receipt.leadDisposition})) throw new ExecutionAdmissionRefusal('Native repair current execution/review/lead/validation authority changed before worker/publication.',false);
+  }
 }
 
 function runAdmissionEvidence(run: Run, additional: { readonly pullRequest?: number; readonly workspace?: string } = {}): MissionEvidence {
@@ -577,6 +598,7 @@ export async function runWorkflow(
 
   const loaded = store.read(runId);
   if (loaded === null) throw new Error(`No run with id "${runId}" found.`);
+  if (options.admittedRun && JSON.stringify(loaded) !== JSON.stringify(options.admittedRun)) throw new ExecutionAdmissionRefusal('Run changed after exact operation-owned admission.', false);
   let run: Run = loaded;
   run = withRunTelemetryThresholds(run, options.telemetryThresholds ?? {});
   if (!updateIfCurrent(store, loaded, run)) {
@@ -595,9 +617,96 @@ export async function runWorkflow(
   // Issued attempts recover independently of reviewer/config availability and
   // never re-enter implementation, review, validation or merge submission.
   if (run.mergeAttempt?.submissionPossible) return { outcome: 'merge_ready', run: await observeNativeMerge(mergeContext(run)) };
+  const historicalGateRecovery=historicalReviewUncertainty(run);
+  const historicalGateObservation=historicalGateRecovery && run.nativeReview?.wait?.kind!=='qualification';
+  const historicalReviewWait = (current: Run, reason: string): Run => current.state === 'WAITING_DEPENDENCY'
+    ? {...current,nativeReview:{...current.nativeReview!,wait:{kind:current.nativeReview?.wait?.kind==='qualification'?'qualification' as const:nativeReviewWaitKind(current),nextAttemptAt:new Date(Date.parse(now())+30_000).toISOString()}}}
+    : parkNativeReview(current,nativeReviewWaitKind(current),reason,now());
+  const revalidateHistoricalGate = (current: Run): Run => {
+    const gate = current.state === 'MERGE_READY' ? applyTransition(current, {type:'recheck_readiness'}, now()) : current;
+    const refreshed = applyTransition(gate, {type:'revalidate',reason:'Historical Oracle uncertainty settled; fresh validation and current review qualification are required.'}, now());
+    // Ordinary revalidate may reuse same-policy local checks. Historical
+    // recovery instead requires a new validation observation.
+    const {validationResult: _historicalValidation, ...withoutHistoricalValidation} = refreshed;
+    return {...withoutHistoricalValidation,nativeReview:{...current.nativeReview!,wait:undefined}};
+  };
+  // One configured recovery decision owns only remote evidence. Even a complete
+  // response must return before verdict adoption, repair admission or publication.
+  if(options.nativeRecoveryDecisionOnly) {
+    const snapshot=await github.readLiveSnapshot(target);
+    const context={run,snapshot,store,now,assertCurrent:()=>assertPublicationAdmission(options),assertLiveClaim:options.assertReviewClaim===undefined?undefined:()=>options.assertReviewClaim!(store.read(run.id)??run),
+      ...(options.admissionFence===undefined?{}:{owner:{missionId:options.admissionFence.productionMissionId,laneId:options.admissionFence.token.laneId,generation:options.admissionFence.token.generation}}),
+      withIssueBoundary:options.withMergeBoundary,assertInitiation:options.assertLeadInitiation===undefined?undefined:()=>options.assertLeadInitiation!(store.read(run.id)??run),recoveryConfiguration:options.leadRecoveryConfiguration,
+      onSubmission:(current:Run)=>{
+        options.onExecutionStart?.();
+        if(!unresolvedNativeLead(current))return recordSpawnTelemetry(current,{role:'reviewer',attemptKind:'review',headSha:current.headSha,contextMode:'bounded',contextJustification:'live-target-bounded'},now()).run;
+        const identity=activeNativeLead(current)!.identity,invocationId=`spawn:lead:${identity.requestId}`;
+        return appendRunTelemetryEvents(current,[{id:invocationId,invocationId,kind:'spawn',at:now(),role:'lead',attemptKind:'lead',attempt:(current.telemetry?.events.filter(e=>e.kind==='spawn'&&e.role==='lead').length??0)+1,headSha:identity.headSha,provider:'native-lead',model:identity.requestedModel,reasoningEffort:identity.requestedEffort,profile:null,contextMode:'bounded',contextJustification:'live-target-bounded'}]);
+      }};
+    const attention=(current:Run,role:'lead'|'review',reason:string):WorkflowOutcome=>{
+      const wait={kind:'qualification' as const,nextAttemptAt:new Date(Date.parse(now())+30_000).toISOString()};
+      const next=role==='lead'?{...current,nativeLead:{...current.nativeLead!,wait}}:{...current,nativeReview:{...current.nativeReview!,wait}};
+      if(!updateIfCurrent(store,current,next))return staleWorkflowOutcome(current.id,current,store,'Run changed before recovery decision attention.');
+      return {outcome:'waiting_dependency',run:next,reason};
+    };
+    if(!context.assertInitiation || !context.withIssueBoundary || !context.assertLiveClaim || !isValidationFresh(run,activeValidationConfiguration(deps)))
+      return attention(run,unresolvedNativeLead(run)?'lead':'review','Qualified recovery decision requires current owner/claim/HOLD and validation authority.');
+    if(deps.nativeLead?.canRecover?.(run,now())) {
+      const active=activeNativeLead(run)!;
+      const execution=deps.resolveRepairExecutionProfile?.('routine');
+      if(!execution || oracleDigest(execution)!==oracleDigest(run.execution))return attention(run,'lead','Qualified recovery execution is unavailable or changed.');
+      const result=await deps.nativeLead.advance({...context,execution,maxAttempts:active.identity.repairLimit});
+      if(result.outcome==='wait' && result.run.nativeLead?.activeRequestId===active.identity.requestId && oracleDigest(result.run.nativeLead.requests)===oracleDigest(run.nativeLead!.requests))return attention(result.run,'lead',result.reason);
+      return {outcome:'waiting_dependency',run:result.run,reason:'Qualified lead recovery decision finished; fresh reentry is required before any repair.'};
+    }
+    if(reviewer.native?.canRecover?.(run,now())) {
+      const original=run.nativeReview?.activeRequestId;
+      const result=await reviewer.native.advance(context);
+      if(result.outcome==='wait' && result.run.nativeReview?.activeRequestId===original && oracleDigest(result.run.nativeReview!.requests)===oracleDigest(run.nativeReview!.requests))return attention(result.run,'review',result.reason);
+      return {outcome:'waiting_dependency',run:result.run,reason:'Qualified Oracle recovery decision finished; fresh reentry is required before verdict adoption.'};
+    }
+    return {outcome:'waiting_dependency',run,reason:'Qualified recovery decision is no longer eligible.'};
+  }
+  if (options.leadObservationOnly || unresolvedNativeLead(run) && !(run.state==='CHANGES_REQUESTED' || run.state==='WAITING_DEPENDENCY' && run.interruptedFrom==='CHANGES_REQUESTED')) {
+    const snapshot=await github.readLiveSnapshot(run.target);
+    const context=(current:Run)=>({run:current,snapshot,store,now,cachedOnly:options.nativeCachedOnly || options.leadObservationOnly && (current.nativeLead?.wait?.kind==='qualification'||current.nativeLead?.wait?.kind==='stop'||current.nativeReview?.wait?.kind==='qualification'),assertCurrent:()=>assertPublicationAdmission(options),assertLiveClaim:options.assertReviewClaim===undefined?undefined:()=>options.assertReviewClaim!(current),...(options.admissionFence===undefined?{}:{owner:{missionId:options.admissionFence.productionMissionId,laneId:options.admissionFence.token.laneId,generation:options.admissionFence.token.generation}})});
+    const reasons:string[]=[];
+    if(unresolvedNativeReview(run)) {const observed=await reviewer.native?.observe?.(context(run));run=observed?.run??run;reasons.push(observed?.reason??'Qualified Oracle observation unavailable.');}
+    if(unresolvedNativeLead(run)) {const observed=await deps.nativeLead?.observe(context(run));run=observed?.run??run;reasons.push(observed?.reason??'Qualified lead observation unavailable.');}
+    if (historicalGateRecovery) {
+      const next = historicalReviewWait(run, reasons.join(' '));
+      if(!updateIfCurrent(store,run,next))return staleWorkflowOutcome(run.id,run,store,'Run changed before historical Oracle recovery wait.');run=next;
+    }
+    if(unresolvedNativeReview(run) && nativeReviewWaitKind(run)==='qualification' && run.nativeReview?.wait?.kind!=='qualification') {
+      const next={...run,nativeReview:{...run.nativeReview!,wait:{kind:'qualification' as const,nextAttemptAt:new Date(Date.parse(now())+30_000).toISOString()}}};
+      if(!updateIfCurrent(store,run,next))return staleWorkflowOutcome(run.id,run,store,'Run changed before Oracle attention wait.');run=next;
+    }
+    return {outcome:'waiting_dependency',run,reason:reasons.join(' ')||'Issued recovery permits no submission or repair.'};
+  }
+  if (historicalGateObservation) {
+    const snapshot=await github.readLiveSnapshot(run.target);
+    const observed=await reviewer.native?.observe?.({run,snapshot,store,now,assertCurrent:()=>assertPublicationAdmission(options),assertLiveClaim:options.assertReviewClaim===undefined?undefined:()=>options.assertReviewClaim!(run),...(options.admissionFence===undefined?{}:{owner:{missionId:options.admissionFence.productionMissionId,laneId:options.admissionFence.token.laneId,generation:options.admissionFence.token.generation}})});
+    run=observed?.run??run;const reason=observed?.reason??'Qualified historical Oracle observation unavailable.';
+    const parked=historicalReviewWait(run,reason);
+    if(!updateIfCurrent(store,run,parked))return staleWorkflowOutcome(run.id,run,store,'Run changed during historical Oracle observation wait.');
+    return {outcome:'waiting_dependency',run:parked,reason};
+  }
+  // Explicit resumeCommand has already applied dependency_satisfied. Its
+  // retained request marker must take the same fresh-gate path as automatic
+  // request reentry, rather than restoring a historical gate permit.
+  if ((run.state === 'FINAL_GATE' || run.state === 'MERGE_READY') &&
+    settledHistoricalReviewGate(run)) {
+    const next = revalidateHistoricalGate(run);
+    if(!updateIfCurrent(store,run,next))return staleWorkflowOutcome(run.id,run,store,'Run changed before resumed historical gate revalidation.');
+    return {outcome:'waiting_dependency',run:next,reason:'Historical gate recovery scheduled fresh validation; no cached gate authority was consumed.'};
+  }
+  if (reviewer.native && run.nativeReview?.repairLimit===undefined) {
+    const next={...run,nativeReview:{...run.nativeReview,requests:run.nativeReview?.requests ?? [],repairLimit:options.maxReviewAttempts}};
+    if(!updateIfCurrent(store,run,next))return staleWorkflowOutcome(run.id,run,store,'Run changed before native shared repair policy binding.');run=next;
+  }
   let recheckCachedReadiness = run.state === 'MERGE_READY';
   for (;;) {
-    if (reviewer.native !== undefined && (!reviewer.native.available() || options.assertReviewClaim === undefined) && ['READY', 'IMPLEMENTING', 'CHANGES_REQUESTED'].includes(run.state)) {
+    if ((reviewer.native !== undefined || run.nativeReview!==undefined || run.nativeLead!==undefined) && (!reviewer.native?.available() || options.assertReviewClaim === undefined) && ['READY', 'IMPLEMENTING', 'CHANGES_REQUESTED'].includes(run.state)) {
       const reason = 'Native review unavailable: no accepted trusted host reviewer binding; implementation and repair are waiting.';
       const parked = parkNativeReview(run, 'binding', reason, now());
       if (!updateIfCurrent(store, run, parked)) return staleWorkflowOutcome(run.id, run, store, 'Run changed before native reviewer availability wait.');
@@ -646,6 +755,10 @@ export async function runWorkflow(
         const effectiveExecution = requiresAdmittedRepair
           ? admittedRepairExecution(run, deps)
           : run.execution;
+        if (reviewer.native && !pendingRepair && effectiveExecution?.executor === 'luna-isolated' &&
+          run.implementationAuthority === undefined && run.repairTaskShapeAuthority === undefined) {
+          return park(run, 'Original admitted implementation task-shape authority is unavailable. Historical scope cannot be reconstructed from current context; no implementation packet or worker was started.', store, now, [CANCEL_RUN_DECISION]);
+        }
         if (requiresAdmittedRepair && effectiveExecution === null) {
           return park(
             run,
@@ -909,6 +1022,14 @@ export async function runWorkflow(
             return park(run, packet.reason, store, now, [CANCEL_RUN_DECISION]);
           }
           implementationPacket = packet.packet;
+          if (reviewer.native && !pendingRepair && run.implementationAuthority === undefined) {
+            if (run.agentResult !== undefined || run.executor !== undefined) return park(run, 'Original admitted implementation provenance is missing; cannot manufacture it during recovery.', store, now);
+            const pinned: Run = { ...run, implementationAuthority: { input: packetInput, taskShape: run.repairTaskShapeAuthority!, packetSha256: oracleDigest(packet.packet) } };
+            if (!updateIfCurrent(store, run, pinned)) return staleWorkflowOutcome(run.id, run, store, 'Run changed before original implementation authority admission.');
+            run = pinned;
+          }
+          if (run.implementationAuthority && !originalImplementationMatches(run, snapshot)) return park(run, 'Live scope/contract changed from the original admitted implementation.', store, now);
+          if (activeRepairAdmission(run)?.snapshot.leadDisposition && oracleDigest(implementationPacket)!==activeRepairAdmission(run)!.snapshot.packetSha256) return park(run,'Native repair packet changed after admitted preflight.',store,now);
         }
         const governedPublication = options.admissionFence === undefined
           ? undefined
@@ -1012,7 +1133,9 @@ export async function runWorkflow(
             ...(supplementalInstructions === undefined ? {} : { supplementalInstructions }),
             ...(capabilities === undefined ? {} : { capabilities }),
             ...(governedPublication === undefined ? {} : { governedPublication }),
+            ...(activeRepairAdmission(run)?.snapshot.leadDisposition===undefined?{}:{withExecutionBoundary:options.withNativeEffectBoundary}),
             beforeExecution: () => {
+              assertNativeRepairExecution(workerHandoff,deps,options,snapshot);
               assertFinalExecutionAdmission(store, workerHandoff, options);
             },
             beforePublish: () => {
@@ -1156,8 +1279,18 @@ export async function runWorkflow(
           run = failed;
           return { outcome: 'failed', run, reason: `Implementation failed: ${result.summary}` };
         }
+        if (run.implementationAuthority) {
+          const liveAuthority = await github.readLiveSnapshot(target);
+          if (!originalImplementationMatches(run, liveAuthority)) return park(run, 'Original implementation authority changed before host publication.', store, now);
+        }
         if (bootstrap !== undefined) {
           if (result.headSha === undefined || bootstrapAdapter === undefined) return bootstrapFailureAfterWorker(run, run, new Error('Implementation did not report an exact durable HEAD.'), store, now);
+          if(repairAttempt?.snapshot.leadDisposition) {
+            const fresh=await github.readLiveSnapshot(target);await options.assertReviewClaim?.(run);
+            const packet=buildImplementationPacket(lunaPacketInput(run,target,fresh,run.headSha!,effectiveExecution!,true,true,false,run.bootstrap!.workspacePath,run.bootstrap!.branch));
+            if(pullRequestIdentityConflict(run,fresh,{allowHeadAdvance:true})!==null || fresh.headSha!==run.headSha || packet.kind!=='packet' || oracleDigest(packet.packet)!==repairAttempt.snapshot.packetSha256)return park(run,'Native repair live packet authority changed before host publication.',store,now);
+            snapshot=fresh;
+          }
           const publicationRun = run;
           try {
             options.onExecutionStart?.();
@@ -1165,7 +1298,13 @@ export async function runWorkflow(
             await bootstrapAdapter.verifyDurable({
               identity: bootstrap, expectedHeadSha: result.headSha, progressBaseSha: pendingRepair ? run.headSha : undefined, workspaceGuard,
               beforeMutation: () => assertFinalExecutionAdmission(store, publicationRun, options),
-              beforePublish: () => assertFinalExecutionAdmission(store, publicationRun, options, true),
+              beforePublish: () => {assertNativeRepairExecution(publicationRun,deps,options,snapshot);assertFinalExecutionAdmission(store, publicationRun, options, true);},
+              ...(activeRepairAdmission(run)?.snapshot.leadDisposition===undefined?{}:{withPublicationBoundary:options.withNativeEffectBoundary,recheckPublication:async()=>{
+                const live=await github.readLiveSnapshot(target);await options.assertReviewClaim?.(publicationRun);
+                const packet=buildImplementationPacket(lunaPacketInput(publicationRun,target,live,publicationRun.headSha!,effectiveExecution!,true,true,false,publicationRun.bootstrap!.workspacePath,publicationRun.bootstrap!.branch));
+                if(pullRequestIdentityConflict(publicationRun,live,{allowHeadAdvance:true})!==null || live.headSha!==publicationRun.headSha || packet.kind!=='packet' || oracleDigest(packet.packet)!==repairAttempt!.snapshot.packetSha256)throw new ExecutionAdmissionRefusal('Native repair live authority changed at final publication read.',false);
+                snapshot=live;assertNativeRepairExecution(publicationRun,deps,options,live);
+              }}),
             });
             if ((run.execution?.executor === 'worker-router' || run.execution?.executor === 'luna-isolated') && snapshot.pullRequest === null) {
               if (deps.github.createImplementationPullRequest === undefined) {
@@ -1495,6 +1634,7 @@ export async function runWorkflow(
             github,
             implementation,
             reviewer,
+            nativeLead: deps.nativeLead, withNativeEffectBoundary:options.withNativeEffectBoundary, withLeadBoundary: options.withMergeBoundary, assertLeadInitiation: options.assertLeadInitiation === undefined ? undefined : () => options.assertLeadInitiation!(run), leadObservationOnly: options.leadObservationOnly, leadRecoveryConfiguration:options.leadRecoveryConfiguration,
             assertReviewClaim: options.assertReviewClaim,
             ...(options.admissionFence === undefined ? {} : { reviewOwner: { missionId: options.admissionFence.productionMissionId, laneId: options.admissionFence.token.laneId, generation: options.admissionFence.token.generation } }),
             bootstrap: deps.bootstrapForExecution?.(bootstrapExecution(run)) ?? deps.bootstrap,
@@ -1595,7 +1735,7 @@ export async function runWorkflow(
           return { outcome: 'needs_human', run, reason };
         }
         if (reviewer.native !== undefined) await options.assertReviewClaim?.(run);
-        if ((reviewer.native !== undefined || run.nativeReview !== undefined) && (options.assertReviewClaim === undefined || !reviewer.native?.validate({ run, snapshot,
+        if ((reviewer.native !== undefined || run.nativeReview !== undefined || run.nativeLead !== undefined) && (options.assertReviewClaim === undefined || !reviewer.native?.validate({ run, snapshot,
           ...(options.admissionFence === undefined ? {} : { owner: { missionId: options.admissionFence.productionMissionId, laneId: options.admissionFence.token.laneId, generation: options.admissionFence.token.generation } }),
           assertCurrent: () => assertCurrentMutationAdmission(options) }))) {
           const reason = 'Final gate requires authenticated immutable native review evidence under current host authority.';
@@ -1699,7 +1839,7 @@ export async function runWorkflow(
       }
 
       case 'MERGE_READY':
-        if (recheckCachedReadiness && (reviewer.native !== undefined || run.nativeReview !== undefined)) {
+        if (recheckCachedReadiness && (reviewer.native !== undefined || run.nativeReview !== undefined || run.nativeLead !== undefined)) {
           recheckCachedReadiness = false;
           const next = applyTransition(run, { type: 'recheck_readiness', reason: 'Re-establish cached native readiness through the complete live final gate.' }, now());
           if (!updateIfCurrent(store, run, next)) return staleWorkflowOutcome(run.id, run, store, 'Run changed before cached readiness revalidation.');
@@ -1719,10 +1859,19 @@ export async function runWorkflow(
         return { outcome: 'needs_human', run, reason: run.interrupt?.reason ?? 'Awaiting a human decision.' };
 
       case 'WAITING_DEPENDENCY':
+        if (nativeLeadReentry(run, now())) {
+          const next = applyTransition(run, {type:'dependency_satisfied',reason:'Model-free native lead recovery.'},now());
+          if (!updateIfCurrent(store,run,next)) return staleWorkflowOutcome(run.id,run,store,'Run changed before lead recovery.');
+          run=next; break;
+        }
         if (reviewer.native !== undefined && nativeReviewReentry(run, now())) {
           const resumed = applyTransition(run, { type: 'dependency_satisfied', reason: 'Model-free native review dependency observation.' }, now());
-          const next: Run = { ...resumed, nativeReview: { ...run.nativeReview!, wait: undefined } };
+          // Historical gate settlement never revives the old gate permit. It
+          // schedules validation in a later ordinary (unheld) workflow turn.
+          const historicalGate = resumed.state === 'FINAL_GATE' || resumed.state === 'MERGE_READY';
+          const next: Run = historicalGate ? revalidateHistoricalGate(resumed) : { ...resumed, nativeReview: { ...run.nativeReview!, wait: undefined } };
           if (!updateIfCurrent(store, run, next)) return staleWorkflowOutcome(run.id, run, store, 'Run changed before native review dependency observation.');
+          if (historicalGate) return {outcome:'waiting_dependency',run:next,reason:'Historical gate recovery scheduled fresh validation; no cached gate authority was consumed.'};
           run = next;
           break;
         }

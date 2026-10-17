@@ -32,6 +32,9 @@ export interface VerifyDurableRequest {
   readonly beforeMutation?: () => void;
   /** Synchronous host-owned fence called immediately before a publication push. */
   readonly beforePublish?: () => void;
+  readonly withPublicationBoundary?: <T>(operation: () => T) => T;
+  /** Fresh remote authority read after Git preparation and immediately before final synchronous publication fencing. */
+  readonly recheckPublication?: () => Promise<void>;
 }
 
 export interface DurableImplementationSnapshot {

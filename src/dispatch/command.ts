@@ -17,9 +17,9 @@ export interface DispatchCommandDependencies {
   readonly workflow: WorkflowDependencies;
   readonly runtime: DispatchCommandRuntime;
   readonly resolveExecutionProfile: (profile: string) => ResolvedExecutionConfiguration;
-  readonly runIssue: (ref: string, execution: ResolvedExecutionConfiguration | undefined, dispatchClaimId: string, repairTaskShapeAuthority: RepairTaskShapeAuthority, admission?: MissionAdmissionRegistry, releaseAdmissionLock?: () => void, withAdmissionLock?: <T>(operation: () => Promise<T> | T) => Promise<T>, assertReviewClaim?: (run: Run) => Promise<void>, assertMergeInitiation?: (run: Run) => Promise<void>) => Promise<WorkflowOutcome>;
+  readonly runIssue: (ref: string, execution: ResolvedExecutionConfiguration | undefined, dispatchClaimId: string, repairTaskShapeAuthority: RepairTaskShapeAuthority, admission?: MissionAdmissionRegistry, releaseAdmissionLock?: () => void, withAdmissionLock?: <T>(operation: () => Promise<T> | T) => Promise<T>, assertReviewClaim?: (run: Run) => Promise<void>, assertMergeInitiation?: (run: Run) => Promise<void>, assertLeadInitiation?: (run: Run) => Promise<void>, leadObservationOnly?: boolean, leadRecoveryConfiguration?: DispatchConfiguration) => Promise<WorkflowOutcome>;
   /** Resume the Run bound by the retained runtime claim, never a target lookup. */
-  readonly resumeClaimedRun: (run: Run, dispatchClaimId: string, admission?: MissionAdmissionRegistry, releaseAdmissionLock?: () => void, withAdmissionLock?: <T>(operation: () => Promise<T> | T) => Promise<T>, assertReviewClaim?: (run: Run) => Promise<void>, assertMergeInitiation?: (run: Run) => Promise<void>) => Promise<WorkflowOutcome>;
+  readonly resumeClaimedRun: (run: Run, dispatchClaimId: string, admission?: MissionAdmissionRegistry, releaseAdmissionLock?: () => void, withAdmissionLock?: <T>(operation: () => Promise<T> | T) => Promise<T>, assertReviewClaim?: (run: Run) => Promise<void>, assertMergeInitiation?: (run: Run) => Promise<void>, assertLeadInitiation?: (run: Run) => Promise<void>, leadObservationOnly?: boolean, leadRecoveryConfiguration?: DispatchConfiguration) => Promise<WorkflowOutcome>;
   /** Executable CLI always supplies the host-global admission registry. */
   readonly admission?: MissionAdmissionRegistry;
   /** Lock held around prepare; execution releases it immediately before model-capable workflow entry. */
@@ -33,6 +33,7 @@ export interface DispatchCommandDependencies {
   readonly now?: () => string;
   readonly maintenanceHold?: boolean;
   readonly issuedMergeRecoveryOnly?: boolean;
+  readonly issuedLeadRecoveryOnly?: boolean;
 }
 
 function outcomeState(outcome: WorkflowOutcome): WorkflowOutcome['run']['state'] {
@@ -46,9 +47,12 @@ export async function dispatchOnceCommand(
 ): Promise<DispatchOnceResult> {
   const now = deps.now ?? (() => new Date().toISOString());
   return await dispatchOnce({
-    queueBody: deps.maintenanceHold || deps.issuedMergeRecoveryOnly ? '' : await deps.runtime.readQueueComment(),
+    queueBody: deps.maintenanceHold || deps.issuedMergeRecoveryOnly || deps.issuedLeadRecoveryOnly ? '' : await deps.runtime.readQueueComment(),
     maintenanceHold: deps.maintenanceHold,
     issuedMergeRecoveryOnly: deps.issuedMergeRecoveryOnly,
+    issuedLeadRecoveryOnly:deps.issuedLeadRecoveryOnly,
+    nativeObservationEligible: (run,at) => deps.workflow.nativeLead?.canObserve?.(run,at) === true || deps.workflow.reviewer.native?.canObserve?.(run,at) === true || deps.workflow.reviewer.native?.canReconcileHistorical?.(run)===true,
+    nativeRecoveryEligible: (run,at) => deps.workflow.nativeLead?.canRecover?.(run,at) === true || deps.workflow.reviewer.native?.canRecover?.(run,at) === true,
     owner: config.owner,
     repo: config.repo,
     github: deps.workflow.github,
@@ -77,6 +81,8 @@ export async function dispatchOnceCommand(
           !['running', 'claimed'].includes(live.claim.state) || JSON.stringify(live.claim.repairTaskShapeAuthority) !== JSON.stringify(claim.repairTaskShapeAuthority) ||
           claimedRun(deps.workflow.store, live.claim, entry, config)?.id !== run.id) throw new Error('Native review retained dispatch claim is missing, replaced, or differently bound.');
       };
+      const assertLeadInitiation = async (run:Run) => {if(deps.maintenanceHold)throw new Error('Maintenance HOLD prevents lead/repair initiation.');await assertReviewClaim(run);};
+      const leadRecoveryConfiguration:DispatchConfiguration={revision:config.revision,owner:config.owner,repo:config.repo,controlIssue:config.controlIssue,queueCommentId:config.queueCommentId,leaseDurationMs:60_000};
       const assertMergeInitiation = async (run: Run) => {
         if (deps.maintenanceHold || !config.merge || !deps.workflow.nativeMergeHost || oracleDigest(config.merge) !== oracleDigest(deps.workflow.nativeMergeHost.policy) ||
           config.merge.dispatchRevision !== config.revision || config.merge.owner !== config.owner || config.merge.repo !== config.repo || config.merge.controlIssue !== config.controlIssue || config.merge.queueCommentId !== config.queueCommentId) throw new Error('Native merge lacks identical accepted-release and current dispatch scope authority.');
@@ -94,8 +100,8 @@ export async function dispatchOnceCommand(
             existing.repairTaskShapeAuthority.shape !== claim.repairTaskShapeAuthority.shape)) {
           throw new Error(`Durable run ${existing.id} task-shape authority does not match the retained dispatch claim.`);
         }
-        const outcome = await deps.resumeClaimedRun(existing, claim.claimId, deps.admission, deps.releaseAdmissionLock, deps.withAdmissionLock, assertReviewClaim, assertMergeInitiation);
-        return { runId: outcome.run.id, state: outcomeState(outcome), ...(outcome.run.state === 'MERGE_READY' && outcome.run.nativeReview !== undefined ? { waitForPoll: true } : {}) };
+        const outcome = await deps.resumeClaimedRun(existing, claim.claimId, deps.admission, deps.releaseAdmissionLock, deps.withAdmissionLock, assertReviewClaim, assertMergeInitiation, assertLeadInitiation, deps.maintenanceHold, leadRecoveryConfiguration);
+        return { runId: outcome.run.id, state: outcomeState(outcome), ...(outcome.run.state === 'MERGE_READY' && (outcome.run.nativeReview !== undefined || outcome.run.nativeLead !== undefined) ? { waitForPoll: true } : {}) };
       }
       if (!hasValidDispatchAuthority(entry)) {
         throw new Error(`Queue issue #${entry.issue} lacks explicit revisioned task-shape authority.`);
@@ -106,8 +112,8 @@ export async function dispatchOnceCommand(
         throw new Error(`Dispatch claim ${claim.claimId} does not retain the queue-selected task-shape authority.`);
       }
       const selected = deps.resolveExecutionProfile(entry.profile);
-      const outcome = await deps.runIssue(`${config.owner}/${config.repo}#${entry.issue}`, selected, claim.claimId, entry.repairTaskShapeAuthority, deps.admission, deps.releaseAdmissionLock, deps.withAdmissionLock, assertReviewClaim, assertMergeInitiation);
-      return { runId: outcome.run.id, state: outcomeState(outcome), ...(outcome.run.state === 'MERGE_READY' && outcome.run.nativeReview !== undefined ? { waitForPoll: true } : {}) };
+      const outcome = await deps.runIssue(`${config.owner}/${config.repo}#${entry.issue}`, selected, claim.claimId, entry.repairTaskShapeAuthority, deps.admission, deps.releaseAdmissionLock, deps.withAdmissionLock, assertReviewClaim, assertMergeInitiation, assertLeadInitiation, deps.maintenanceHold, leadRecoveryConfiguration);
+      return { runId: outcome.run.id, state: outcomeState(outcome), ...(outcome.run.state === 'MERGE_READY' && (outcome.run.nativeReview !== undefined || outcome.run.nativeLead !== undefined) ? { waitForPoll: true } : {}) };
     },
   });
 }

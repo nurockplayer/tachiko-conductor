@@ -45,8 +45,8 @@ export const DEFAULT_EFFICIENCY_THRESHOLDS: EfficiencyThresholds = Object.freeze
   reviewerRestarts: 2,
 });
 
-export type TelemetryRole = 'worker' | 'reviewer';
-export type SpawnAttemptKind = 'initial' | 'resume' | 'repair' | 'review' | 'review_restart';
+export type TelemetryRole = 'worker' | 'reviewer' | 'lead';
+export type SpawnAttemptKind = 'initial' | 'resume' | 'repair' | 'review' | 'review_restart' | 'lead';
 export type SpawnContextMode = 'bounded' | 'full' | 'unknown';
 export type SpawnContextJustification = 'live-target-bounded' | 'operator-full-override';
 export type ProviderFailureCategory = 'configuration-preflight' | 'executed-runtime';
@@ -1000,10 +1000,10 @@ function isRunTelemetryEvent(value: unknown): value is RunTelemetryEvent {
   const event = value as Record<string, unknown>;
   if (!nonEmpty(event.id) || !nonEmpty(event.at) || !nonEmpty(event.kind)) return false;
   if (event.kind === 'spawn') {
-    return (event.role === 'worker' || event.role === 'reviewer') &&
+    return (event.role === 'worker' || event.role === 'reviewer' || event.role === 'lead') &&
       nonEmpty(event.invocationId) &&
       Number.isSafeInteger(event.attempt) && (event.attempt as number) >= 1 &&
-      ['initial', 'resume', 'repair', 'review', 'review_restart'].includes(event.attemptKind as string) &&
+      ['initial', 'resume', 'repair', 'review', 'review_restart', 'lead'].includes(event.attemptKind as string) &&
       (event.headSha === null || nonEmpty(event.headSha)) &&
       (event.provider === null || nonEmpty(event.provider)) &&
       (event.model === null || nonEmpty(event.model)) &&
@@ -1022,7 +1022,7 @@ function isRunTelemetryEvent(value: unknown): value is RunTelemetryEvent {
       (event.observationDigest === undefined || nonEmpty(event.observationDigest));
   }
   if (event.kind === 'completion') {
-    if ((event.role !== 'worker' && event.role !== 'reviewer') || !nonEmpty(event.invocationId) ||
+    if ((event.role !== 'worker' && event.role !== 'reviewer' && event.role !== 'lead') || !nonEmpty(event.invocationId) ||
         (event.provider !== null && !nonEmpty(event.provider)) ||
         (event.model !== null && !nonEmpty(event.model)) ||
         (event.reasoningEffort !== null && !nonEmpty(event.reasoningEffort)) ||

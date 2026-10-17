@@ -116,6 +116,7 @@ export interface ImplementationRequest {
   readonly beforePublish?: () => void;
   /** Synchronous host-only check immediately before an implementation process enters execution. */
   readonly beforeExecution?: () => void;
+  readonly withExecutionBoundary?: <T>(operation: () => T) => T;
   /** Must be evaluated after capability resolution and directly before spawn. */
   readonly workspaceGuard?: WorkspaceGuard;
   /** Whether the executor should read target authority live instead of from copied prose. */

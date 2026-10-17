@@ -183,10 +183,11 @@ export class StandaloneGitBootstrap implements ImplementationBootstrapAdapter {
     }
     // Normal Git push is intentionally non-force. A concurrent/diverged ref
     // therefore remains untouched even if it changes after the re-read.
+    await request.recheckPublication?.();
     await this.git(this.source, ['push', '--no-verify', 'origin', `${head}:${ref}`], [0], () => {
       beforePublish();
       this.assertCurrentProof(identity, proof, progressBase);
-    });
+    }, request.withPublicationBoundary);
     await this.assertPublicationRemote(identity);
     const published = (await this.git(this.source, ['ls-remote', '--heads', 'origin', ref])).stdout.trim().split(/\s+/)[0];
     if (published !== head) this.fail('UNPUSHED_HEAD', 'Host publication did not retain the exact standalone worker HEAD.');
@@ -330,13 +331,13 @@ export class StandaloneGitBootstrap implements ImplementationBootstrapAdapter {
       this.fail('STALE_IDENTITY', 'Standalone invocation preparation proof changed before final acceptance.');
     }
   }
-  private async git(cwd: string, args: string[], allowed: number[] = [0], beforeSpawn?: () => void) {
+  private async git(cwd: string, args: string[], allowed: number[] = [0], beforeSpawn?: () => void, withSpawnBoundary?: <T>(operation:()=>T)=>T) {
     const env = { ...process.env } as NodeJS.ProcessEnv;
     for (const key of Object.keys(env)) if (key.startsWith('GIT_CONFIG_') || ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_ALTERNATE_OBJECT_DIRECTORIES'].includes(key)) delete env[key];
     env.GIT_CONFIG_NOSYSTEM = '1';
     env.GIT_CONFIG_GLOBAL = '/dev/null';
     env.GIT_NO_REPLACE_OBJECTS = '1';
-    const result = await this.runner.run('git', ['-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '-c', 'core.attributesFile=/dev/null', '-c', 'core.useReplaceRefs=false', '-c', 'core.commitGraph=false', ...args], { cwd, timeoutMs: this.timeoutMs, env, ...(beforeSpawn === undefined ? {} : { beforeSpawn }) });
+    const result = await this.runner.run('git', ['-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '-c', 'core.attributesFile=/dev/null', '-c', 'core.useReplaceRefs=false', '-c', 'core.commitGraph=false', ...args], { cwd, timeoutMs: this.timeoutMs, env, ...(beforeSpawn === undefined ? {} : { beforeSpawn }), ...(withSpawnBoundary===undefined?{}:{withSpawnBoundary}) });
     if (!allowed.includes(result.exitCode)) this.fail('COMMAND_FAILED', `git ${args[0]} failed.`); return result;
   }
   private fail(code: keyof typeof IMPLEMENTATION_BOOTSTRAP_ERROR_CODE, message: string): never { throw new ImplementationBootstrapError(IMPLEMENTATION_BOOTSTRAP_ERROR_CODE[code], message); }

@@ -1,4 +1,8 @@
 #!/usr/bin/env node
+import type { NativeCompletionHosts } from './oracle/completion-proof.js';
+import { ExecutionAdmissionRefusal } from './adapters/agent.js';
+import { oracleDigest } from './oracle/source-evidence.js';
+import { resolveNativeLead, unresolvedNativeLead, nativeLeadStopped, issuedLeadRecoveryConfiguration, emptyLeadLedger, type NativeLeadHost, type LeadOwnerSuccession } from './oracle/native-lead.js';
 import { assertNativeMergeSettlement, issuedMergeRecoveryConfiguration, qualifiedMergeIntegration, resolveNativeMergeHost, unresolvedNativeMerge, type NativeMergeHost } from './workflow/merge.js';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
@@ -72,7 +76,7 @@ import {
 import { GitHubLiveStateError } from './github/errors.js';
 import { LiveGitHubAdapter } from './github/live-state.js';
 import { GhCliTransport, NodeProcessRunner } from './github/transport.js';
-import { resolveNativeReviewer, unresolvedNativeReview } from './oracle/native-reviewer.js';
+import { resolveNativeReviewer, unresolvedNativeReview, historicalReviewUncertainty, settledHistoricalReviewGate, issuedReviewRecoveryConfiguration } from './oracle/native-reviewer.js';
 import type { NativeReviewerHost } from './oracle/types.js';
 import { JsonFileStore, type RunStore } from './store/json-file-store.js';
 import { GitWorktreeBootstrap } from './workspace/git-worktree-bootstrap.js';
@@ -939,12 +943,12 @@ export function publishAdmissionRuntimeProjection(
   return projection;
 }
 
-export function assertCanonicalDispatchResumeClaim(run: Run, claim: DispatchRuntimeClaim | null, config: ReturnType<typeof resolveDispatchConfiguration>, claimBoundRun: Run | null = null): asserts claim is DispatchRuntimeClaim {
+export function assertCanonicalDispatchResumeClaim(run: Run, claim: DispatchRuntimeClaim | null, config: ReturnType<typeof resolveDispatchConfiguration>, claimBoundRun: Run | null = null, observationOnly = false): asserts claim is DispatchRuntimeClaim {
   const uniqueUnboundRunProof = claimBoundRun?.id === run.id && claimBoundRun.dispatchClaimId === claim?.claimId;
   if (run.target.kind !== 'issue' || run.dispatchClaimId === undefined || run.execution === undefined ||
-    (run.state !== 'NEEDS_HUMAN' && run.state !== 'WAITING_DEPENDENCY') ||
+    (run.state !== 'NEEDS_HUMAN' && run.state !== 'WAITING_DEPENDENCY' && !(observationOnly && (historicalReviewUncertainty(run) || settledHistoricalReviewGate(run)))) ||
     `${run.target.owner}/${run.target.repo}`.toLowerCase() !== `${config.owner}/${config.repo}`.toLowerCase() ||
-    claim === null || claim.state !== 'needs_human' || (claim.runId !== run.id && !(claim.runId === null && uniqueUnboundRunProof)) || claim.claimId !== run.dispatchClaimId ||
+    claim === null || !(claim.state === 'needs_human' || observationOnly && ['running','claimed'].includes(claim.state)) || (claim.runId !== run.id && !(claim.runId === null && uniqueUnboundRunProof)) || claim.claimId !== run.dispatchClaimId ||
     claim.issue !== run.target.issueNumber || claim.profile !== run.execution.profile ||
     (claim.repairTaskShapeAuthority !== undefined &&
       (run.repairTaskShapeAuthority?.revision !== claim.repairTaskShapeAuthority.revision ||
@@ -1201,12 +1205,38 @@ function assertIssuedMergeReadmissionReceipt(receiptPath: string, run: Run, lane
   if (receipt.settlementReason !== undefined || !(exactParked || completedParkPublication || interruptedReadmission || exactStoppedRelease)) throw new Error('Issued merge receipt phase/token/generation does not match its exact current predecessor lane.');
 }
 
-function acquireRunAdmission(registry: MissionAdmissionRegistry, run: Run, receiptPath?: string, workspace?: string): AdmissionToken {
+function acquireRunAdmission(registry: MissionAdmissionRegistry, run: Run, receiptPath?: string, workspace?: string, store?: RunStore): { readonly token: AdmissionToken; readonly run: Run } {
+  let succession: LeadOwnerSuccession | undefined;
+  const leadRecovery = run.nativeLead !== undefined && run.nativeLead.requests.length > 0;
+  const persist = (next: Run) => { if (!store || store.updateIfUnchanged?.(run,next) !== true) throw new Error('Lead owner succession Run CAS lost; no owner capability may be issued.'); run=next; };
   const laneId = `run:${run.id}`;
   const evidence = evidenceForRun(run, workspace === undefined ? {} : { workspace });
   const result = registry.admit({ laneId, role: 'production_captain', evidence, highAutonomy: true }, {
     ...(receiptPath === undefined ? {} : { beforePublish: (candidate: Extract<AdmissionResult, { outcome: 'admitted' }>, previousLane?: Readonly<AdmissionLaneView> | null) => {
       if (run.mergeAttempt?.submissionPossible) assertIssuedMergeReadmissionReceipt(receiptPath, run, previousLane ?? null, candidate);
+      if (leadRecovery) {
+        const previous = previousLane;
+        if (!previous || !['parked','released'].includes(previous.status) || previous.missionId !== candidate.missionId || candidate.token.generation !== previous.generation + 1 || !run.bootstrap) throw new Error('Lead readmission requires an exact quiescent predecessor lane.');
+        const canonicalWorkspace = canonicalizeMissionEvidence({repository:evidence.repository,workspace:run.bootstrap.workspacePath}).workspace;
+        if (previous.evidence.run !== run.id || previous.evidence.claim !== run.dispatchClaimId || previous.evidence.repository !== evidence.repository || previous.evidence.issue !== evidence.issue || previous.evidence.pullRequest !== run.pullRequest?.number || previous.evidence.workspace !== canonicalWorkspace || evidence.workspace !== canonicalWorkspace) throw new Error('Lead readmission predecessor identity/workspace changed.');
+        const receipt = readMergeReceipt(receiptPath,run,candidate.missionId,canonicalWorkspace);
+        if (receipt.workDisposition !== undefined || receipt.settlementReason !== undefined) throw new Error('Lead predecessor has an incompatible work disposition.');
+        const exactParked = previous.status === 'parked' && receipt.phase === 'parked' && receipt.generation === previous.generation && receipt.token === undefined;
+        const parkedCut = previous.status === 'parked' && receipt.phase === 'park_transition' && receipt.generation === previous.generation-1 && receipt.token?.generation === receipt.generation && receipt.token.laneId === previous.laneId;
+        const interrupted = previous.status === 'parked' && receipt.phase === 'pre_execution' && receipt.generation === candidate.token.generation && receipt.token?.generation === receipt.generation && receipt.token.laneId === previous.laneId;
+        const stopped = previous.status === 'released' && receipt.phase === 'released' && receipt.generation === previous.generation && receipt.token === undefined ? run.nativeLead?.stoppedRecoveries?.find(s=>s.releasedGeneration===previous.generation && s.missionId===previous.missionId && s.workspace===canonicalWorkspace) : undefined;
+        const existing=run.nativeLead?.ownerSuccessions.find(s=>s.toGeneration===candidate.token.generation && s.missionId===candidate.missionId);
+        if (interrupted) {
+          if (!existing || existing.status !== 'prepared' || existing.predecessorGeneration !== previous.generation) throw new Error('Interrupted lead readmission lacks its durable prepared predecessor proof.');
+          succession=existing;
+        } else {
+          if (!exactParked && !parkedCut && !stopped) throw new Error('Lead owner receipt has no proved parked/stopped succession.');
+          const {token:_secret,...nonsecret}=receipt;
+          succession={missionId:candidate.missionId,laneId:previous.laneId,claimId:run.dispatchClaimId!,workspace:canonicalWorkspace!,fromGeneration:stopped?.fromGeneration ?? previous.generation-1,toGeneration:candidate.token.generation,predecessorSha256:oracleDigest(nonsecret),status:'prepared',predecessorGeneration:previous.generation,predecessorPhase:receipt.phase,predecessorStatus:previous.status as 'parked'|'released'};
+          if (existing && oracleDigest({...existing,status:'prepared'}) !== oracleDigest(succession)) throw new Error('Lead predecessor contradicts its prepared succession.');
+          if (!existing) persist({...run,nativeLead:{...run.nativeLead!,ownerSuccessions:[...run.nativeLead!.ownerSuccessions,succession]}});
+        }
+      }
       writeRunOwnerReceipt(receiptPath, runReceiptFor(run, candidate.missionId, candidate.token, 'pre_execution', evidence.workspace));
     } }),
   });
@@ -1244,14 +1274,20 @@ function acquireRunAdmission(registry: MissionAdmissionRegistry, run: Run, recei
     }
     throw new Error(`Run "${run.id}" cannot enter mission admission: overlaps active or parked lane "${result.conflictingLaneId}".`);
   }
-  return result.token;
+  if (succession) {
+    registry.assertCurrentOwner(result.token);
+    const receipt=readRunOwnerReceipt(receiptPath!);
+    if (!receipt || receipt.phase!=='pre_execution' || receipt.token?.token!==result.token.token || receipt.generation!==result.token.generation || receipt.missionId!==succession.missionId || receipt.workspace!==succession.workspace) throw new Error('Lead successor publication lacks exact current owner receipt.');
+    persist({...run,nativeLead:{...run.nativeLead!,ownerSuccessions:run.nativeLead!.ownerSuccessions.map(s=>s.toGeneration===succession!.toGeneration?{...s,status:'confirmed' as const}:s)}});
+  }
+  return { token: result.token, run };
 }
 
 function settleRunAdmission(registry: MissionAdmissionRegistry, token: AdmissionToken, run: Run, receiptPath?: string, workDisposition?: 'cancelled'): void {
   // A local terminal outcome does not prove that a submitted native request
   // completed or was cancelled. Preserve its overlap reservation on returned
   // failures as well as on thrown exceptions.
-  const unresolvedReview = unresolvedNativeWork(run) || run.state === 'MERGED' && (run.nativeReview !== undefined || run.mergeAttempt !== undefined);
+  const unresolvedReview = unresolvedNativeWork(run) || nativeLeadStopped(run) && workDisposition === undefined || run.state === 'MERGED' && (run.nativeReview !== undefined || run.nativeLead !== undefined || run.mergeAttempt !== undefined);
   if ((run.state === 'FAILED' || run.state === 'MERGED') && !unresolvedReview) {
     registry.release(token, true, receiptPath === undefined ? undefined : () => writeRunOwnerReceipt(receiptPath, receiptForCurrentToken(receiptPath, token, 'release_transition')),
       receiptPath === undefined ? undefined : () => finalizeRunOwnerReceipt(receiptPath, token, 'released', token.generation + 1, workDisposition));
@@ -1279,9 +1315,10 @@ export function recoverRunAdmission(
 ): 'released' {
   if (recoveryOptions?.retireWork === true && !operatorStopped) throw new Error('--retire-work requires explicit --stopped attestation.');
   if (!Number.isSafeInteger(expectedGeneration) || expectedGeneration < 1) throw new Error('Run admission recovery requires --generation <positive integer>.');
-  const run = store.read(runId);
-  if (run === null) throw new Error(`No run with id "${runId}" found.`);
-  if (recoveryOptions?.retireWork === true && (unresolvedNativeWork(run) || run.mergeAttempt?.submissionPossible === true)) throw new Error('Native review remote submission is unresolved; stopped local execution cannot retire its external work.');
+  const initialRun = store.read(runId);
+  if (initialRun === null) throw new Error(`No run with id "${runId}" found.`);
+  let run: Run = initialRun;
+  if (recoveryOptions?.retireWork === true && (nativeLeadStopped(run) || unresolvedNativeWork(run) || run.mergeAttempt?.submissionPossible === true)) throw new Error('Native review remote submission is unresolved; stopped local execution cannot retire its external work.');
   const laneId = `run:${run.id}`;
   const repo = `${run.target.owner}/${run.target.repo}`.toLowerCase();
   const canonicalReceiptPath = receiptPath ?? resolveRunOwnerReceiptPath(repo, run.id, evidenceForRun(run));
@@ -1302,6 +1339,17 @@ export function recoverRunAdmission(
     throw new Error(`Run owner receipt does not match the canonical registry owner for Run "${run.id}".`);
   }
   assertRecoveryOwnerEvidence(run, receipt, lane, lane.missionId, expectedGeneration);
+  const recordLeadStopped = (current: Run, currentReceipt: RunOwnerReceipt, locked: AdmissionLaneView) => {
+    if (!operatorStopped || !current.nativeLead?.requests.length || !locked.evidence.workspace) return;
+    const {token:_secret,...nonsecret}=currentReceipt;
+    const proof={fromGeneration:locked.status==='parked'?locked.generation-1:locked.generation,releasedGeneration:locked.generation+1,missionId:locked.missionId,workspace:locked.evidence.workspace,receiptSha256:oracleDigest(nonsecret)};
+    const existing=current.nativeLead.stoppedRecoveries?.find(s=>s.releasedGeneration===proof.releasedGeneration);
+    if (existing) return;
+    if (JSON.stringify(current) !== JSON.stringify(run)) throw new Error('Run changed before stopped-recovery provenance CAS.');
+    const next = {...current,nativeLead:{...current.nativeLead,ownerSuccessions:current.nativeLead.ownerSuccessions.map(s=>s.status==='prepared'&&s.toGeneration===proof.fromGeneration?{...s,status:'confirmed' as const}:s),stoppedRecoveries:[...(current.nativeLead.stoppedRecoveries ?? []),proof]}};
+    if (store.updateIfUnchanged?.(current,next)!==true) throw new Error('Lead stopped-recovery provenance CAS changed.');
+    run = next;
+  };
   const recordRetirement = () => {
     if (recoveryOptions?.retireWork !== true) return;
     registry.withExactReleasedLane(laneId, expectedGeneration + 1, (released) => {
@@ -1373,6 +1421,7 @@ export function recoverRunAdmission(
       (lockedParkedLane) => {
         assertLockedLaneUnchanged(lane, lockedParkedLane, 'parked');
         const fresh = readRecoveryEvidence(store, canonicalReceiptPath, lockedParkedLane, run.id, lane.missionId, expectedGeneration);
+        recordLeadStopped(fresh.run,fresh.receipt,lockedParkedLane);
         writeParkedReleaseTransition(canonicalReceiptPath, fresh.run, lane.missionId, lane.generation, lockedParkedLane.evidence.workspace,
           canBindMissingReceiptWorkspace(fresh.receipt, fresh.run, lockedParkedLane.evidence.workspace), lockedParkedLane.parkedReason === 'workflow_settled');
         if (interruptedParkPublication) recoveryOptions?.parkReceiptNormalization?.();
@@ -1420,6 +1469,7 @@ export function recoverRunAdmission(
       assertLockedLaneUnchanged(lane, activeLane, 'active');
       const fresh = readRecoveryEvidence(store, canonicalReceiptPath, activeLane, run.id, lane.missionId, expectedGeneration);
       assertActiveReceiptGeneration(fresh.receipt, laneId, expectedGeneration, operationTokenSecret!);
+      recordLeadStopped(fresh.run,fresh.receipt,activeLane);
       writeRunOwnerReceipt(canonicalReceiptPath, { ...fresh.receipt, phase: 'release_transition', token: fresh.receipt.token });
     },
     (releasedLane) => {
@@ -1470,6 +1520,12 @@ export function parseGitHubRepositoryRemote(remote: string): string {
 
 export interface WorkflowCommandOptions {
   readonly assertReviewClaim?: (run: Run) => Promise<void>;
+  readonly assertLeadInitiation?: (run: Run) => Promise<void>;
+  readonly leadObservationOnly?: boolean;
+  readonly nativeCachedOnly?: boolean;
+  readonly nativeRecoveryDecisionOnly?: boolean;
+  readonly withNativeEffectBoundary?: <T>(operation:()=>T)=>T;
+  readonly leadRecoveryConfiguration?: import('./dispatch/config.js').DispatchConfiguration;
   readonly assertMergeInitiation?: (run: Run) => Promise<void>;
   readonly maxReviewAttempts?: number;
   readonly now?: () => string;
@@ -1540,7 +1596,9 @@ export async function runIssueCommand(
   // callers; capacity denial and a crash can retry this immutable Run id.
   const precreatedRun = isNewRun && (options.dispatchClaimId !== undefined || options.admission !== undefined);
   if (precreatedRun) deps.store.create(run);
-  const admissionToken = options.admission === undefined ? undefined : acquireRunAdmission(options.admission, run, runOwnerReceiptPath, options.admissionWorkspace);
+  const admitted = options.admission === undefined ? undefined : acquireRunAdmission(options.admission, run, runOwnerReceiptPath, options.admissionWorkspace, deps.store);
+  const admissionToken = admitted?.token;
+  run = admitted?.run ?? run;
   let mayReleaseAsPreExecution = admissionToken !== undefined && !unresolvedNativeWork(run) && run.mergeAttempt?.submissionPossible !== true;
   try {
     if (admissionToken !== undefined && runOwnerReceiptPath !== undefined && unresolvedNativeWork(run)) {
@@ -1552,7 +1610,9 @@ export async function runIssueCommand(
     }
     options.releaseDispatchAdmissionLock?.();
     const outcome = await runWorkflow(deps, run.id, {
+      admittedRun: admitted?.run.nativeLead === undefined ? undefined : admitted.run,
       assertReviewClaim: options.assertReviewClaim,
+      assertLeadInitiation: options.assertLeadInitiation, leadObservationOnly:options.leadObservationOnly, nativeCachedOnly:options.nativeCachedOnly, nativeRecoveryDecisionOnly:options.nativeRecoveryDecisionOnly, leadRecoveryConfiguration:options.leadRecoveryConfiguration, withNativeEffectBoundary:options.withNativeEffectBoundary ?? withNativeEffectBoundary,
       assertMergeInitiation: options.assertMergeInitiation,
       withMergeBoundary: options.withDispatchAdmissionLock,
       onMergeSubmission: () => {
@@ -1592,6 +1652,17 @@ export async function runIssueCommand(
   }
 }
 
+
+function withNativeEffectBoundary<T>(operation:()=>T):T {
+  const lockPath=dispatchAdmissionLockPath();
+  assertSafeAccountOwnedPath(resolveAccountHomeDirectory(),lockPath,'file');
+  let lock;
+  try {lock=acquireDispatchInvocationLock({lockPath});}catch(error){if(error instanceof DispatchInvocationLockedError)throw new ExecutionAdmissionRefusal('Native repair serialized effect boundary is busy; no process was created.',false);throw error;}
+  try {
+    if(readOperationalRuntimeProjection(resolveRunsDir())?.maintenanceHold.active) throw new ExecutionAdmissionRefusal('Maintenance HOLD prevents native repair worker/publication creation.',false);
+    return operation();
+  } finally {lock.release();}
+}
 /**
  * Resume a run parked in NEEDS_HUMAN / WAITING_DEPENDENCY with a supplied
  * human decision, then continue the workflow from the interrupted state.
@@ -1605,12 +1676,13 @@ export async function resumeCommand(
   decision: string,
   options: WorkflowCommandOptions = {},
 ): Promise<WorkflowOutcome> {
-  const run = deps.store.read(id);
+  let run = deps.store.read(id);
   if (run === null) throw new Error(`No run with id "${id}" found.`);
   if (run.dispatchClaimId !== options.dispatchClaimId) {
     throw new Error(`Run "${id}" is bound to dispatch claim "${run.dispatchClaimId}"; matching dispatch ownership is required to resume it.`);
   }
-  if (run.state !== 'NEEDS_HUMAN' && run.state !== 'WAITING_DEPENDENCY') {
+  const historicalGateResume=(run.state==='FINAL_GATE'||run.state==='MERGE_READY') && (options.leadObservationOnly && historicalReviewUncertainty(run) || settledHistoricalReviewGate(run));
+  if (run.state !== 'NEEDS_HUMAN' && run.state !== 'WAITING_DEPENDENCY' && !historicalGateResume) {
     throw new Error(`Run "${id}" is not parked for a decision (state ${run.state}); nothing to resume.`);
   }
   if (decision.trim() === '') throw new Error('A non-empty --decision is required to resume a parked run.');
@@ -1622,7 +1694,9 @@ export async function resumeCommand(
   const targetOwner = findRunByTarget(deps.store, run.target);
   if (targetOwner !== null && targetOwner.id !== id) throw new Error(`Run "${id}" is not the unique active durable Run for its target.`);
   const runOwnerReceiptPath = options.runOwnerReceiptPath ?? (options.admission === undefined ? undefined : resolveRunOwnerReceiptPath(`${run.target.owner}/${run.target.repo}`.toLowerCase(), run.id, evidenceForRun(run, options.admissionWorkspace === undefined ? {} : { workspace: options.admissionWorkspace })));
-  const admissionToken = options.admission === undefined ? undefined : acquireRunAdmission(options.admission, run, runOwnerReceiptPath, options.admissionWorkspace);
+  const admitted = options.admission === undefined ? undefined : acquireRunAdmission(options.admission, run, runOwnerReceiptPath, options.admissionWorkspace, deps.store);
+  const admissionToken = admitted?.token;
+  run = admitted?.run ?? run;
   let mayReleaseAsPreExecution = admissionToken !== undefined && !unresolvedNativeWork(run) && run.mergeAttempt?.submissionPossible !== true;
   try {
   const now = options.now ?? (() => new Date().toISOString());
@@ -1691,7 +1765,7 @@ export async function resumeCommand(
     synchronizedPullRequest = { number: snapshot.pullRequest.number, headSha: snapshot.headSha };
     if (synchronizeLiveHead) synchronizedHead = snapshot.headSha;
   }
-  const resumed = applyTransition(
+  const resumed = options.leadObservationOnly || historicalGateResume ? run : applyTransition(
     run,
     {
       type: transition,
@@ -1713,7 +1787,9 @@ export async function resumeCommand(
   }
   options.releaseDispatchAdmissionLock?.();
   const outcome = await runWorkflow(deps, id, {
+    admittedRun: admissionToken === undefined || resumed.nativeLead === undefined ? undefined : resumed,
     assertReviewClaim: options.assertReviewClaim,
+    assertLeadInitiation: options.assertLeadInitiation, leadObservationOnly:options.leadObservationOnly, nativeCachedOnly:options.nativeCachedOnly, nativeRecoveryDecisionOnly:options.nativeRecoveryDecisionOnly, leadRecoveryConfiguration:options.leadRecoveryConfiguration, withNativeEffectBoundary:options.withNativeEffectBoundary ?? withNativeEffectBoundary,
     assertMergeInitiation: options.assertMergeInitiation,
     withMergeBoundary: options.withDispatchAdmissionLock,
     onMergeSubmission: () => {
@@ -1801,7 +1877,9 @@ export function buildWorkflowDeps(
   transport: GhCliTransport = new GhCliTransport(),
   nativeReviewerHost?: NativeReviewerHost,
   nativeMergeHost?: NativeMergeHost,
+  nativeLeadHost?: NativeLeadHost,
 ): WorkflowDependencies {
+  store.configureNativeCompletionHosts?.({ review: nativeReviewerHost, lead: nativeLeadHost });
   const github = new LiveGitHubAdapter({ transport });
   const localValidation = resolveLocalValidationConfiguration(env);
   const hostedCheckPolicy = resolveHostedCheckPolicyConfiguration(env);
@@ -1899,6 +1977,7 @@ export function buildWorkflowDeps(
       },
     }),
     reviewer: resolveNativeReviewer(nativeReviewerHost),
+    nativeLead: resolveNativeLead(nativeLeadHost),
     nativeMergeHost: resolveNativeMergeHost(nativeMergeHost),
     bootstrap: lazyBootstrap,
     bootstrapForExecution: (execution) => {
@@ -1917,7 +1996,9 @@ export function buildWorkflowDeps(
     // configuration is intentionally surfaced as an unavailable profile.
     resolveRepairExecutionProfile: (profile) => {
       try {
-        return resolveSelectedExecutionProfile(profile, env);
+        const selected=resolveSelectedExecutionProfile(profile, env);
+        if(nativeLeadHost!==undefined && selected.executor===LUNA_ISOLATED_PROVIDER) new IsolatedLunaAdapter({codexHome:requiredLunaHome(env),timeoutMs:selected.timeoutMs});
+        return selected;
       } catch {
         return undefined;
       }
@@ -1925,7 +2006,7 @@ export function buildWorkflowDeps(
   };
 }
 
-function unresolvedNativeWork(run: Run): boolean { return unresolvedNativeReview(run) || unresolvedNativeMerge(run); }
+function unresolvedNativeWork(run: Run): boolean { return unresolvedNativeReview(run) || unresolvedNativeLead(run) || unresolvedNativeMerge(run); }
 
 // --- commands (exported so tests can exercise them without spawning a process) ---
 
@@ -2087,6 +2168,7 @@ function casMergedRun(store: RunStore, current: Run): Run {
 
 /** Work retirement needs explicit disposition and exact owner proof; release alone is not disposition. */
 export function isDispatchRunOwnerRetiredCommand(store: RunStore, run: Run, admission: MissionAdmissionRegistry): boolean {
+  if(nativeLeadStopped(run) || unresolvedNativeWork(run) || run.state!=='MERGED' && run.mergeAttempt?.submissionPossible)return false;
   if (run.dispatchClaimId === undefined || run.execution === undefined || run.repairTaskShapeAuthority === undefined) return false;
   const lane = admission.readLane(`run:${run.id}`);
   if (lane === null || lane.status !== 'released') return false;
@@ -2173,15 +2255,17 @@ export async function runMergedTransitionCommand(
       const workspace = assertMergeLaneIdentity(initial, lane);
       const receiptPath = resolveRunOwnerReceiptPath(`${initial.target.owner}/${initial.target.repo}`.toLowerCase(), id, evidenceForRun(initial));
       readMergeReceipt(receiptPath, initial, lane.missionId, workspace);
-      const token = acquireRunAdmission(admission, initial, receiptPath, workspace);
-      const resumed = initial.state === 'WAITING_DEPENDENCY' ? applyTransition(initial, { type: 'dependency_satisfied' }) : initial;
-      const next: Run = { ...resumed, mergeAttempt: { ...initial.mergeAttempt!, observedMerged: initial.mergeAttempt!.observedMerged ?? { mergeCommitSha: qualification.mergeCommitSha, observedAt: qualification.observedAt }, qualification: initial.mergeAttempt!.qualification ?? qualification } };
-      if (store.updateIfUnchanged?.(initial, next) !== true) throw new Error('Run changed before qualified merge recovery CAS.');
-      settleRunAdmission(admission, token, next, receiptPath);
+      const admitted = acquireRunAdmission(admission, initial, receiptPath, workspace, store);
+      const owned = admitted.run;
+      admission.assertCurrentOwner(admitted.token);
+      const resumed = owned.state === 'WAITING_DEPENDENCY' ? applyTransition(owned, { type: 'dependency_satisfied' }) : owned;
+      const next: Run = { ...resumed, mergeAttempt: { ...owned.mergeAttempt!, observedMerged: owned.mergeAttempt!.observedMerged ?? { mergeCommitSha: qualification.mergeCommitSha, observedAt: qualification.observedAt }, qualification: owned.mergeAttempt!.qualification ?? qualification } };
+      if (store.updateIfUnchanged?.(owned, next) !== true) throw new Error('Run changed before qualified merge recovery CAS.');
+      settleRunAdmission(admission, admitted.token, next, receiptPath);
       return await runMergedTransitionCommand(store, id, github, admission, async (operation) => await operation());
     });
   }
-  if ((initial.nativeReview !== undefined || initial.mergeAttempt !== undefined) && initial.mergeAttempt?.qualification === undefined) {
+  if ((initial.nativeReview !== undefined || initial.nativeLead !== undefined || initial.mergeAttempt !== undefined) && initial.mergeAttempt?.qualification === undefined) {
     // A review receipt without an issued merge attempt is not integration
     // authority. Retain the external fact without releasing work.
     const reason = 'Merged PR observed; native settlement remains unqualified because the accepted-release merge bridge is unavailable.';
@@ -2191,7 +2275,7 @@ export async function runMergedTransitionCommand(
     throw new Error(`${reason} The exact observed proof is retained; Run and owner remain fenced.`);
   }
 
-  if (initial.nativeReview !== undefined || initial.mergeAttempt !== undefined) {
+  if (initial.nativeReview !== undefined || initial.nativeLead !== undefined || initial.mergeAttempt !== undefined) {
     assertNativeMergeSettlement(initial);
     await qualifiedMergeIntegration(initial, github, new Date().toISOString());
   }
@@ -2213,7 +2297,7 @@ export async function runMergedTransitionCommand(
     if (current.state !== 'MERGE_READY' && current.state !== 'MERGED') throw new Error(`Run "${id}" changed to ${current.state} during merge reconciliation.`);
 
     if (lane === null) {
-      if (current.nativeReview !== undefined || current.mergeAttempt !== undefined) throw new Error('Native-bearing settlement requires its exact retained admission lane and owner receipt.');
+      if (current.nativeReview !== undefined || current.nativeLead !== undefined || current.mergeAttempt !== undefined) throw new Error('Native-bearing settlement requires its exact retained admission lane and owner receipt.');
       if (phase !== 'unadmitted') throw new Error('Admission lane disappeared during merge reconciliation.');
       if (readRunOwnerReceipt(resolveRunOwnerReceiptPath(`${current.target.owner}/${current.target.repo}`.toLowerCase(), current.id, evidenceForRun(current))) !== null) {
         throw new Error(`Run owner receipt exists without its admission lane for Run "${id}"; refusing merge reconciliation.`);
@@ -2225,7 +2309,7 @@ export async function runMergedTransitionCommand(
     const repository = `${current.target.owner}/${current.target.repo}`.toLowerCase();
     const receiptPath = resolveRunOwnerReceiptPath(repository, current.id, evidenceForRun(current, laneWorkspace === undefined ? {} : { workspace: laneWorkspace }));
     const storedReceipt = readRunOwnerReceipt(receiptPath);
-    if (storedReceipt === null && current.state === 'MERGED' && phase === 'already_released' && current.nativeReview === undefined && current.mergeAttempt === undefined) return current;
+    if (storedReceipt === null && current.state === 'MERGED' && phase === 'already_released' && current.nativeReview === undefined && current.nativeLead === undefined && current.mergeAttempt === undefined) return current;
     const receipt = readMergeReceipt(receiptPath, current, lane.missionId, laneWorkspace);
     if (phase === 'before_publish') {
       parkedGeneration = writeMergeReleaseTransition(receiptPath, current, lane.missionId, lane);
@@ -2489,8 +2573,18 @@ export function printWaitResult(result: WaitCommandResult): void {
   else if (result.idle) console.log('TACHIKO_WAIT_IDLE_V1');
 }
 
-export async function main(argv: string[]): Promise<number> {
-  const store = new JsonFileStore({ dir: resolveRunsDir() });
+/** Trusted installed composition only. Historical authentication does not opt
+ * a current model role into execution; defaults remain unavailable. */
+export interface CliNativeDependencies {
+  readonly historicalCompletionHosts?: NativeCompletionHosts | readonly NativeCompletionHosts[];
+  readonly nativeReviewerHost?: NativeReviewerHost;
+  readonly nativeLeadHost?: NativeLeadHost;
+  readonly nativeMergeHost?: NativeMergeHost;
+}
+export async function main(argv: string[], native: CliNativeDependencies = {}): Promise<number> {
+  const historical = native.historicalCompletionHosts === undefined ? [] : Array.isArray(native.historicalCompletionHosts) ? native.historicalCompletionHosts : [native.historicalCompletionHosts];
+  // Must precede every command's initial read/list, including model-free stopped recovery.
+  const store = new JsonFileStore({ dir: resolveRunsDir(), nativeCompletionHosts: [...historical, { review: native.nativeReviewerHost, lead: native.nativeLeadHost }] });
   const [command, subcommand, ...rest] = argv;
 
   if (command === undefined || command === '--help' || command === '-h') {
@@ -2813,28 +2907,42 @@ export async function main(argv: string[]): Promise<number> {
         // admission lock serializes an operator hold/release with this entire
         // interval, so a transition cannot be overwritten mid-reconcile.
         const maintenanceHold = readOperationalRuntimeProjection(resolveRunsDir())?.maintenanceHold.active === true;
-        const issued = store.list().filter((run) => {
-          if (!run.mergeAttempt?.submissionPossible) return false;
+        const retained = store.list();
+        const uncertain = retained.filter((run) => {
+          if (!run.mergeAttempt?.submissionPossible && !unresolvedNativeLead(run) && !unresolvedNativeReview(run)) return false;
           if (run.state !== 'MERGED') return true;
           try { return !isDispatchRunOwnerRetiredCommand(store, run, admission); } catch { return true; }
         });
-        if (issued.length > 1) throw new Error('Multiple issued merge owners require explicit reconciliation; refusing ambiguous recovery.');
+        if (uncertain.length > 1) throw new Error('Multiple issued merge owners require explicit reconciliation; refusing ambiguous recovery.');
+        const observedAt = new Date().toISOString();
+        const leadObservable = (run: Run) => resolveNativeLead(native.nativeLeadHost).canObserve?.(run,observedAt) === true;
+        const reviewObservable = (run: Run) => {const reviewer=resolveNativeReviewer(native.nativeReviewerHost).native;return reviewer?.canObserve?.(run,observedAt)===true || reviewer?.canReconcileHistorical?.(run)===true;};
+        const leadRecoverable=(run:Run)=>!maintenanceHold && resolveNativeLead(native.nativeLeadHost).canRecover?.(run,observedAt)===true;
+        const reviewRecoverable=(run:Run)=>!maintenanceHold && resolveNativeReviewer(native.nativeReviewerHost).native?.canRecover?.(run,observedAt)===true;
+        const issued = uncertain.filter(run => run.mergeAttempt?.submissionPossible || leadObservable(run) || reviewObservable(run) || leadRecoverable(run) || reviewRecoverable(run));
         const recovering = issued[0];
+        if (recovering === undefined && (uncertain.length > 0 || retained.some(run => run.state === 'WAITING_DEPENDENCY' &&
+          (run.nativeLead?.wait?.kind === 'qualification' || run.nativeLead?.wait?.kind === 'stop' || run.nativeReview?.wait?.kind === 'qualification') && !isDispatchRunOwnerRetiredCommand(store,run,admission)))) {
+          publishRuntime(maintenanceHold ? 'maintenance_hold' : 'idle','parked',nextPollAt());
+          return {outcome:'no_eligible_work' as const,reasons:['Issued native work requires explicit attention or is not due; retaining its claim and owner without readmission.']};
+        }
         if (maintenanceHold && recovering === undefined) {
           publishRuntime('maintenance_hold', 'parked', nextPollAt());
           return { outcome: 'maintenance_hold' as const, reason: 'Typed restart hold prevents new dispatch admission.' };
         }
         publishRuntime('scanning', 'running', nextPollAt());
-        const config = recovering === undefined ? processConfig ??= resolveDispatchConfiguration() : issuedMergeRecoveryConfiguration(recovering);
+        const config = recovering === undefined ? processConfig ??= resolveDispatchConfiguration() : recovering.mergeAttempt?.submissionPossible ? issuedMergeRecoveryConfiguration(recovering) : leadObservable(recovering) || leadRecoverable(recovering) ? issuedLeadRecoveryConfiguration(recovering) : issuedReviewRecoveryConfiguration(recovering);
+        const recoveryDecision=recovering!==undefined && !recovering.mergeAttempt?.submissionPossible && (leadRecoverable(recovering)||reviewRecoverable(recovering));
         const transport = new GhCliTransport();
         const runtime = new GitHubDispatchRuntime(transport, config);
-        const workflow = recovering === undefined ? processWorkflow ??= buildWorkflowDeps(store, undefined, process.env, transport) : buildWorkflowDeps(store, undefined, {}, transport);
+        const workflow = recovering === undefined ? processWorkflow ??= buildWorkflowDeps(store, undefined, process.env, transport, native.nativeReviewerHost, native.nativeMergeHost, native.nativeLeadHost) : buildWorkflowDeps(store, undefined, recoveryDecision ? process.env : {}, transport, native.nativeReviewerHost, native.nativeMergeHost, native.nativeLeadHost);
         return await dispatchOnceCommand(config, {
           workflow,
           runtime,
           admission,
           maintenanceHold,
-          issuedMergeRecoveryOnly: recovering !== undefined,
+          issuedMergeRecoveryOnly: recovering?.mergeAttempt?.submissionPossible === true,
+          issuedLeadRecoveryOnly:recovering !== undefined && !recovering.mergeAttempt?.submissionPossible,
           releaseAdmissionLock,
           // The outer prepare boundary still owns the canonical lock here.
           // Reacquiring that same lock inside settlement would deadlock.
@@ -2842,12 +2950,13 @@ export async function main(argv: string[]): Promise<number> {
           reconcileMergedRun: async (run) => await reconcileDispatchMergedRunCommand(store, run, workflow.github, admission, async (operation) => await operation()),
           withAdmissionLock: async <T>(operation: () => Promise<T> | T) => await withDispatchAdmissionLock(operation),
           resolveExecutionProfile: (profile) => resolveSelectedExecutionProfile(profile),
-          runIssue: async (ref, execution, dispatchClaimId, repairTaskShapeAuthority, missionAdmission, release, withLock, assertReviewClaim, assertMergeInitiation) => {
+          runIssue: async (ref, execution, dispatchClaimId, repairTaskShapeAuthority, missionAdmission, release, withLock, assertReviewClaim, assertMergeInitiation, assertLeadInitiation, leadObservationOnly, leadRecoveryConfiguration) => {
             return await runIssueCommand(workflow, ref, {
               ...(execution === undefined ? {} : { execution }), dispatchClaimId, repairTaskShapeAuthority, admission: missionAdmission!,
               publishRuntimeProjection: (registry, runStore, update) => publishAdmissionRuntimeProjection(resolveRunsDir(), registry, runStore, update),
               releaseDispatchAdmissionLock: release, withDispatchAdmissionLock: withLock,
-              assertReviewClaim,
+              assertReviewClaim, leadObservationOnly: leadObservationOnly || recovering !== undefined && !recovering.mergeAttempt?.submissionPossible && !recoveryDecision, nativeRecoveryDecisionOnly:recoveryDecision, leadRecoveryConfiguration,
+              assertLeadInitiation:async(run)=>{if(readOperationalRuntimeProjection(resolveRunsDir())?.maintenanceHold.active)throw new Error('Maintenance HOLD prevents lead/repair initiation.');if(!assertLeadInitiation)throw new Error('Lead dispatch authority unavailable.');await assertLeadInitiation(run);},
               assertMergeInitiation: async (run) => {
                 if (readOperationalRuntimeProjection(resolveRunsDir())?.maintenanceHold.active) throw new Error('Maintenance HOLD prevents merge initiation.');
                 if (!assertMergeInitiation) throw new Error('Merge dispatch authority unavailable.');
@@ -2855,7 +2964,7 @@ export async function main(argv: string[]): Promise<number> {
               },
             });
           },
-          resumeClaimedRun: async (run, dispatchClaimId, missionAdmission, release, withLock, assertReviewClaim, assertMergeInitiation) => {
+          resumeClaimedRun: async (run, dispatchClaimId, missionAdmission, release, withLock, assertReviewClaim, assertMergeInitiation, assertLeadInitiation, leadObservationOnly, leadRecoveryConfiguration) => {
             if (run.target.kind !== 'issue') throw new Error(`Dispatch claimed Run ${run.id} is not an issue Run.`);
             const workspace = persistedRunWorkspace(run);
             return await runIssueCommand(workflow, `${run.target.owner}/${run.target.repo}#${run.target.issueNumber}`, {
@@ -2866,7 +2975,8 @@ export async function main(argv: string[]): Promise<number> {
               publishRuntimeProjection: (registry, runStore, update) => publishAdmissionRuntimeProjection(resolveRunsDir(), registry, runStore, update),
               ...(workspace === undefined ? {} : { admissionWorkspace: workspace }),
               releaseDispatchAdmissionLock: release, withDispatchAdmissionLock: withLock,
-              assertReviewClaim,
+              assertReviewClaim, leadObservationOnly: leadObservationOnly || recovering !== undefined && !recovering.mergeAttempt?.submissionPossible && !recoveryDecision, nativeRecoveryDecisionOnly:recoveryDecision, leadRecoveryConfiguration,
+              assertLeadInitiation:async(run)=>{if(readOperationalRuntimeProjection(resolveRunsDir())?.maintenanceHold.active)throw new Error('Maintenance HOLD prevents lead/repair initiation.');if(!assertLeadInitiation)throw new Error('Lead dispatch authority unavailable.');await assertLeadInitiation(run);},
               assertMergeInitiation: async (run) => {
                 if (readOperationalRuntimeProjection(resolveRunsDir())?.maintenanceHold.active) throw new Error('Maintenance HOLD prevents merge initiation.');
                 if (!assertMergeInitiation) throw new Error('Merge dispatch authority unavailable.');
@@ -3082,9 +3192,13 @@ export async function main(argv: string[]): Promise<number> {
       const admissionWorkspace = persistedRunWorkspace(run);
       const withLock = async <T>(operation: () => Promise<T> | T) => await withDispatchAdmissionLock(operation);
       let commitDispatchResumeTransition: WorkflowCommandOptions['commitDispatchResumeTransition'];
+      let assertReviewClaim: WorkflowCommandOptions['assertReviewClaim'];
+      const attentionObservation = unresolvedNativeLead(run) || unresolvedNativeReview(run);
+      const historicalGateResume = !unresolvedNativeWork(run) && settledHistoricalReviewGate(run);
+      if(historicalGateResume && readOperationalRuntimeProjection(resolveRunsDir())?.maintenanceHold.active)throw new Error('Maintenance HOLD permits cached native evidence only; fresh gate scheduling must wait.');
       if (run.dispatchClaimId !== undefined) {
         if (run.target.kind !== 'issue' || run.execution === undefined) throw new Error(`Dispatch-bound Run "${id}" has no canonical issue/profile binding.`);
-        const config = resolveDispatchConfiguration();
+        const config = attentionObservation ? unresolvedNativeLead(run) ? issuedLeadRecoveryConfiguration(run) : issuedReviewRecoveryConfiguration(run) : resolveDispatchConfiguration();
         if (`${run.target.owner}/${run.target.repo}`.toLowerCase() !== `${config.owner}/${config.repo}`.toLowerCase()) throw new Error('Dispatch-bound Run does not belong to the configured canonical runtime repository.');
         const runtime = new GitHubDispatchRuntime(new GhCliTransport(), config);
         const assertLiveClaim = async (expectedRun: Run) => {
@@ -3094,10 +3208,11 @@ export async function main(argv: string[]): Promise<number> {
           const claimBoundRun = claim.runId === null && expectedRun.target.kind === 'issue'
             ? claimedRun(store, claim, { issue: expectedRun.target.issueNumber, route: 'codex', profile: expectedRun.execution!.profile }, { owner: config.owner, repo: config.repo })
             : null;
-          assertCanonicalDispatchResumeClaim(expectedRun, claim, config, claimBoundRun);
+          assertCanonicalDispatchResumeClaim(expectedRun, claim, config, claimBoundRun, attentionObservation || historicalGateResume);
           return selected;
         };
         await assertLiveClaim(run);
+        if (attentionObservation || historicalGateResume) assertReviewClaim = async current => { await assertLiveClaim(current); };
         commitDispatchResumeTransition = async (expectedRun, nextRun, commitRun) => {
           const live = await assertLiveClaim(expectedRun);
           const now = new Date().toISOString();
@@ -3113,12 +3228,13 @@ export async function main(argv: string[]): Promise<number> {
           assertDispatchRuntimeClaimReadback(live.id, transitionClaim, observed);
         };
       }
-      return await resumeCommand(buildWorkflowDeps(store, resolveCapabilities), id, values.decision!, {
+      return await resumeCommand(buildWorkflowDeps(store, resolveCapabilities, attentionObservation ? {} : process.env, undefined, native.nativeReviewerHost, native.nativeMergeHost, native.nativeLeadHost), id, values.decision!, {
         admission: createHostAdmissionRegistry(),
         publishRuntimeProjection: (registry, runStore, update) => publishAdmissionRuntimeProjection(resolveRunsDir(), registry, runStore, update),
         ...(admissionWorkspace === undefined ? {} : { admissionWorkspace }),
         releaseDispatchAdmissionLock: releaseAdmissionLock,
         withDispatchAdmissionLock: withLock,
+        assertReviewClaim, leadObservationOnly:attentionObservation, nativeCachedOnly:attentionObservation,
         ...(run.dispatchClaimId === undefined ? {} : { dispatchClaimId: run.dispatchClaimId, commitDispatchResumeTransition }),
       });
     });
@@ -3158,7 +3274,7 @@ export async function main(argv: string[]): Promise<number> {
     const repairTaskShapeAuthority = values['repair-task-shape-authority'] === undefined
       ? undefined
       : parseRepairTaskShapeAuthority(values['repair-task-shape-authority']);
-    return runIssueCommand(buildWorkflowDeps(store, resolveCapabilities), ref, {
+    return runIssueCommand(buildWorkflowDeps(store, resolveCapabilities, process.env, undefined, native.nativeReviewerHost, native.nativeMergeHost, native.nativeLeadHost), ref, {
       execution, repairTaskShapeAuthority, admission: createHostAdmissionRegistry(),
       publishRuntimeProjection: (registry, runStore, update) => publishAdmissionRuntimeProjection(resolveRunsDir(), registry, runStore, update),
       releaseDispatchAdmissionLock: releaseAdmissionLock,

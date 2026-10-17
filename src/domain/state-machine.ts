@@ -1,3 +1,6 @@
+import { authenticatedReviewMatches, nativeReviewCoherent } from '../oracle/native-reviewer.js';
+import { nativeLeadCoherent, unresolvedNativeRepairHistory } from '../oracle/native-lead.js';
+import { leadConsumptionValid, acceptedNativeLead } from '../oracle/native-lead.js';
 import {
   LIVE_HEAD_SYNC_DECISION,
   RECOVER_LEGACY_PULL_REQUEST_DECISION,
@@ -12,6 +15,7 @@ import { activeRepairAdmission, isRepairAdmissionSnapshot, isRepairExecutorIdent
 
 /** Why a transition was rejected. */
 export type InvalidTransitionCode =
+  | 'invalid-native-evidence'
   | 'terminal-state'
   | 'unknown-transition'
   | 'missing-payload'
@@ -398,8 +402,16 @@ function assertPayload(
   if (input.type === 'bootstrap_prepared' && input.bootstrap === undefined) {
     throw new InvalidTransitionError('missing-payload', from, input.type, 'Transition "bootstrap_prepared" requires durable bootstrap identity.');
   }
+  if(input.nativeLeadStop!==undefined) {
+    const accepted=acceptedNativeLead(run);const ref=input.nativeLeadStop;
+    if(input.type!=='escalate' || from!=='CHANGES_REQUESTED' || !accepted || accepted.disposition.outcome!=='stop' || accepted.requestId!==ref.requestId || accepted.receiptId!==ref.receiptId || accepted.digest!==ref.digest || run.history.some(h=>h.nativeLeadStop?.requestId===ref.requestId)) throw new InvalidTransitionError('unexpected-payload',from,input.type,'Lead stop history requires the exact qualified active stop once.');
+  }
   if (input.repairAdmission !== undefined && input.type !== 'start_fix') {
     throw new InvalidTransitionError('unexpected-payload', from, input.type, 'Repair admission is only accepted atomically with start_fix.');
+  }
+  if(input.type==='start_fix' && run.nativeReview?.repairLimit!==undefined && (input.repairAdmission?.budgetLimit!==run.nativeReview.repairLimit || run.history.filter(h=>h.type==='start_fix').length>=run.nativeReview.repairLimit)) throw new InvalidTransitionError('invalid-repair-admission',from,input.type,'Native shared durable repair budget is missing, changed or exhausted.');
+  if (input.type === 'start_fix' && (run.nativeReview !== undefined || run.nativeLead !== undefined) && run.reviewResult?.verdict === 'request_changes' && !leadConsumptionValid(run, input.repairAdmission?.leadDisposition)) {
+    throw new InvalidTransitionError('invalid-repair-admission', from, input.type, 'Native repair requires exact qualified one-time lead disposition consumption.');
   }
   if (input.type === 'start_fix' && input.repairAdmission !== undefined) {
     const admission = input.repairAdmission;
@@ -721,6 +733,9 @@ export function applyTransition(
   now: string = new Date().toISOString(),
   activeValidation?: ActiveValidationConfiguration,
 ): Run {
+  if (!nativeReviewCoherent(run) || !nativeLeadCoherent(run)) throw new InvalidTransitionError('invalid-native-evidence', run.state, input.type, 'Native ledger lacks coherent immutable authenticated completion proof.');
+  if (['start', 'start_fix', 'review_approved', 'changes_requested', 'merged', 'final_gate_verified', 'agent_succeeded'].includes(input.type) && unresolvedNativeRepairHistory(run)) throw new InvalidTransitionError('invalid-native-evidence', run.state, input.type, 'Unresolved native history cannot authorize execution, acceptance, publication, or settlement.');
+  if (['review_approved', 'changes_requested'].includes(input.type) && run.nativeReview !== undefined && !authenticatedReviewMatches(run, input.reviewResult)) throw new InvalidTransitionError('invalid-native-evidence', run.state, input.type, 'Review payload must match the exact authenticated immutable terminal.');
   const from = run.state;
   const target = TRANSITION_TABLE[from][input.type];
 
@@ -789,6 +804,7 @@ export function applyTransition(
     updatedAt: now,
     history: [...run.history, {
       type: input.type, from, to, at: now, reason: input.reason,
+      ...(input.nativeLeadStop===undefined?{}:{nativeLeadStop:input.nativeLeadStop}),
       ...(input.type === 'start_fix' && input.repairAdmission !== undefined ? { repairAdmissionIndex: input.repairAdmission.attemptBinding!.admissionIndex } : {}),
       ...(input.repairAgentResult === undefined ? {} : { repairHandoff: validateRepairHandoff(run, input.repairAgentResult, input.type === 'repair_executor_continued') }),
     }],

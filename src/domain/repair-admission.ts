@@ -1,3 +1,4 @@
+import { validLeadRepairReference, type LeadRepairReference } from '../oracle/native-lead.js';
 import type { ResolvedExecutionConfiguration } from '../execution-profiles.js';
 import type { ExecutorIdentity } from './types.js';
 import { randomUUID } from 'node:crypto';
@@ -23,6 +24,9 @@ export const REPAIR_ESCALATION_KINDS = ['decision_required', 'complex_unavailabl
 export type RepairEscalationKind = (typeof REPAIR_ESCALATION_KINDS)[number];
 
 export interface RepairAdmissionSnapshot {
+  readonly leadDisposition?: LeadRepairReference;
+  readonly packetSha256?: string;
+  readonly budgetLimit?: number;
   readonly authorityRevision: string;
   readonly taskShape: TaskShape;
   readonly taxonomyRevision: typeof REPAIR_FINDING_TAXONOMY_REVISION;
@@ -220,6 +224,8 @@ export function isRepairAdmissionSnapshot(value: unknown): value is RepairAdmiss
     isResolvedExecution(snapshot.execution) && snapshot.execution.profile === snapshot.executionProfile &&
     snapshot.execution.revision === snapshot.executionRevision &&
     typeof snapshot.admittedAt === 'string' &&
+    (snapshot.budgetLimit===undefined || Number.isSafeInteger(snapshot.budgetLimit) && Number(snapshot.budgetLimit)>0) &&
+    (snapshot.leadDisposition === undefined || validLeadRepairReference(snapshot.leadDisposition as LeadRepairReference) && typeof snapshot.packetSha256==='string' && /^[0-9a-f]{64}$/.test(snapshot.packetSha256)) &&
     (snapshot.attemptBinding === undefined || (isRepairAttemptBinding(snapshot.attemptBinding) &&
       isAttemptBindingCompatible(snapshot.execution.executor, snapshot.attemptBinding)));
 }
