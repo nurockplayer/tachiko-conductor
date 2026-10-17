@@ -67,10 +67,22 @@ jobs:
           set -euo pipefail
           pnpm install --frozen-lockfile --ignore-scripts --store-dir "$QUAL_ROOT/artifact/store"
           pnpm exec playwright install chromium
-          pnpm_program=$(pnpm exec node -p 'require("fs").realpathSync(process.env.npm_execpath)')
+          mkdir -m 700 "$QUAL_ROOT/toolchain"
+          node <<'NODE'
+          const fs = require('node:fs');
+          const path = require('node:path');
+          fs.writeFileSync(path.join(process.env.QUAL_ROOT, 'toolchain/package.json'), JSON.stringify({
+            private: true, packageManager: 'pnpm@10.34.5',
+            scripts: { 'locate-pnpm': 'node -p "require(\'fs\').realpathSync(process.env.npm_execpath)"' },
+          }));
+          NODE
+          pnpm_program=$(pnpm --silent --dir "$QUAL_ROOT/toolchain" run locate-pnpm)
           test -f "$pnpm_program"
+          node_program=$(node -p 'require("fs").realpathSync(process.execPath)')
+          test "$(env -i PATH="$(dirname "$node_program"):/usr/bin:/bin" HOME="$QUAL_ROOT/host-home" "$pnpm_program" --version)" = 10.34.5
+          printf 'configured-pnpm=%s\n' "$pnpm_program"
           printf 'PNPM_PROGRAM=%s\n' "$pnpm_program" >> "$GITHUB_ENV"
-          node -e 'const f=require("fs"),c=require("crypto"),p=require("path");const lock=c.createHash("sha256").update(f.readFileSync("pnpm-lock.yaml")).digest("hex");f.writeFileSync(p.join(process.env.QUAL_ROOT,"artifact/pnpm-lock.yaml.sha256"),lock+"\n",{mode:0o600});f.writeFileSync(p.join(process.env.QUAL_ROOT,"artifact/candidate.json"),JSON.stringify({head:process.env.CANDIDATE_SHA,tree:process.env.CANDIDATE_TREE,lockSha256:lock})+"\n",{mode:0o600});console.log(JSON.stringify({head:process.env.CANDIDATE_SHA,tree:process.env.CANDIDATE_TREE,lockSha256:lock,pnpm:process.env.npm_execpath}))'
+          node -e 'const f=require("fs"),c=require("crypto"),p=require("path");const lock=c.createHash("sha256").update(f.readFileSync("pnpm-lock.yaml")).digest("hex");f.writeFileSync(p.join(process.env.QUAL_ROOT,"artifact/pnpm-lock.yaml.sha256"),lock+"\n",{mode:0o600});f.writeFileSync(p.join(process.env.QUAL_ROOT,"artifact/candidate.json"),JSON.stringify({head:process.env.CANDIDATE_SHA,tree:process.env.CANDIDATE_TREE,lockSha256:lock})+"\n",{mode:0o600});console.log(JSON.stringify({head:process.env.CANDIDATE_SHA,tree:process.env.CANDIDATE_TREE,lockSha256:lock}))'
           chmod -R go-w "$QUAL_ROOT/artifact" "$QUAL_ROOT/browsers"
       - name: Full host unit and real Darwin confinement tests
         working-directory: candidate
