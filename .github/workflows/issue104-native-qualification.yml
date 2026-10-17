@@ -12,8 +12,8 @@ jobs:
     runs-on: macos-26
     timeout-minutes: 45
     env:
-      CANDIDATE_SHA: 1767045cb3169363e75fd58507012793ae914ac5
-      CANDIDATE_TREE: 609309a4ad69f92bf410b7e5e7019e895181fb2b
+      CANDIDATE_SHA: cea583cad5df4a21f289613ac4ec3ed354171ee7
+      CANDIDATE_TREE: cbd1cbc6feb22a49a49edf6dd057de9ce1c16861
     steps:
       - uses: actions/checkout@v7
         with:
@@ -21,7 +21,7 @@ jobs:
           persist-credentials: false
       - uses: actions/checkout@v7
         with:
-          ref: 1767045cb3169363e75fd58507012793ae914ac5
+          ref: cea583cad5df4a21f289613ac4ec3ed354171ee7
           path: candidate
           persist-credentials: false
       - uses: actions/setup-node@v7
