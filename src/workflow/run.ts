@@ -1,6 +1,6 @@
 import { originalImplementationMatches } from '../domain/implementation-authority.js';
 import { oracleDigest } from '../oracle/source-evidence.js';
-import { nativeLeadReentry, nativeLeadStopped, unresolvedNativeLead, type NativeLeadBoundary } from '../oracle/native-lead.js';
+import { activeNativeLead, nativeLeadReentry, nativeLeadStopped, unresolvedNativeLead, type NativeLeadBoundary } from '../oracle/native-lead.js';
 import { initiateNativeMerge, observeNativeMerge, type NativeMergeHost, type MergeContext } from './merge.js';
 import {
   GOVERNED_PUBLICATION_REENTRY_ACTION,
@@ -23,6 +23,7 @@ import { activeHostedPolicyIdentity, activeLocalPolicyIdentity, applyTransition,
 import { isValidationResultCoherent } from '../domain/validation.js';
 import type { AgentResult, ExecutorIdentity, HostedValidationEvidence, LocalValidationEvidence, Run, Target, ValidationResult } from '../domain/types.js';
 import {
+  appendRunTelemetryEvents,
   createCompletionInputFromResult,
   recordCompletionTelemetry,
   recordSpawnTelemetry,
@@ -153,6 +154,8 @@ export interface WorkflowOptions {
   readonly assertReviewClaim?: (run: Run) => Promise<void>;
   readonly assertLeadInitiation?: (run: Run) => Promise<void>;
   readonly leadObservationOnly?: boolean;
+  readonly nativeCachedOnly?: boolean;
+  readonly nativeRecoveryDecisionOnly?: boolean;
   readonly withNativeEffectBoundary?: <T>(operation:()=>T)=>T;
   readonly leadRecoveryConfiguration?: import('../dispatch/config.js').DispatchConfiguration;
   readonly assertMergeInitiation?: (run: Run) => Promise<void>;
@@ -627,9 +630,46 @@ export async function runWorkflow(
     const {validationResult: _historicalValidation, ...withoutHistoricalValidation} = refreshed;
     return {...withoutHistoricalValidation,nativeReview:{...current.nativeReview!,wait:undefined}};
   };
+  // One configured recovery decision owns only remote evidence. Even a complete
+  // response must return before verdict adoption, repair admission or publication.
+  if(options.nativeRecoveryDecisionOnly) {
+    const snapshot=await github.readLiveSnapshot(target);
+    const context={run,snapshot,store,now,assertCurrent:()=>assertPublicationAdmission(options),assertLiveClaim:options.assertReviewClaim===undefined?undefined:()=>options.assertReviewClaim!(store.read(run.id)??run),
+      ...(options.admissionFence===undefined?{}:{owner:{missionId:options.admissionFence.productionMissionId,laneId:options.admissionFence.token.laneId,generation:options.admissionFence.token.generation}}),
+      withIssueBoundary:options.withMergeBoundary,assertInitiation:options.assertLeadInitiation===undefined?undefined:()=>options.assertLeadInitiation!(store.read(run.id)??run),recoveryConfiguration:options.leadRecoveryConfiguration,
+      onSubmission:(current:Run)=>{
+        options.onExecutionStart?.();
+        if(!unresolvedNativeLead(current))return recordSpawnTelemetry(current,{role:'reviewer',attemptKind:'review',headSha:current.headSha,contextMode:'bounded',contextJustification:'live-target-bounded'},now()).run;
+        const identity=activeNativeLead(current)!.identity,invocationId=`spawn:lead:${identity.requestId}`;
+        return appendRunTelemetryEvents(current,[{id:invocationId,invocationId,kind:'spawn',at:now(),role:'lead',attemptKind:'lead',attempt:(current.telemetry?.events.filter(e=>e.kind==='spawn'&&e.role==='lead').length??0)+1,headSha:identity.headSha,provider:'native-lead',model:identity.requestedModel,reasoningEffort:identity.requestedEffort,profile:null,contextMode:'bounded',contextJustification:'live-target-bounded'}]);
+      }};
+    const attention=(current:Run,role:'lead'|'review',reason:string):WorkflowOutcome=>{
+      const wait={kind:'qualification' as const,nextAttemptAt:new Date(Date.parse(now())+30_000).toISOString()};
+      const next=role==='lead'?{...current,nativeLead:{...current.nativeLead!,wait}}:{...current,nativeReview:{...current.nativeReview!,wait}};
+      if(!updateIfCurrent(store,current,next))return staleWorkflowOutcome(current.id,current,store,'Run changed before recovery decision attention.');
+      return {outcome:'waiting_dependency',run:next,reason};
+    };
+    if(!context.assertInitiation || !context.withIssueBoundary || !context.assertLiveClaim || !isValidationFresh(run,activeValidationConfiguration(deps)))
+      return attention(run,unresolvedNativeLead(run)?'lead':'review','Qualified recovery decision requires current owner/claim/HOLD and validation authority.');
+    if(deps.nativeLead?.canRecover?.(run,now())) {
+      const active=activeNativeLead(run)!;
+      const execution=deps.resolveRepairExecutionProfile?.('routine');
+      if(!execution || oracleDigest(execution)!==oracleDigest(run.execution))return attention(run,'lead','Qualified recovery execution is unavailable or changed.');
+      const result=await deps.nativeLead.advance({...context,execution,maxAttempts:active.identity.repairLimit});
+      if(result.outcome==='wait' && result.run.nativeLead?.activeRequestId===active.identity.requestId && oracleDigest(result.run.nativeLead.requests)===oracleDigest(run.nativeLead!.requests))return attention(result.run,'lead',result.reason);
+      return {outcome:'waiting_dependency',run:result.run,reason:'Qualified lead recovery decision finished; fresh reentry is required before any repair.'};
+    }
+    if(reviewer.native?.canRecover?.(run,now())) {
+      const original=run.nativeReview?.activeRequestId;
+      const result=await reviewer.native.advance(context);
+      if(result.outcome==='wait' && result.run.nativeReview?.activeRequestId===original && oracleDigest(result.run.nativeReview!.requests)===oracleDigest(run.nativeReview!.requests))return attention(result.run,'review',result.reason);
+      return {outcome:'waiting_dependency',run:result.run,reason:'Qualified Oracle recovery decision finished; fresh reentry is required before verdict adoption.'};
+    }
+    return {outcome:'waiting_dependency',run,reason:'Qualified recovery decision is no longer eligible.'};
+  }
   if (options.leadObservationOnly || unresolvedNativeLead(run) && !(run.state==='CHANGES_REQUESTED' || run.state==='WAITING_DEPENDENCY' && run.interruptedFrom==='CHANGES_REQUESTED')) {
     const snapshot=await github.readLiveSnapshot(run.target);
-    const context=(current:Run)=>({run:current,snapshot,store,now,cachedOnly:options.leadObservationOnly && (current.nativeLead?.wait?.kind==='qualification'||current.nativeLead?.wait?.kind==='stop'||current.nativeReview?.wait?.kind==='qualification'),assertCurrent:()=>assertPublicationAdmission(options),assertLiveClaim:options.assertReviewClaim===undefined?undefined:()=>options.assertReviewClaim!(current),...(options.admissionFence===undefined?{}:{owner:{missionId:options.admissionFence.productionMissionId,laneId:options.admissionFence.token.laneId,generation:options.admissionFence.token.generation}})});
+    const context=(current:Run)=>({run:current,snapshot,store,now,cachedOnly:options.nativeCachedOnly || options.leadObservationOnly && (current.nativeLead?.wait?.kind==='qualification'||current.nativeLead?.wait?.kind==='stop'||current.nativeReview?.wait?.kind==='qualification'),assertCurrent:()=>assertPublicationAdmission(options),assertLiveClaim:options.assertReviewClaim===undefined?undefined:()=>options.assertReviewClaim!(current),...(options.admissionFence===undefined?{}:{owner:{missionId:options.admissionFence.productionMissionId,laneId:options.admissionFence.token.laneId,generation:options.admissionFence.token.generation}})});
     const reasons:string[]=[];
     if(unresolvedNativeReview(run)) {const observed=await reviewer.native?.observe?.(context(run));run=observed?.run??run;reasons.push(observed?.reason??'Qualified Oracle observation unavailable.');}
     if(unresolvedNativeLead(run)) {const observed=await deps.nativeLead?.observe(context(run));run=observed?.run??run;reasons.push(observed?.reason??'Qualified lead observation unavailable.');}

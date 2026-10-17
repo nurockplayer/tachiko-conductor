@@ -670,8 +670,8 @@ describe('bounded native lead through real persistence / dispatch / isolated rep
       f.cleanup();
     }
   });
-  it('preserves uncertainty on unsupported observation or conflicting returned URLs without inventing a URL or resending', async () => {
-    for (const unsupported of [true, false]) {
+  for (const unsupported of [true, false]) {
+    it(`preserves uncertainty on ${unsupported?'unsupported observation':'conflicting returned URL'} without inventing a URL or resending`, async () => {
       const f = fixture();
       try {
         f.setLeadSubmit(async () => ({ outcome: 'pending', conversationUrl: 'https://fixture.invalid/original' }));
@@ -686,13 +686,13 @@ describe('bounded native lead through real persistence / dispatch / isolated rep
         assert.equal(f.run().repairAdmissions, undefined);
         assert.equal(f.counts().leadCalls, 1);
         if (unsupported)
-          assert.equal(activeNativeLead(f.run())?.status, 'terminal_unknown');
+          assert.equal(activeNativeLead(f.run())?.status, 'pending');
       }
       finally {
         f.cleanup();
       }
-    }
-  });
+    });
+  }
   for (const state of ['FAILED', 'MERGED'] as const)
     it(`keeps unresolved lead ownership fenced through a forced terminal-looking ${state}`, async () => {
       const f = fixture();

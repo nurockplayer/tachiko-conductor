@@ -69,6 +69,7 @@ export interface DispatchOnceOptions {
   readonly issuedMergeRecoveryOnly?: boolean;
   readonly issuedLeadRecoveryOnly?: boolean;
   readonly nativeObservationEligible?: (run: Run, now: string) => boolean;
+  readonly nativeRecoveryEligible?: (run: Run, now: string) => boolean;
   readonly owner: string;
   readonly repo: string;
   readonly github: GitHubAdapter;
@@ -479,7 +480,7 @@ export async function dispatchOnce(options: DispatchOnceOptions): Promise<Dispat
     }
     if (run !== null) assertClaimAuthorityMatchesRun(existing.claim, run);
     if (run && !run.mergeAttempt?.submissionPossible && (unresolvedNativeLead(run) || unresolvedNativeReview(run)) &&
-      options.nativeObservationEligible?.(run,options.now()) !== true) {
+      options.nativeObservationEligible?.(run,options.now()) !== true && (options.maintenanceHold || options.nativeRecoveryEligible?.(run,options.now()) !== true)) {
       return {outcome:'existing_claim',claim:existing.claim};
     }
     if (options.issuedMergeRecoveryOnly && !run?.mergeAttempt?.submissionPossible) return { outcome: 'existing_claim', claim: existing.claim };

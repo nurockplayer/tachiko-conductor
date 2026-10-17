@@ -1272,6 +1272,7 @@ export async function runReviewLoop(
         run, snapshot: liveSnapshot, store, now, owner: deps.reviewOwner, recoveryConfiguration: deps.leadRecoveryConfiguration,
         ...(deps.assertReviewClaim === undefined ? {} : { assertLiveClaim: async () => await deps.assertReviewClaim!(store.read(run.id) ?? run) }),
         assertCurrent: () => deps.assertCurrentMutation?.(),
+        withIssueBoundary:deps.withLeadBoundary, assertInitiation:deps.assertLeadInitiation,
         onSubmission: (markedRun) => {
           deps.assertCurrentMutation?.();
           options.onExecutionStart?.();

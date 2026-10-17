@@ -1209,3 +1209,154 @@ for(const explicit of ['active','inactive','foreign','revoked','observer-unavail
 for(const bounded of ['future','refusal','unavailable','revoked-observer'] as const)for(const held of [true,false]) {
   it(`E2 actual automatic ${bounded} retained work held=${held} cannot readmit before an eligible observation`,()=>leadAttentionCliControl(['dispatch','once'],held,false,'none',bounded));
 }
+
+// Actual public entrypoints with real retained owner receipts; transport is controlled in process.
+for(const phase of ['FINAL_GATE','MERGE_READY'] as const)it(`N1 actual public explicit ${phase} attention recovery can schedule fresh gates after cached settlement`,async()=>{
+ const f:any=inactiveOracleFixture(),originalUserInfo=os.userInfo,log=console.log;
+ const env={data:process.env.TACHIKO_DATA_DIR,config:process.env.TACHIKO_DISPATCH_CONFIG};
+ const originals={list:GitHubDispatchRuntime.prototype.listRuntimeComments,update:GitHubDispatchRuntime.prototype.updateRuntimeComment,queue:GitHubDispatchRuntime.prototype.readQueueComment,create:GitHubDispatchRuntime.prototype.createRuntimeComment,snapshot:LiveGitHubAdapter.prototype.readLiveSnapshot,processRun:NodeProcessRunner.prototype.run};
+ let children=0,queueReads=0;
+ try{
+  os.userInfo=(()=>({...originalUserInfo(),homedir:f.root})) as typeof os.userInfo;process.env.TACHIKO_DATA_DIR=path.join(f.root,f.directory);process.env.TACHIKO_DISPATCH_CONFIG=JSON.stringify(f.config);console.log=()=>{};
+  await f.issue();const initial=f.store().read(f.run.id),[old,active]=initial.nativeReview.requests;
+  f.store().update({...initial,state:phase,reviewResult:f.terminal(active.identity).result});
+  f.registry=()=>createHostAdmissionRegistry();const w=oracleWorkflow(f);
+  for(let i=0;i<3;i++){f.tick();await w.poll();}
+  const r=f.store().read(f.run.id);assert.equal(r.nativeReview.wait.kind,'qualification');assert.equal(nativeReviewReentry(r,f.now()),false);assert.equal(f.reads().length,3);
+  const evidence={repository:'acme/widgets',run:r.id,issue:42,pullRequest:7,claim:r.dispatchClaimId,workspace:r.bootstrap.workspacePath};
+  const receipt=resolveRunOwnerReceiptPath('acme/widgets',r.id,evidence),base:any={schemaVersion:1,laneId:`run:${r.id}`,missionId:f.context().owner.missionId,repository:'acme/widgets',runId:r.id,issue:42,claimId:r.dispatchClaimId,workspace:r.bootstrap.workspacePath};
+  w.registry.park(w.token,'workflow_wait',()=>writeRunOwnerReceipt(receipt,{...base,phase:'park_transition',generation:1,token:w.token}),()=>writeRunOwnerReceipt(receipt,{...base,phase:'parked',generation:2}));
+  publishAdmissionRuntimeProjection(process.env.TACHIKO_DATA_DIR,w.registry,f.store(),{stage:'idle',supervisor:'parked',maintenanceHold:{active:false}});
+  let comments=[{id:'retained-oracle-attention',body:renderDispatchRuntime({issue:42,claimId:r.dispatchClaimId,runId:r.id,profile:'routine',repairTaskShapeAuthority:r.repairTaskShapeAuthority,state:'running',claimedAt:T0,heartbeatAt:T0,leaseUntil:'2099-01-01T00:00:00.000Z'})}];
+  GitHubDispatchRuntime.prototype.listRuntimeComments=async()=>structuredClone(comments);
+  GitHubDispatchRuntime.prototype.updateRuntimeComment=async(_id,body)=>{comments=[{id:'retained-oracle-attention',body}];return comments[0]!;};
+  GitHubDispatchRuntime.prototype.readQueueComment=async()=>{queueReads++;throw new Error('No new queue read');};
+  GitHubDispatchRuntime.prototype.createRuntimeComment=async()=>{throw new Error('No new claim');};
+  LiveGitHubAdapter.prototype.readLiveSnapshot=async()=>f.snapshot;
+  NodeProcessRunner.prototype.run=async()=>{children++;throw new Error('No child in attention scheduling control');};
+  f.receipts.recordNative(f.terminal(old.identity,'request_changes'));
+  const native={historicalCompletionHosts:f.hosts,nativeReviewerHost:f.host};
+  const firstExit=await main(['run','resume',r.id,'--decision','Explicitly reconcile authenticated historical Oracle attention'],native);
+  const settled=f.store().read(r.id);assert.equal(firstExit,0);assert.equal(unresolvedNativeReview(settled),false);assert.equal(settled.nativeReview.wait.kind,'qualification');assert.equal(selectDispatchRuntime(comments)!.claim.state,'running');
+  const parkedBefore=w.registry.readLane(`run:${r.id}`)!.generation;
+  let secondExit,error;try{secondExit=await main(['run','resume',r.id,'--decision','Explicitly schedule fresh gates after authenticated settlement'],native);}catch(e){error=String(e);}
+  const final=f.store().read(r.id);
+  log(JSON.stringify({control:'public-attention-settlement-then-fresh-resume',phase,firstExit,secondExit:secondExit??null,error:error??null,state:final.state,wait:final.nativeReview.wait?.kind,unresolved:unresolvedNativeReview(final),claim:selectDispatchRuntime(comments)!.claim.state,oldReviewPresent:!!final.reviewResult,oldValidationPresent:!!final.validationResult,generationBefore:parkedBefore,generationAfter:w.registry.readLane(`run:${r.id}`)!.generation,receiptPhase:readRunOwnerReceipt(receipt)?.phase,reads:f.reads().length,submits:f.submissions(),workers:w.workers(),children,queueReads}));
+  assert.equal(error,undefined,'public explicit recovery must remain usable after evidence-only settlement, without manual runtime-comment editing');
+  assert.equal(secondExit,0);assert.equal(final.state,'VALIDATING');assert.equal(final.reviewResult,undefined);assert.equal(final.validationResult,undefined);
+  // Continue through the actual owned command with controlled validation (no
+  // Git reconstruction in this fixture); public CLI claim selection above is real.
+  let validations=0;w.deps.validation.validate=async(current:Run)=>{validations++;return validationPassed(current.headSha).local;};
+  const fresh=await runIssueCommand(w.deps,'acme/widgets#42',{execution:r.execution,repairTaskShapeAuthority:r.repairTaskShapeAuthority,dispatchClaimId:r.dispatchClaimId,admission:w.registry,runOwnerReceiptPath:receipt,maxReviewAttempts:1,now:f.now,async assertReviewClaim(current){assert.equal(selectDispatchRuntime(comments)!.claim.claimId,current.dispatchClaimId);}});
+  assert.equal(fresh.run.state,'MERGE_READY');assert.equal(validations,1);assert.equal(fresh.run.reviewResult?.verdict,'approve');assert.equal(fresh.run.repairAdmissions?.length??0,0);assert.equal(f.submissions(),2);assert.equal(f.reads().length,3);assert.equal(children,0);assert.equal(w.workers(),0);
+
+ }finally{
+  GitHubDispatchRuntime.prototype.listRuntimeComments=originals.list;GitHubDispatchRuntime.prototype.updateRuntimeComment=originals.update;GitHubDispatchRuntime.prototype.readQueueComment=originals.queue;GitHubDispatchRuntime.prototype.createRuntimeComment=originals.create;LiveGitHubAdapter.prototype.readLiveSnapshot=originals.snapshot;NodeProcessRunner.prototype.run=originals.processRun;os.userInfo=originalUserInfo;console.log=log;
+  for(const [key,value] of [['TACHIKO_DATA_DIR',env.data],['TACHIKO_DISPATCH_CONFIG',env.config]] as const){if(value===undefined)delete process.env[key];else process.env[key]=value;}f.cleanup();
+ }
+});
+
+for(const cacheKind of ['active','inactive','foreign','absent'] as const)it(`N1 actual observed refusal retains explicit ${cacheKind} cached recovery`,async()=>{
+ const f:any=observationFixture(true),originalUserInfo=os.userInfo,data=process.env.TACHIKO_DATA_DIR,configEnv=process.env.TACHIKO_DISPATCH_CONFIG,log=console.log;
+ const original={list:GitHubDispatchRuntime.prototype.listRuntimeComments,update:GitHubDispatchRuntime.prototype.updateRuntimeComment,queue:GitHubDispatchRuntime.prototype.readQueueComment,create:GitHubDispatchRuntime.prototype.createRuntimeComment,snapshot:LiveGitHubAdapter.prototype.readLiveSnapshot,processRun:NodeProcessRunner.prototype.run};
+ let reads=0,submits=0,dispositions=0,children=0,executes=0,queueReads=0;
+ try{
+  os.userInfo=(()=>({...originalUserInfo(),homedir:f.root})) as typeof os.userInfo;process.env.TACHIKO_DATA_DIR=path.join(f.root,'runs');console.log=()=>{};
+  if(cacheKind==='inactive')f.replacement(3);
+  const observations=0;
+  const seed=f.store().read(f.run.id),config={revision:'original-dispatch',owner:'acme',repo:'widgets',controlIssue:90,queueCommentId:91,leaseDurationMs:60000};
+  const r={...seed,state:'WAITING_DEPENDENCY',interruptedFrom:'CHANGES_REQUESTED',reviewResult:f.request.packet.origin.result,validationResult:f.request.packet.authority.validation,nativeLead:{...seed.nativeLead,wait:{kind:'request',nextAttemptAt:T0},recoveryConfiguration:config,requests:seed.nativeLead.requests.map((q:any,i:number)=>cacheKind==='inactive'&&i===0?q:({...q,status:'pending',observations,nextObservationAt:T0}))}};f.store().update(r);process.env.TACHIKO_DISPATCH_CONFIG=JSON.stringify(config);
+  f.host.replacementDisposition=()=>{dispositions++;return 'irrecoverable_transport';};f.host.submit=async()=>{submits++;return {outcome:'pending'};};f.setObserve(async()=>{reads++;return {outcome:'incomplete',reason:'safety_refusal'};});
+  const registry=createHostAdmissionRegistry(),evidence={repository:'acme/widgets',run:r.id,issue:42,pullRequest:7,claim:r.dispatchClaimId,workspace:r.bootstrap.workspacePath};
+  const owner=registry.admit({laneId:`run:${r.id}`,role:'production_captain',evidence,highAutonomy:true});assert.equal(owner.outcome,'admitted');assert.equal(owner.missionId,f.request.identity.missionId);
+  const receipt=resolveRunOwnerReceiptPath('acme/widgets',r.id,evidence),base:any={schemaVersion:1,laneId:`run:${r.id}`,missionId:owner.missionId,repository:'acme/widgets',runId:r.id,issue:42,claimId:r.dispatchClaimId,workspace:r.bootstrap.workspacePath};
+  registry.park(owner.token,'workflow_wait',()=>writeRunOwnerReceipt(receipt,{...base,phase:'park_transition',generation:1,token:owner.token}),()=>writeRunOwnerReceipt(receipt,{...base,phase:'parked',generation:2}));
+  publishAdmissionRuntimeProjection(process.env.TACHIKO_DATA_DIR,registry,f.store(),{stage:'idle',supervisor:'parked',maintenanceHold:{active:false}});
+  let comments=[{id:'retained-replacement',body:renderDispatchRuntime({issue:42,claimId:r.dispatchClaimId,runId:r.id,profile:'routine',repairTaskShapeAuthority:r.repairTaskShapeAuthority,state:'running',claimedAt:T0,heartbeatAt:T0,leaseUntil:'2099-01-01T00:00:00.000Z'})}];
+  const runtime={async listRuntimeComments(){return structuredClone(comments);},async updateRuntimeComment(_id:string,body:string){comments=[{id:'retained-replacement',body}];return comments[0]!;},async readQueueComment(){queueReads++;return `<!-- issue-dispatch-queue:v1 -->\nready:\n  - issue: 42\n    route: codex\n    profile: routine\n    task-shape-revision: ${r.repairTaskShapeAuthority.revision}\n    task-shape: ${r.repairTaskShapeAuthority.shape}`;},async createRuntimeComment(){throw new Error('No successor claim');}};
+  GitHubDispatchRuntime.prototype.listRuntimeComments=runtime.listRuntimeComments;GitHubDispatchRuntime.prototype.updateRuntimeComment=runtime.updateRuntimeComment;GitHubDispatchRuntime.prototype.readQueueComment=runtime.readQueueComment;GitHubDispatchRuntime.prototype.createRuntimeComment=runtime.createRuntimeComment;
+  LiveGitHubAdapter.prototype.readLiveSnapshot=async()=>({headSha:r.headSha}) as any;NodeProcessRunner.prototype.run=async()=>{children++;throw new Error('No child permitted');};
+  assert.equal(nativeLeadReentry(r,new Date().toISOString()),true);assert.equal(f.host.binding.allowTransportReplacement,true);assert.equal(r.nativeLead.requests.length,cacheKind==='inactive'?2:1);
+  const canObserve=f.boundary.canObserve(r,new Date().toISOString());
+  const mainExit=await main(['dispatch','once'],{historicalCompletionHosts:f.hosts,nativeLeadHost:f.host});
+  const refused=f.store().read(r.id);assert.equal(refused.nativeLead.requests[cacheKind==='inactive'?1:0].failure,'safety_refusal');assert.equal(refused.nativeLead.wait.kind,'request');
+  if(cacheKind!=='absent')f.terminal(refused.nativeLead.requests[0].identity);if(cacheKind==='foreign')f.host.authenticate=()=>false;const generationBefore=registry.readLane(`run:${r.id}`)!.generation;
+  const automaticExit=await main(['dispatch','once'],{historicalCompletionHosts:f.hosts,nativeLeadHost:f.host});
+  let explicitExit,error;try{explicitExit=await main(['run','resume',r.id,'--decision','Explicitly reconcile authentic cached refusal completion'],{historicalCompletionHosts:f.hosts,nativeLeadHost:f.host});}catch(e){error=String(e);}
+  const current=f.store().read(r.id);
+  log(JSON.stringify({control:'observed-refusal-explicit-cache',cacheKind,mainExit,automaticExit,explicitExit:explicitExit??null,error:error??null,wait:current.nativeLead.wait.kind,status:current.nativeLead.requests[0].status,failure:current.nativeLead.requests[0].failure,completionProof:!!current.nativeLead.requests[0].completionProof,reads,submits,children,queueReads,generationBefore,generationAfter:registry.readLane(`run:${r.id}`)!.generation,successions:current.nativeLead.ownerSuccessions.length}));
+  assert.equal(error,undefined,'actual refusal must retain an intentional exact-owner cached evidence path even when its producer retained a request wait');
+  assert.equal(current.nativeLead.requests[0].completionProof!==undefined,cacheKind==='active'||cacheKind==='inactive');assert.equal(current.repairAdmissions,undefined);
+  assert.equal(unresolvedNativeLead(current),cacheKind!=='active');assert.equal(reads,1);assert.equal(submits,0);assert.equal(children,0);assert.equal(registry.readLane(`run:${r.id}`)!.generation,generationBefore+2);
+ }finally{GitHubDispatchRuntime.prototype.listRuntimeComments=original.list;GitHubDispatchRuntime.prototype.updateRuntimeComment=original.update;GitHubDispatchRuntime.prototype.readQueueComment=original.queue;GitHubDispatchRuntime.prototype.createRuntimeComment=original.create;LiveGitHubAdapter.prototype.readLiveSnapshot=original.snapshot;NodeProcessRunner.prototype.run=original.processRun;os.userInfo=originalUserInfo;console.log=log;if(data===undefined)delete process.env.TACHIKO_DATA_DIR;else process.env.TACHIKO_DATA_DIR=data;if(configEnv===undefined)delete process.env.TACHIKO_DISPATCH_CONFIG;else process.env.TACHIKO_DISPATCH_CONFIG=configEnv;f.cleanup();}
+});
+
+// Configured production composition and actual CLI/runner owner admission. No
+// service, Git or worker runs: the host returns controlled remote observations.
+async function qualifiedRecoveryCaller(role:'lead'|'review',command:string[],held:boolean,observations:number,caller:'main'|'runner'='main',denied=false) {
+  const f:any=role==='lead'?observationFixture(true):inactiveOracleFixture();
+  const previousUser=os.userInfo,log=console.log,env={...process.env};
+  const original={list:GitHubDispatchRuntime.prototype.listRuntimeComments,update:GitHubDispatchRuntime.prototype.updateRuntimeComment,queue:GitHubDispatchRuntime.prototype.readQueueComment,create:GitHubDispatchRuntime.prototype.createRuntimeComment,snapshot:LiveGitHubAdapter.prototype.readLiveSnapshot,processRun:NodeProcessRunner.prototype.run};
+  let submits=0,dispositions=0,children=0,reads=0,queues=0;
+  try {
+    os.userInfo=(()=>({...previousUser(),homedir:f.root})) as typeof os.userInfo;
+    process.env.TACHIKO_DATA_DIR=path.join(f.root,role==='lead'?'runs':f.directory);console.log=()=>{};
+    const config={revision:'original-dispatch',owner:'acme',repo:'widgets',controlIssue:90,queueCommentId:91,leaseDurationMs:60000};
+    process.env.TACHIKO_DISPATCH_CONFIG=JSON.stringify(config);
+    process.env.TACHIKO_LOCAL_VALIDATION_CONFIG=JSON.stringify({revision:'test-config-v1',commands:[{argv:['test'],timeoutMs:30000}]});
+    process.env.TACHIKO_HOSTED_CHECK_POLICY_CONFIG=JSON.stringify({revision:'test-hosted-policy-v1',mode:'required'});
+    const a=f.request.packet.authority;
+    const {profile:_profile,revision,...execution}=a.execution;
+    process.env.TACHIKO_EXECUTION_PROFILE_CONFIG=JSON.stringify({revision,profiles:Object.fromEntries(['routine','standard','complex','critical'].map(p=>[p,execution]))});
+    const home=path.join(f.root,'qualified-home');mkdirSync(home);
+    writeFileSync(path.join(home,'config.toml'),'tachiko_luna_runtime_revision = "luna-qualified-runtime-v1"\n[features]\nplugins = false\napps = false\nmcp_servers = {}\nweb_search = false\n[sandbox_workspace_write]\nnetwork_access = false\n');process.env.TACHIKO_LUNA_CODEX_HOME=home;
+    if(role==='review')await f.boundary.advance(f.context()); // actual first transport result
+    const seeded:any=f.store().read(f.run.id)!;
+    const key=role==='lead'?'nativeLead':'nativeReview';
+    const r:any={...seeded,state:'WAITING_DEPENDENCY',interruptedFrom:role==='lead'?'CHANGES_REQUESTED':'REVIEWING',validationResult:a.validation,
+      ...(role==='lead'?{reviewResult:a?f.request.packet.origin.result:undefined}:{}),
+      [key]:{...seeded[key],wait:{kind:'request',nextAttemptAt:T0},recoveryConfiguration:config,requests:seeded[key].requests.map((q:any)=>({...q,status:'incomplete',failure:'transport_failure',observations,nextObservationAt:T0}))}};
+    f.store().update(r);
+    const snapshot=role==='review'?f.snapshot:{repository:{owner:'acme',repo:'widgets'},issue:a.issue,headSha:r.headSha,pullRequest:{...r.pullRequest,state:'open',baseSha:f.request.identity.baseSha},handoff:{sourceId:a.scope.sourceId,sourceScope:a.scope.sourceScope,sourceUpdatedAt:a.scope.sourceUpdatedAt,freshness:'current',sections:{scope:a.scope.text}},problems:[]};
+    f.host.replacementDisposition=()=>{dispositions++;return denied?'unavailable':'irrecoverable_transport';};
+    f.host.submit=async()=>{submits++;return{outcome:'pending'};};f.setObserve(async()=>{reads++;return{outcome:'pending'};});
+    const registry=createHostAdmissionRegistry(),evidence={repository:'acme/widgets',run:r.id,issue:42,pullRequest:7,claim:r.dispatchClaimId,workspace:r.bootstrap.workspacePath};
+    const owner=registry.admit({laneId:`run:${r.id}`,role:'production_captain',evidence,highAutonomy:true});assert.equal(owner.outcome,'admitted');if(owner.outcome!=='admitted')throw new Error('fixture admission');
+    const receipt=resolveRunOwnerReceiptPath('acme/widgets',r.id,evidence),base:any={schemaVersion:1,laneId:`run:${r.id}`,missionId:owner.missionId,repository:'acme/widgets',runId:r.id,issue:42,claimId:r.dispatchClaimId,workspace:r.bootstrap.workspacePath};
+    registry.park(owner.token,'workflow_wait',()=>writeRunOwnerReceipt(receipt,{...base,phase:'park_transition',generation:1,token:owner.token}),()=>writeRunOwnerReceipt(receipt,{...base,phase:'parked',generation:2}));
+    publishAdmissionRuntimeProjection(process.env.TACHIKO_DATA_DIR,registry,f.store(),{stage:held?'maintenance_hold':'idle',supervisor:'parked',maintenanceHold:{active:held}});
+    let comments=[{id:'qualified-retained',body:renderDispatchRuntime({issue:42,claimId:r.dispatchClaimId,runId:r.id,profile:'routine',repairTaskShapeAuthority:r.repairTaskShapeAuthority,state:'running',claimedAt:T0,heartbeatAt:T0,leaseUntil:'2099-01-01T00:00:00.000Z'})}];
+    const runtime={async listRuntimeComments(){return structuredClone(comments);},async updateRuntimeComment(_id:string,body:string){comments=[{id:'qualified-retained',body}];return comments[0]!;},async readQueueComment(){queues++;throw new Error('Issued recovery must not read queue');},async createRuntimeComment(){throw new Error('No successor claim');}};
+    GitHubDispatchRuntime.prototype.listRuntimeComments=runtime.listRuntimeComments;GitHubDispatchRuntime.prototype.updateRuntimeComment=runtime.updateRuntimeComment;GitHubDispatchRuntime.prototype.readQueueComment=runtime.readQueueComment;GitHubDispatchRuntime.prototype.createRuntimeComment=runtime.createRuntimeComment;
+    LiveGitHubAdapter.prototype.readLiveSnapshot=async()=>snapshot;NodeProcessRunner.prototype.run=async()=>{children++;throw new Error('No child in read-only recovery decision');};
+    const native:any={historicalCompletionHosts:f.hosts,...(role==='lead'?{nativeLeadHost:f.host}:{nativeReviewerHost:f.host})};
+    assert.equal(f.boundary.canRecover!(f.store().read(r.id)!,new Date().toISOString()),true);
+    if(caller==='main')assert.equal(await main(command,native),0);
+    else {
+      const deps=buildWorkflowDeps(f.store(),undefined,process.env,undefined,native.nativeReviewerHost,undefined,native.nativeLeadHost);
+      const invoke=async(current:any,claim:string,admission:any,_release:any,lock:any,assertClaim:any,_merge:any,initiate:any,observationOnly:any,recovery:any)=>runIssueCommand(deps,'acme/widgets#42',{execution:r.execution,repairTaskShapeAuthority:r.repairTaskShapeAuthority,dispatchClaimId:claim,admission,withDispatchAdmissionLock:lock,assertReviewClaim:assertClaim,assertLeadInitiation:initiate,leadObservationOnly:observationOnly,nativeRecoveryDecisionOnly:!held,leadRecoveryConfiguration:recovery});
+      await dispatchOnceCommand(config,{workflow:deps,runtime,admission:registry,maintenanceHold:held,issuedLeadRecoveryOnly:true,withAdmissionLock:async op=>op(),resolveExecutionProfile:()=>r.execution,resumeClaimedRun:invoke,runIssue:async()=>{throw new Error('No new run');}});
+    }
+    const current:any=f.store().read(r.id)!;
+    assert.equal(current[key].requests.length,held||denied?1:2);
+    assert.equal(submits,held||denied?0:1);assert.equal(dispositions,held?0:1);assert.equal(reads,held&&observations<3?1:0);
+    assert.equal(current.repairAdmissions,undefined);assert.equal(current.history.some((h:any)=>h.type==='start_fix'),false);
+    assert.equal(role==='lead'?unresolvedNativeLead(current):unresolvedNativeReview(current),true,'replaced original remains remotely unresolved');
+    assert.equal(children,0);assert.equal(queues,0);assert.equal(selectDispatchRuntime(comments)!.claim.issue,42);
+    assert.equal(readRunOwnerReceipt(receipt)?.workDisposition,undefined);
+    if(denied){
+      assert.equal(current[key].wait.kind,'qualification');const generation=registry.readLane(`run:${r.id}`)!.generation;
+      assert.equal(await main(command,native),0);assert.equal(dispositions,1);assert.equal(submits,0);assert.equal(registry.readLane(`run:${r.id}`)!.generation,generation);
+    }
+    if(!held&&!denied){assert.equal(current[key].requests[0].status,'replaced');assert.equal(current[key].requests[1].observations,0);assert.equal(current[key].requests[1].submissionPossible,true);assert.equal(current[key].requests[0].observations,observations);}
+  } finally {
+    GitHubDispatchRuntime.prototype.listRuntimeComments=original.list;GitHubDispatchRuntime.prototype.updateRuntimeComment=original.update;GitHubDispatchRuntime.prototype.readQueueComment=original.queue;GitHubDispatchRuntime.prototype.createRuntimeComment=original.create;LiveGitHubAdapter.prototype.readLiveSnapshot=original.snapshot;NodeProcessRunner.prototype.run=original.processRun;os.userInfo=previousUser;console.log=log;
+    for(const key of Object.keys(process.env))if(!(key in env))delete process.env[key];Object.assign(process.env,env);f.cleanup();
+  }
+}
+for(const role of ['lead','review'] as const)for(const observations of [0,3])for(const held of [false,true])for(const command of [['dispatch','once'],['dispatch','serve','--max-cycles','1']])
+  it(`N2 actual ${role} ${command.join(' ')} observation=${observations} held=${held} separates qualified replacement from bounded reads`,()=>qualifiedRecoveryCaller(role,command,held,observations));
+for(const role of ['lead','review'] as const)
+  it(`N2 direct ${role} runner admits one configured replacement despite spent read budget`,()=>qualifiedRecoveryCaller(role,['dispatch','once'],false,3,'runner'));
+
+for(const role of ['lead','review'] as const)it(`N2 ${role} configured disposition denial becomes finite attention without submission or automatic decision polling`,()=>qualifiedRecoveryCaller(role,['dispatch','once'],false,3,'main',true));

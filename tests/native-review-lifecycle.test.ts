@@ -575,14 +575,21 @@ describe('native review through the real factory / durable dispatcher', () => {
     } finally { f.cleanup(); }
   });
 
-  it('records unknown unsupported recovery and uses only an explicit qualified irrecoverable-transport disposition for one replacement', async () => {
+  it('retains unsupported pending recovery and uses a genuine lost acknowledgement for one explicitly qualified replacement', async () => {
     const f = fixture();
     try {
-      f.seed(); await f.poll(); const original = f.request();
+      f.seed(); await f.poll();
       const { observe: _observe, ...unsupported } = f.host;
       f.tick(); await f.poll(unsupported);
-      assert.equal(activeNativeReview(f.store().read('run-native')!)!.status, 'terminal_unknown');
+      assert.equal(activeNativeReview(f.store().read('run-native')!)!.status, 'pending');
       assert.equal(f.counts().submissions, 1);
+      assert.equal(activeNativeReview(f.store().read('run-native')!)!.failure, undefined);
+    } finally { f.cleanup(); }
+    const f2=fixture();
+    try {
+      const f=f2; f.seed(); f.setSubmit(async()=>{throw new Error('actual controlled lost acknowledgement');}); await f.poll(); const original=f.request();
+      const {observe:_observe,...unsupported}=f.host;
+      assert.equal(activeNativeReview(f.store().read('run-native')!)!.status,'terminal_unknown');
       f.tick();
       await f.poll({ ...unsupported, replacementDisposition: () => 'irrecoverable_transport' });
       const replaced = f.store().read('run-native')!;
@@ -591,11 +598,12 @@ describe('native review through the real factory / durable dispatcher', () => {
       assert.equal(replaced.nativeReview!.requests[0]!.retirementReason, 'irrecoverable_transport');
       assert.equal(replaced.nativeReview!.requests[0]!.failure, undefined, 'unknown is not fabricated transport failure/cancellation');
       f.receipts().recordNative(f.terminal(original));
-      f.tick(); await f.poll(unsupported);
+      await runIssueCommand(f.workflow(unsupported),'acme/widgets#42',{execution,dispatchClaimId:'claim-native',repairTaskShapeAuthority:authority,admission:f.registry(),runOwnerReceiptPath:f.receiptPath,admissionWorkspace:f.repository,now:f.now,leadObservationOnly:true,nativeCachedOnly:true,async assertReviewClaim(){},withDispatchAdmissionLock:async op=>op()});
+      assert.ok(f.store().read('run-native')!.nativeReview!.requests[0]!.completionProof,'explicit exact cached original terminal is reconciled');
       f.tick(); await f.poll({ ...unsupported, replacementDisposition: () => 'irrecoverable_transport' });
       assert.equal(f.store().read('run-native')!.nativeReview!.accepted, undefined);
       assert.equal(f.counts().submissions, 2);
-    } finally { f.cleanup(); }
+    } finally { f2.cleanup(); }
   });
 
   it('retains original correlation without inventing a URL after remote acceptance and lost acknowledgement', async () => {

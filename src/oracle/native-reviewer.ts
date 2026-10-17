@@ -241,6 +241,15 @@ export function resolveNativeReviewer(host?: NativeReviewerHost): ReviewerAdapte
     observe,
     available: () => usableHost(host),
     canObserve: (run,now) => usableHost(host) && typeof host.observe === 'function' && nativeReviewObservationDue(run,now,host.binding),
+    canRecover: (run,now) => {
+      const active=activeNativeReview(run);
+      return usableHost(host) && run.state==='WAITING_DEPENDENCY' && run.interruptedFrom==='REVIEWING' && typeof host.replacementDisposition==='function' && host.binding.allowTransportReplacement &&
+        run.nativeReview?.wait?.kind!=='qualification' && !nativeLeadStopped(run) && !!active && active.submissionPossible &&
+        !hasAuthenticatedCompletion(active.identity,active.terminalDigest,active.completionProof,'review') && active.failure!=='safety_refusal' &&
+        (active.failure==='transport_failure' || active.status==='terminal_unknown') && active.identity.bindingId===host.binding.bindingId &&
+        active.identity.policyRevision===host.binding.policyRevision && active.identity.requestedModel===host.binding.model &&
+        run.nativeReview!.requests.filter(r=>sameCandidate(r.identity,active.identity)).length<2 && run.nativeReview!.requests.length<20 && Date.parse(active.nextObservationAt)<=Date.parse(now);
+    },
     async advance(context) {
       let run = context.run;
       const wait = (reason: string) => ({ outcome: 'wait' as const, run, reason });
@@ -290,7 +299,9 @@ export function resolveNativeReviewer(host?: NativeReviewerHost): ReviewerAdapte
         return wait('Native review unavailable: active request authority changed; original identity remains fenced.');
       }
       let replacement = false;
-      const irrecoverable = active?.status === 'terminal_unknown' && host.replacementDisposition?.(frozen(active)) === 'irrecoverable_transport';
+      const disposition = active && (active.status==='terminal_unknown' || active.status==='incomplete' && active.failure==='transport_failure') ? host.replacementDisposition?.(frozen(active)) : undefined;
+      const irrecoverable = active?.status === 'terminal_unknown' && disposition === 'irrecoverable_transport';
+      if(active?.status==='incomplete' && active.failure==='transport_failure' && host.replacementDisposition && disposition!=='irrecoverable_transport')return wait('Native review replacement allowance requires the configured qualified transport disposition.');
       if (active?.status === 'incomplete' && active.failure === 'transport_failure' || irrecoverable) {
         if (!host.binding.allowTransportReplacement || (run.nativeReview?.requests.filter((r) => sameCandidate(r.identity, active!.identity)).length ?? 0) >= 2) return wait('Native review incomplete: durable replacement allowance unavailable or exhausted.');
         replacement = true;
@@ -324,15 +335,25 @@ export function resolveNativeReviewer(host?: NativeReviewerHost): ReviewerAdapte
       if (active.status === 'qualified_complete') return wait('Native review incomplete: immutable accepted receipt is missing.');
       let response: NativeReviewObservation;
       if (!active.submissionPossible) {
-        const marked = { ...active, submissionPossible: true };
-        if (!save({ ...run, nativeReview: { ...run.nativeReview!, requests: run.nativeReview!.requests.map((r) => r.identity.requestId === active!.identity.requestId ? marked : r) } })) return stale();
-        active = marked;
-        await context.assertLiveClaim();
-        context.assertCurrent();
-        if (!save(context.onSubmission(run))) return stale();
-        context.assertCurrent();
-        if (context.store.updateIfUnchanged?.(run, run) !== true) return stale();
-        try { response = await host.submit(requestEvidence); } catch { response = { outcome: 'terminal_unknown' }; }
+        const issue = async () => {
+          await context.assertInitiation?.();
+          await context.assertLiveClaim!();
+          context.assertCurrent();
+          const marked = { ...active!, submissionPossible: true };
+          if (!save({ ...run, nativeReview: { ...run.nativeReview!, requests: run.nativeReview!.requests.map((r) => r.identity.requestId === active!.identity.requestId ? marked : r) } })) return null;
+          active = marked;
+          if (!save(context.onSubmission(run))) return null;
+          await context.assertInitiation?.();
+          await context.assertLiveClaim!();
+          context.assertCurrent();
+          if (context.store.updateIfUnchanged?.(run, run) !== true) return null;
+          let promise: Promise<NativeReviewObservation>;
+          try { promise=host.submit(requestEvidence); } catch { promise=Promise.resolve({outcome:'terminal_unknown'}); }
+          return {promise};
+        };
+        const issued=await (context.withIssueBoundary ? context.withIssueBoundary(issue) : issue());
+        if(!issued)return stale();
+        try { response=await issued.promise; } catch { response={outcome:'terminal_unknown'}; }
       } else {
         if (active.observations >= NATIVE_REVIEW_OBSERVATIONS || Date.parse(active.nextObservationAt) > Date.parse(context.now())) return wait('Native review pending: bounded observation is parked.');
         if (host.observe === undefined) {

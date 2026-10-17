@@ -76,7 +76,7 @@ import {
 import { GitHubLiveStateError } from './github/errors.js';
 import { LiveGitHubAdapter } from './github/live-state.js';
 import { GhCliTransport, NodeProcessRunner } from './github/transport.js';
-import { resolveNativeReviewer, unresolvedNativeReview, issuedReviewRecoveryConfiguration } from './oracle/native-reviewer.js';
+import { resolveNativeReviewer, unresolvedNativeReview, settledHistoricalReviewGate, issuedReviewRecoveryConfiguration } from './oracle/native-reviewer.js';
 import type { NativeReviewerHost } from './oracle/types.js';
 import { JsonFileStore, type RunStore } from './store/json-file-store.js';
 import { GitWorktreeBootstrap } from './workspace/git-worktree-bootstrap.js';
@@ -1522,6 +1522,8 @@ export interface WorkflowCommandOptions {
   readonly assertReviewClaim?: (run: Run) => Promise<void>;
   readonly assertLeadInitiation?: (run: Run) => Promise<void>;
   readonly leadObservationOnly?: boolean;
+  readonly nativeCachedOnly?: boolean;
+  readonly nativeRecoveryDecisionOnly?: boolean;
   readonly withNativeEffectBoundary?: <T>(operation:()=>T)=>T;
   readonly leadRecoveryConfiguration?: import('./dispatch/config.js').DispatchConfiguration;
   readonly assertMergeInitiation?: (run: Run) => Promise<void>;
@@ -1610,7 +1612,7 @@ export async function runIssueCommand(
     const outcome = await runWorkflow(deps, run.id, {
       admittedRun: admitted?.run.nativeLead === undefined ? undefined : admitted.run,
       assertReviewClaim: options.assertReviewClaim,
-      assertLeadInitiation: options.assertLeadInitiation, leadObservationOnly:options.leadObservationOnly, leadRecoveryConfiguration:options.leadRecoveryConfiguration, withNativeEffectBoundary:options.withNativeEffectBoundary ?? withNativeEffectBoundary,
+      assertLeadInitiation: options.assertLeadInitiation, leadObservationOnly:options.leadObservationOnly, nativeCachedOnly:options.nativeCachedOnly, nativeRecoveryDecisionOnly:options.nativeRecoveryDecisionOnly, leadRecoveryConfiguration:options.leadRecoveryConfiguration, withNativeEffectBoundary:options.withNativeEffectBoundary ?? withNativeEffectBoundary,
       assertMergeInitiation: options.assertMergeInitiation,
       withMergeBoundary: options.withDispatchAdmissionLock,
       onMergeSubmission: () => {
@@ -1786,7 +1788,7 @@ export async function resumeCommand(
   const outcome = await runWorkflow(deps, id, {
     admittedRun: admissionToken === undefined || resumed.nativeLead === undefined ? undefined : resumed,
     assertReviewClaim: options.assertReviewClaim,
-    assertLeadInitiation: options.assertLeadInitiation, leadObservationOnly:options.leadObservationOnly, leadRecoveryConfiguration:options.leadRecoveryConfiguration, withNativeEffectBoundary:options.withNativeEffectBoundary ?? withNativeEffectBoundary,
+    assertLeadInitiation: options.assertLeadInitiation, leadObservationOnly:options.leadObservationOnly, nativeCachedOnly:options.nativeCachedOnly, nativeRecoveryDecisionOnly:options.nativeRecoveryDecisionOnly, leadRecoveryConfiguration:options.leadRecoveryConfiguration, withNativeEffectBoundary:options.withNativeEffectBoundary ?? withNativeEffectBoundary,
     assertMergeInitiation: options.assertMergeInitiation,
     withMergeBoundary: options.withDispatchAdmissionLock,
     onMergeSubmission: () => {
@@ -2914,7 +2916,9 @@ export async function main(argv: string[], native: CliNativeDependencies = {}): 
         const observedAt = new Date().toISOString();
         const leadObservable = (run: Run) => resolveNativeLead(native.nativeLeadHost).canObserve?.(run,observedAt) === true;
         const reviewObservable = (run: Run) => resolveNativeReviewer(native.nativeReviewerHost).native?.canObserve?.(run,observedAt) === true;
-        const issued = uncertain.filter(run => run.mergeAttempt?.submissionPossible || leadObservable(run) || reviewObservable(run));
+        const leadRecoverable=(run:Run)=>!maintenanceHold && resolveNativeLead(native.nativeLeadHost).canRecover?.(run,observedAt)===true;
+        const reviewRecoverable=(run:Run)=>!maintenanceHold && resolveNativeReviewer(native.nativeReviewerHost).native?.canRecover?.(run,observedAt)===true;
+        const issued = uncertain.filter(run => run.mergeAttempt?.submissionPossible || leadObservable(run) || reviewObservable(run) || leadRecoverable(run) || reviewRecoverable(run));
         const recovering = issued[0];
         if (recovering === undefined && (uncertain.length > 0 || retained.some(run => run.state === 'WAITING_DEPENDENCY' &&
           (run.nativeLead?.wait?.kind === 'qualification' || run.nativeLead?.wait?.kind === 'stop' || run.nativeReview?.wait?.kind === 'qualification') && !isDispatchRunOwnerRetiredCommand(store,run,admission)))) {
@@ -2926,10 +2930,11 @@ export async function main(argv: string[], native: CliNativeDependencies = {}): 
           return { outcome: 'maintenance_hold' as const, reason: 'Typed restart hold prevents new dispatch admission.' };
         }
         publishRuntime('scanning', 'running', nextPollAt());
-        const config = recovering === undefined ? processConfig ??= resolveDispatchConfiguration() : recovering.mergeAttempt?.submissionPossible ? issuedMergeRecoveryConfiguration(recovering) : leadObservable(recovering) ? issuedLeadRecoveryConfiguration(recovering) : issuedReviewRecoveryConfiguration(recovering);
+        const config = recovering === undefined ? processConfig ??= resolveDispatchConfiguration() : recovering.mergeAttempt?.submissionPossible ? issuedMergeRecoveryConfiguration(recovering) : leadObservable(recovering) || leadRecoverable(recovering) ? issuedLeadRecoveryConfiguration(recovering) : issuedReviewRecoveryConfiguration(recovering);
+        const recoveryDecision=recovering!==undefined && !recovering.mergeAttempt?.submissionPossible && (leadRecoverable(recovering)||reviewRecoverable(recovering));
         const transport = new GhCliTransport();
         const runtime = new GitHubDispatchRuntime(transport, config);
-        const workflow = recovering === undefined ? processWorkflow ??= buildWorkflowDeps(store, undefined, process.env, transport, native.nativeReviewerHost, native.nativeMergeHost, native.nativeLeadHost) : buildWorkflowDeps(store, undefined, {}, transport, native.nativeReviewerHost, native.nativeMergeHost, native.nativeLeadHost);
+        const workflow = recovering === undefined ? processWorkflow ??= buildWorkflowDeps(store, undefined, process.env, transport, native.nativeReviewerHost, native.nativeMergeHost, native.nativeLeadHost) : buildWorkflowDeps(store, undefined, recoveryDecision ? process.env : {}, transport, native.nativeReviewerHost, native.nativeMergeHost, native.nativeLeadHost);
         return await dispatchOnceCommand(config, {
           workflow,
           runtime,
@@ -2949,7 +2954,7 @@ export async function main(argv: string[], native: CliNativeDependencies = {}): 
               ...(execution === undefined ? {} : { execution }), dispatchClaimId, repairTaskShapeAuthority, admission: missionAdmission!,
               publishRuntimeProjection: (registry, runStore, update) => publishAdmissionRuntimeProjection(resolveRunsDir(), registry, runStore, update),
               releaseDispatchAdmissionLock: release, withDispatchAdmissionLock: withLock,
-              assertReviewClaim, leadObservationOnly: leadObservationOnly || recovering !== undefined && !recovering.mergeAttempt?.submissionPossible, leadRecoveryConfiguration,
+              assertReviewClaim, leadObservationOnly: leadObservationOnly || recovering !== undefined && !recovering.mergeAttempt?.submissionPossible && !recoveryDecision, nativeRecoveryDecisionOnly:recoveryDecision, leadRecoveryConfiguration,
               assertLeadInitiation:async(run)=>{if(readOperationalRuntimeProjection(resolveRunsDir())?.maintenanceHold.active)throw new Error('Maintenance HOLD prevents lead/repair initiation.');if(!assertLeadInitiation)throw new Error('Lead dispatch authority unavailable.');await assertLeadInitiation(run);},
               assertMergeInitiation: async (run) => {
                 if (readOperationalRuntimeProjection(resolveRunsDir())?.maintenanceHold.active) throw new Error('Maintenance HOLD prevents merge initiation.');
@@ -2969,7 +2974,7 @@ export async function main(argv: string[], native: CliNativeDependencies = {}): 
               publishRuntimeProjection: (registry, runStore, update) => publishAdmissionRuntimeProjection(resolveRunsDir(), registry, runStore, update),
               ...(workspace === undefined ? {} : { admissionWorkspace: workspace }),
               releaseDispatchAdmissionLock: release, withDispatchAdmissionLock: withLock,
-              assertReviewClaim, leadObservationOnly: leadObservationOnly || recovering !== undefined && !recovering.mergeAttempt?.submissionPossible, leadRecoveryConfiguration,
+              assertReviewClaim, leadObservationOnly: leadObservationOnly || recovering !== undefined && !recovering.mergeAttempt?.submissionPossible && !recoveryDecision, nativeRecoveryDecisionOnly:recoveryDecision, leadRecoveryConfiguration,
               assertLeadInitiation:async(run)=>{if(readOperationalRuntimeProjection(resolveRunsDir())?.maintenanceHold.active)throw new Error('Maintenance HOLD prevents lead/repair initiation.');if(!assertLeadInitiation)throw new Error('Lead dispatch authority unavailable.');await assertLeadInitiation(run);},
               assertMergeInitiation: async (run) => {
                 if (readOperationalRuntimeProjection(resolveRunsDir())?.maintenanceHold.active) throw new Error('Maintenance HOLD prevents merge initiation.');
@@ -3187,7 +3192,9 @@ export async function main(argv: string[], native: CliNativeDependencies = {}): 
       const withLock = async <T>(operation: () => Promise<T> | T) => await withDispatchAdmissionLock(operation);
       let commitDispatchResumeTransition: WorkflowCommandOptions['commitDispatchResumeTransition'];
       let assertReviewClaim: WorkflowCommandOptions['assertReviewClaim'];
-      const attentionObservation = unresolvedNativeWork(run) && (run.nativeLead?.wait?.kind === 'qualification' || run.nativeLead?.wait?.kind === 'stop' || run.nativeReview?.wait?.kind === 'qualification');
+      const attentionObservation = unresolvedNativeLead(run) || unresolvedNativeReview(run);
+      const historicalGateResume = !unresolvedNativeWork(run) && settledHistoricalReviewGate(run);
+      if(historicalGateResume && readOperationalRuntimeProjection(resolveRunsDir())?.maintenanceHold.active)throw new Error('Maintenance HOLD permits cached native evidence only; fresh gate scheduling must wait.');
       if (run.dispatchClaimId !== undefined) {
         if (run.target.kind !== 'issue' || run.execution === undefined) throw new Error(`Dispatch-bound Run "${id}" has no canonical issue/profile binding.`);
         const config = attentionObservation ? unresolvedNativeLead(run) ? issuedLeadRecoveryConfiguration(run) : issuedReviewRecoveryConfiguration(run) : resolveDispatchConfiguration();
@@ -3200,11 +3207,11 @@ export async function main(argv: string[], native: CliNativeDependencies = {}): 
           const claimBoundRun = claim.runId === null && expectedRun.target.kind === 'issue'
             ? claimedRun(store, claim, { issue: expectedRun.target.issueNumber, route: 'codex', profile: expectedRun.execution!.profile }, { owner: config.owner, repo: config.repo })
             : null;
-          assertCanonicalDispatchResumeClaim(expectedRun, claim, config, claimBoundRun, attentionObservation);
+          assertCanonicalDispatchResumeClaim(expectedRun, claim, config, claimBoundRun, attentionObservation || historicalGateResume);
           return selected;
         };
         await assertLiveClaim(run);
-        if (attentionObservation) assertReviewClaim = async current => { await assertLiveClaim(current); };
+        if (attentionObservation || historicalGateResume) assertReviewClaim = async current => { await assertLiveClaim(current); };
         commitDispatchResumeTransition = async (expectedRun, nextRun, commitRun) => {
           const live = await assertLiveClaim(expectedRun);
           const now = new Date().toISOString();
@@ -3220,13 +3227,13 @@ export async function main(argv: string[], native: CliNativeDependencies = {}): 
           assertDispatchRuntimeClaimReadback(live.id, transitionClaim, observed);
         };
       }
-      return await resumeCommand(buildWorkflowDeps(store, resolveCapabilities, process.env, undefined, native.nativeReviewerHost, native.nativeMergeHost, native.nativeLeadHost), id, values.decision!, {
+      return await resumeCommand(buildWorkflowDeps(store, resolveCapabilities, attentionObservation ? {} : process.env, undefined, native.nativeReviewerHost, native.nativeMergeHost, native.nativeLeadHost), id, values.decision!, {
         admission: createHostAdmissionRegistry(),
         publishRuntimeProjection: (registry, runStore, update) => publishAdmissionRuntimeProjection(resolveRunsDir(), registry, runStore, update),
         ...(admissionWorkspace === undefined ? {} : { admissionWorkspace }),
         releaseDispatchAdmissionLock: releaseAdmissionLock,
         withDispatchAdmissionLock: withLock,
-        assertReviewClaim, leadObservationOnly:attentionObservation,
+        assertReviewClaim, leadObservationOnly:attentionObservation, nativeCachedOnly:attentionObservation,
         ...(run.dispatchClaimId === undefined ? {} : { dispatchClaimId: run.dispatchClaimId, commitDispatchResumeTransition }),
       });
     });

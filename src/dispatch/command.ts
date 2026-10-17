@@ -52,6 +52,7 @@ export async function dispatchOnceCommand(
     issuedMergeRecoveryOnly: deps.issuedMergeRecoveryOnly,
     issuedLeadRecoveryOnly:deps.issuedLeadRecoveryOnly,
     nativeObservationEligible: (run,at) => deps.workflow.nativeLead?.canObserve?.(run,at) === true || deps.workflow.reviewer.native?.canObserve?.(run,at) === true,
+    nativeRecoveryEligible: (run,at) => deps.workflow.nativeLead?.canRecover?.(run,at) === true || deps.workflow.reviewer.native?.canRecover?.(run,at) === true,
     owner: config.owner,
     repo: config.repo,
     github: deps.workflow.github,

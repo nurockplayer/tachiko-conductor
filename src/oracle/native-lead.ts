@@ -435,6 +435,7 @@ export interface NativeLeadBoundary {
   available(): boolean;
   /** Configured-host scheduling only; grants no cached or executable authority. */
   canObserve?(run: Run, now: string): boolean;
+  canRecover?(run: Run, now: string): boolean;
   observe(context: NativeReviewContext & {
     readonly store: RunStore;
     readonly now: () => string;
@@ -601,6 +602,15 @@ export function resolveNativeLead(host?: NativeLeadHost): NativeLeadBoundary {
   };
   return { available: () => usable(host),
     canObserve: (run,now) => usable(host) && typeof host.observe === 'function' && nativeLeadObservationDue(run,now,host.binding),
+    canRecover: (run,now) => {
+      const active=activeNativeLead(run);
+      return usable(host) && run.state==='WAITING_DEPENDENCY' && run.interruptedFrom==='CHANGES_REQUESTED' && typeof host.replacementDisposition==='function' && host.binding.allowTransportReplacement &&
+        run.nativeLead?.wait?.kind!=='qualification' && run.nativeLead?.wait?.kind!=='stop' && !nativeLeadStopped(run) &&
+        !!active && active.submissionPossible && !hasAuthenticatedCompletion(active.identity,active.terminalDigest,active.completionProof,'lead') &&
+        active.failure!=='safety_refusal' && (active.failure==='transport_failure' || active.status==='terminal_unknown') &&
+        active.identity.bindingId===host.binding.bindingId && active.identity.policyRevision===host.binding.policyRevision && active.identity.requestedModel===host.binding.model &&
+        run.nativeLead!.requests.filter(r=>r.identity.incarnation===active.identity.incarnation).length<2 && run.nativeLead!.requests.length<20 && Date.parse(active.nextObservationAt)<=Date.parse(now);
+    },
     validate, observe, async advance(c) {
       let run = c.run;
       const wait = (reason: string) => ({ outcome: 'wait' as const, run, reason });

@@ -205,7 +205,8 @@ for (const observation of ['transport_failure', 'safety_refusal'] as const) {
       f.setLeadSubmit(async () => ({ outcome: 'pending' })); await f.poll(); f.setHold(true);
       f.setLeadObserve(async () => ({ outcome: 'incomplete', reason: observation })); Object.assign(f.lead, { replacementDisposition: () => 'irrecoverable_transport' });
       let prior = Date.parse(activeNativeLead(f.run())!.nextObservationAt);
-      for (let i = 0; i < 3; i++) { f.tick(); await f.poll(); const q = activeNativeLead(f.run())!; assert.equal(q.observations, i + 1); assert.equal(q.failure, observation); assert.ok(Date.parse(q.nextObservationAt) >= prior + 30000); prior = Date.parse(q.nextObservationAt); }
+      for (let i = 0; i < (observation==='transport_failure'?3:1); i++) { f.tick(); await f.poll(); const q = activeNativeLead(f.run())!; assert.equal(q.observations, i + 1); assert.equal(q.failure, observation); assert.ok(Date.parse(q.nextObservationAt) >= prior + 30000); prior = Date.parse(q.nextObservationAt); }
+      if(observation==='safety_refusal'){const generation=f.registry().readLane(`run:${f.run().id}`)!.generation,reads=f.counts().observations;f.tick();await f.poll();assert.equal(f.counts().observations,reads);assert.equal(f.registry().readLane(`run:${f.run().id}`)!.generation,generation);}
       assert.equal(f.counts().leadCalls, 1); assert.equal(f.run().repairAdmissions, undefined); assert.equal(f.counts().boundaries, 0);
       f.setHold(false); f.tick(); await f.poll();
       assert.equal(f.counts().leadCalls, observation === 'transport_failure' ? 2 : 1);
@@ -216,7 +217,11 @@ for (const observation of ['transport_failure', 'safety_refusal'] as const) {
 it('never downgrades held incomplete/refusal evidence when a later observation is only pending', async () => {
   const f = fixture(); try {
     f.setLeadSubmit(async () => ({ outcome: 'pending' })); await f.poll(); f.setHold(true);
-    for (const reason of ['transport_failure', 'safety_refusal', undefined] as const) { f.setLeadObserve(async () => reason ? { outcome: 'incomplete', reason } : { outcome: 'pending' }); f.tick(); await f.poll(); }
+    for (const reason of ['transport_failure', 'safety_refusal'] as const) { f.setLeadObserve(async () => reason ? { outcome: 'incomplete', reason } : { outcome: 'pending' }); f.tick(); await f.poll(); }
+    const reads=f.counts().observations; f.setLeadObserve(async()=>({outcome:'pending'})); f.tick(); await f.poll(); assert.equal(f.counts().observations,reads,'automatic refusal polling is disabled');
+    // Exercise monotonic evidence through the actual observer/store CAS without
+    // using the automatic scheduler to grant another refusal observation.
+    await runIssueCommand(f.workflow(),'acme/widgets#42',{execution:f.execution,repairTaskShapeAuthority:f.shape,dispatchClaimId:f.run().dispatchClaimId,admission:f.registry(),runOwnerReceiptPath:f.receiptPath,now:f.now,maxReviewAttempts:1,leadObservationOnly:true,async assertReviewClaim(){},withDispatchAdmissionLock:async op=>op()});
     const q = activeNativeLead(f.run())!; assert.equal(q.status, 'incomplete'); assert.equal(q.failure, 'safety_refusal'); assert.equal(q.observations, 3);
     Object.assign(f.lead, { replacementDisposition: () => 'irrecoverable_transport' }); f.setHold(false); f.tick(); await f.poll(); assert.equal(f.counts().leadCalls, 1);
   } finally { f.cleanup(); }
@@ -325,9 +330,13 @@ it('reconciles a genuine held terminal after incomplete evidence without promoti
     const f = fixture(); try {
       f.setLeadSubmit(async () => ({ outcome: 'pending' })); await f.poll(); f.setHold(true);
       f.setLeadObserve(async () => ({ outcome: 'incomplete', reason: failure })); f.tick(); await f.poll();
-      f.setLeadObserve(async () => ({ outcome: 'complete', evidence: f.terminal(f.leadRequests[0]!) })); f.tick(); await f.poll();
+      f.setLeadObserve(async () => ({ outcome: 'complete', evidence: f.terminal(f.leadRequests[0]!) })); f.tick();
+      if(failure==='safety_refusal') {
+        f.receipts.recordLead(f.terminal(f.leadRequests[0]!));
+        await runIssueCommand(f.workflow(),'acme/widgets#42',{execution:f.execution,repairTaskShapeAuthority:f.shape,dispatchClaimId:f.run().dispatchClaimId,admission:f.registry(),runOwnerReceiptPath:f.receiptPath,now:f.now,maxReviewAttempts:1,leadObservationOnly:true,nativeCachedOnly:true,async assertReviewClaim(){},withDispatchAdmissionLock:async op=>op()});
+      } else await f.poll();
       const observed = f.run(); assert.equal(unresolvedNativeLead(observed), false);
-      assert.equal(activeNativeLead(observed)!.failure, failure); assert.equal(activeNativeLead(observed)!.observations, 2);
+      assert.equal(activeNativeLead(observed)!.failure, failure); assert.equal(activeNativeLead(observed)!.observations, failure==='transport_failure'?2:1);
       assert.equal(observed.repairAdmissions, undefined); assert.equal(f.counts().leadCalls, 1); assert.equal(f.counts().boundaries, 0);
       f.setHold(false); f.tick(); await f.poll();
       assert.equal(f.run().repairAdmissions?.length ?? 0, failure === 'transport_failure' ? 1 : 0);
