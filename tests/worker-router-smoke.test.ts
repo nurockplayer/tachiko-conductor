@@ -113,6 +113,7 @@ describe('worker-router container smoke', () => {
         baseSha: request.baseSha,
         workspacePath: identity.workspacePath,
         branch: identity.branch,
+        beforePublish: () => undefined,
         authority: 'embedded',
         instructions: [
           'This is an isolated local container acceptance fixture with no live GitHub authority.',

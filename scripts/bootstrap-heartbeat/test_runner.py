@@ -4,31 +4,752 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
+import io
 import json
 import os
 from pathlib import Path
 import plistlib
+import platform
+import pwd
+import shutil
 import subprocess
 import sys
+import stat
 import tempfile
+import tarfile
 import time
 import unittest
+from unittest import mock
 
 
 HERE = Path(__file__).resolve().parent
 RUNNER = HERE / "runner.py"
 
 
+class ProviderBuildTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory(prefix="tachiko-provider-tests-", dir=Path(tempfile.gettempdir()).resolve())
+        self.root = Path(self.temp.name).resolve()
+        saved_testing = os.environ.get("SCD_HEARTBEAT_TESTING")
+        saved_root = os.environ.get("SCD_HEARTBEAT_TEST_ROOT")
+        os.environ["SCD_HEARTBEAT_TESTING"] = "1"
+        os.environ["SCD_HEARTBEAT_TEST_ROOT"] = str(self.root / "state")
+        try:
+            spec = importlib.util.spec_from_file_location("heartbeat_provider_under_test", RUNNER)
+            assert spec and spec.loader
+            self.module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(self.module)
+        finally:
+            if saved_testing is None:
+                os.environ.pop("SCD_HEARTBEAT_TESTING", None)
+            else:
+                os.environ["SCD_HEARTBEAT_TESTING"] = saved_testing
+            if saved_root is None:
+                os.environ.pop("SCD_HEARTBEAT_TEST_ROOT", None)
+            else:
+                os.environ["SCD_HEARTBEAT_TEST_ROOT"] = saved_root
+        self.module.ROOT.mkdir(mode=0o700)
+        self.manifest = json.loads((HERE / "providers/corepack-0.34.6.json").read_bytes())
+        self.artifact = (HERE / "providers/corepack-0.34.6.tgz").read_bytes()
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def test_apple_provider_requires_anchored_requirement_and_stable_inode(self) -> None:
+        tool = self.root / "provider"
+        tool.write_bytes(b"qualified bytes")
+        tool.chmod(0o755)
+        codesign = self.root / "codesign"
+        codesign.write_text("unused")
+        codesign.chmod(0o755)
+
+        def result(args: list[str], stdout: str = "", stderr: str = "", returncode: int = 0) -> subprocess.CompletedProcess[str]:
+            return subprocess.CompletedProcess(args, returncode, stdout, stderr)
+
+        responses = [
+            result(["codesign", "--verify", "-R=anchor apple"]),
+            result(["codesign", "-dv"], stderr="Identifier=com.apple.git\n"),
+            result(["codesign", "-d", "-r-"], stderr='designated => identifier "com.apple.git" and anchor apple\n'),
+        ]
+        with mock.patch.object(self.module, "_safe_system_file", return_value=tool), \
+             mock.patch.object(self.module.subprocess, "run", side_effect=responses):
+            qualified = self.module._signed_apple_tool(tool, "com.apple.git", codesign)
+        self.assertIn('identifier "com.apple.git"', qualified["designatedRequirement"])
+        self.assertEqual(qualified["verifiedRequirement"], "anchor apple")
+        self.assertIn("inode", qualified)
+        bad_responses = [
+            result(["codesign", "--verify", "-R=anchor apple"], stderr="anchored verification rejected", returncode=1),
+            result(["codesign", "-dv"], stderr="Identifier=com.apple.git\n"),
+            result(["codesign", "-d", "-r-"],
+                   stderr='designated => identifier "com.apple.git" or anchor apple\n'),
+        ]
+        with mock.patch.object(self.module, "_safe_system_file", return_value=tool), \
+             mock.patch.object(self.module.subprocess, "run", side_effect=bad_responses) as verify:
+            with self.assertRaisesRegex(RuntimeError, "signature qualification"):
+                self.module._signed_apple_tool(tool, "com.apple.git", codesign)
+        self.assertEqual(verify.call_args_list[0].args[0][1:4], ["--verify", "--strict", "-R=anchor apple"])
+        self.assertEqual(verify.call_count, 3, "the rejected designated expression contains an Apple OR alternative")
+
+        with mock.patch.object(self.module, "_system_codesign", return_value=codesign), \
+             mock.patch.object(self.module, "_signed_apple_tool",
+                               side_effect=lambda path, identifier, _codesign:
+                               self.module._provider_filesystem_identity(path, identifier, qualified["designatedRequirement"],
+                                                                        qualified["verifiedRequirement"])):
+            self.module._provider_file(qualified, "fixture Git")
+            replacement = self.root / "replacement"
+            replacement.write_bytes(tool.read_bytes())
+            replacement.chmod(tool.stat().st_mode & 0o777)
+            os.replace(replacement, tool)
+            with self.assertRaisesRegex(RuntimeError, "identity changed"):
+                self.module._provider_file(qualified, "fixture Git")
+
+    def test_unqualified_resolver_is_rejected_before_any_resolver_execution(self) -> None:
+        resolver = {"path": "/usr/bin/xcrun", "sha256": "0" * 64,
+                    "identifier": "com.apple.xcrun", "requirement": "unanchored"}
+        with mock.patch.object(self.module, "_provider_file", side_effect=RuntimeError("unqualified resolver")), \
+             mock.patch.object(self.module.subprocess, "run") as execute:
+            with self.assertRaisesRegex(RuntimeError, "unqualified resolver"):
+                self.module._resolve_apple_git(resolver, Path("/usr/bin/codesign"))
+        execute.assert_not_called()
+
+    def test_qualified_resolver_never_executes_unqualified_selected_git(self) -> None:
+        resolver = {"path": "/usr/bin/xcrun", "sha256": "0" * 64,
+                    "identifier": "com.apple.xcrun",
+                    "designatedRequirement": 'identifier "com.apple.xcrun" or anchor apple',
+                    "verifiedRequirement": "anchor apple"}
+        resolved = subprocess.CompletedProcess(["xcrun", "--find", "git"], 0, "/usr/bin/git\n", "")
+        with mock.patch.object(self.module, "_provider_file") as verify_resolver, \
+             mock.patch.object(self.module.subprocess, "run", return_value=resolved) as execute_resolver, \
+             mock.patch.object(self.module, "_signed_apple_tool", side_effect=RuntimeError("selected Git is unqualified")) as qualify_git:
+            with self.assertRaisesRegex(RuntimeError, "selected Git is unqualified"):
+                self.module._resolve_apple_git(resolver, Path("/usr/bin/codesign"))
+        self.assertEqual(execute_resolver.call_count, 1, "only the qualified resolver may execute")
+        self.assertEqual(execute_resolver.call_args.args[0], ["/usr/bin/xcrun", "--find", "git"])
+        self.assertEqual(qualify_git.call_args.args[0], Path("/usr/bin/git"))
+        self.assertEqual(verify_resolver.call_count, 2, "resolver identity is checked around resolver use")
+
+    def test_git_lazy_fetch_is_disabled_for_a_missing_promisor_object(self) -> None:
+        git_path = shutil.which("git")
+        self.assertIsNotNone(git_path, "promisor regression needs a Git executable")
+        git = {"path": git_path}
+        repo = self.root / "promisor-repo"
+        repo.mkdir()
+        base_env = {**self.module.git_environment(), "GIT_AUTHOR_NAME": "Provider Test",
+                    "GIT_AUTHOR_EMAIL": "provider@example.invalid", "GIT_COMMITTER_NAME": "Provider Test",
+                    "GIT_COMMITTER_EMAIL": "provider@example.invalid"}
+        subprocess.run([git["path"], "init", "--quiet"], cwd=repo, env=base_env, check=True)
+        (repo / "tracked.txt").write_text("promised object\n", encoding="utf-8")
+        subprocess.run([git["path"], "add", "tracked.txt"], cwd=repo, env=base_env, check=True)
+        subprocess.run([git["path"], "commit", "--quiet", "-m", "promisor fixture"], cwd=repo,
+                       env=base_env, check=True)
+        object_id = subprocess.run([git["path"], "hash-object", "tracked.txt"], cwd=repo, env=base_env,
+                                   check=True, stdout=subprocess.PIPE, text=True).stdout.strip()
+        commit = subprocess.run([git["path"], "rev-parse", "HEAD"], cwd=repo, env=base_env,
+                                check=True, stdout=subprocess.PIPE, text=True).stdout.strip()
+        tree = subprocess.run([git["path"], "rev-parse", "HEAD^{tree}"], cwd=repo, env=base_env,
+                              check=True, stdout=subprocess.PIPE, text=True).stdout.strip()
+        pack_directory = repo / ".git/objects/pack"
+        pack_directory.mkdir(exist_ok=True)
+        pack_id = subprocess.run([git["path"], "pack-objects", str(pack_directory / "pack")], cwd=repo,
+                                 env=base_env, input=commit + "\n" + tree + "\n", check=True,
+                                 stdout=subprocess.PIPE, text=True).stdout.strip()
+        (pack_directory / (pack_id + ".promisor")).touch()
+        helper_marker = self.root / "remote-helper-ran"
+        helper = self.root / "promisor-helper.sh"
+        helper.write_text("#!/bin/sh\nprintf fetched >> " + str(helper_marker) + "\nexit 1\n", encoding="utf-8")
+        helper.chmod(0o700)
+        for key, value in (("extensions.partialClone", "origin"), ("remote.origin.promisor", "true"),
+                           ("remote.origin.url", "ext::/bin/sh " + str(helper)),
+                           ("protocol.ext.allow", "always")):
+            subprocess.run([git["path"], "config", key, value], cwd=repo, env=base_env, check=True)
+        missing_object = repo / ".git/objects" / object_id[:2] / object_id[2:]
+        missing_object.unlink()
+        # Prove the fixture's promisor remote would execute its helper without
+        # the no-lazy-fetch fence; the production plumbing path must not.
+        baseline_env = dict(base_env)
+        baseline_env.pop("GIT_NO_LAZY_FETCH", None)
+        baseline = subprocess.run([git["path"], "-C", str(repo), "cat-file", "-e", object_id],
+                                  env=baseline_env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.assertNotEqual(baseline.returncode, 0)
+        self.assertTrue(helper_marker.exists(), "promisor fixture did not demonstrate a transport attempt")
+        helper_marker.unlink()
+        with mock.patch.object(self.module, "_provider_file"):
+            with self.assertRaisesRegex(RuntimeError, "could not inspect committed"):
+                self.module._git_output(git, repo, "cat-file", "-e", object_id)
+        self.assertFalse(helper_marker.exists(), "missing promisor object must fail without remote helper execution")
+
+    @unittest.skipUnless(platform.system() == "Darwin", "Corepack provider is supported only on qualified Darwin")
+    def test_official_corepack_signature_and_complete_package_inventory(self) -> None:
+        codesign = self.module._system_codesign()
+        openssl = self.module._signed_apple_tool(Path("/usr/bin/openssl"), "com.apple.openssl", codesign)
+        digest = self.module.verify_corepack_artifact(self.manifest, self.artifact, openssl)
+        self.assertEqual(digest, "af29678fc25ed5ae02343e9b67b214a25bacdcffae566f8cf848936beb23a7c8")
+        files = self.module.extract_corepack_package(self.manifest, self.artifact)
+        self.assertEqual(len(files), 54)
+        self.assertIn("LICENSE.md", files)
+        bundle, created = self.module.materialize_corepack_bundle(self.manifest, files)
+        self.assertTrue(created)
+        self.assertEqual((bundle / "LICENSE.md").read_bytes(), files["LICENSE.md"])
+        self.module.verify_existing_corepack_bundle(bundle, self.manifest, files)
+
+    def test_reviewed_artifact_rejects_signature_manifest_key_and_byte_changes(self) -> None:
+        bad_artifact = bytearray(self.artifact)
+        bad_artifact[-1] ^= 1
+        with self.assertRaisesRegex(RuntimeError, "SHA-256"):
+            self.module.verify_corepack_artifact(self.manifest, bytes(bad_artifact), {})
+        for key, replacement in (("version", "0.34.0"), ("signature", "AA=="),
+                                 ("publicKey", "AA=="), ("keyId", "SHA256:changed")):
+            with self.subTest(field=key):
+                changed = json.loads(json.dumps(self.manifest))
+                changed[key] = replacement
+                with self.assertRaisesRegex(RuntimeError, "manifest"):
+                    self.module._validate_corepack_manifest(changed)
+
+    def test_generated_corepack_identity_binds_canonical_raw_and_bundle_path(self) -> None:
+        manifest_bytes = (HERE / "providers/corepack-0.34.6.json").read_bytes()
+        manifest = self.module._validate_corepack_manifest(json.loads(manifest_bytes))
+        files = self.module.extract_corepack_package(manifest, self.artifact)
+        bundle, _created = self.module.materialize_corepack_bundle(manifest, files)
+        entry = bundle / "dist/corepack.js"
+        receipt = self.module.corepack_build_identity(
+            manifest, manifest_bytes, entry, self.module.corepack_package_closure_sha256(manifest),
+            hashlib.sha256(self.artifact).hexdigest(),
+        )
+        self.assertEqual(receipt["manifestSha256"], self.module._canonical_corepack_manifest_sha256(manifest))
+        self.assertEqual(receipt["sourceManifestSha256"], hashlib.sha256(manifest_bytes).hexdigest())
+        self.assertEqual(Path(receipt["path"]), self.module._corepack_bundle_path(manifest) / "dist/corepack.js")
+        self.assertTrue(self.module.valid_corepack_provider_identity(receipt))
+        for field, replacement in (("manifestSha256", receipt["sourceManifestSha256"]),
+                                   ("sourceManifestSha256", receipt["manifestSha256"]),
+                                   ("path", str(self.root / "wrong-corepack.js"))):
+            with self.subTest(field=field):
+                changed = dict(receipt, **{field: replacement})
+                self.assertFalse(self.module.valid_corepack_provider_identity(changed))
+
+    def _make_tar(self, *, extra: tuple[str, bytes] | None = None,
+                  duplicate: bool = False, link: bool = False,
+                  missing: bool = False, changed: bool = False,
+                  changed_mode: bool = False) -> bytes:
+        actual_files = self.module.extract_corepack_package(self.manifest, self.artifact)
+        out = io.BytesIO()
+        with tarfile.open(fileobj=out, mode="w:gz") as archive:
+            for item in self.manifest["files"]:
+                if missing and item["path"] == "dist/corepack.js":
+                    continue
+                name = "package/" + item["path"]
+                info = tarfile.TarInfo(name)
+                info.mode = item["mode"]
+                data = actual_files[item["path"]]
+                if changed and item["path"] == "dist/corepack.js":
+                    data += b"// changed"
+                if changed_mode and item["path"] == "dist/corepack.js":
+                    info.mode ^= 0o100
+                info.size = len(data)
+                archive.addfile(info, io.BytesIO(data))
+                if duplicate and item["path"] == "dist/corepack.js":
+                    archive.addfile(info, io.BytesIO(data))
+            if extra is not None:
+                name, data = extra
+                info = tarfile.TarInfo(name)
+                info.mode = 0o644
+                info.size = len(data)
+                archive.addfile(info, io.BytesIO(data))
+            if link:
+                info = tarfile.TarInfo("package/linked")
+                info.type = tarfile.SYMTYPE
+                info.linkname = "dist/corepack.js"
+                archive.addfile(info)
+        return out.getvalue()
+
+    def test_archive_rejects_duplicate_traversal_link_missing_and_extra_entries(self) -> None:
+        cases = (
+            (self._make_tar(duplicate=True), "duplicate"),
+            (self._make_tar(extra=("package/../escape", b"x")), "unsafe|unexpected"),
+            (self._make_tar(link=True), "link or special"),
+            (self._make_tar(missing=True), "missing"),
+            (self._make_tar(extra=("package/unlisted", b"x")), "unexpected"),
+            (self._make_tar(changed=True), "differs from its reviewed inventory"),
+            (self._make_tar(changed_mode=True), "mode differs from its reviewed inventory"),
+        )
+        for archive, message in cases:
+            with self.subTest(message=message), self.assertRaisesRegex(RuntimeError, message):
+                self.module.extract_corepack_package(self.manifest, archive)
+
+    def test_existing_corepack_snapshot_rejects_replacement_and_extra_files(self) -> None:
+        files = self.module.extract_corepack_package(self.manifest, self.artifact)
+        bundle, _ = self.module.materialize_corepack_bundle(self.manifest, files)
+        corepack = bundle / "dist/corepack.js"
+        original = corepack.read_bytes()
+        corepack.write_bytes(original + b"// changed")
+        with self.assertRaisesRegex(RuntimeError, "byte verification"):
+            self.module.verify_existing_corepack_bundle(bundle, self.manifest, files)
+        corepack.write_bytes(original)
+        (bundle / "unlisted").write_bytes(b"extra")
+        with self.assertRaisesRegex(RuntimeError, "file set"):
+            self.module.verify_existing_corepack_bundle(bundle, self.manifest, files)
+
+    def test_existing_corepack_snapshot_rejects_hardlinks(self) -> None:
+        files = self.module.extract_corepack_package(self.manifest, self.artifact)
+        bundle, _ = self.module.materialize_corepack_bundle(self.manifest, files)
+        victim = bundle / "dist/corepack.js"
+        outside = self.root / "linked-corepack.js"
+        os.link(victim, outside)
+        with self.assertRaisesRegex(RuntimeError, "hard-linked"):
+            self.module.verify_existing_corepack_bundle(bundle, self.manifest, files)
+
+    def test_existing_corepack_snapshot_rejects_incomplete_or_broad_fixture_directories(self) -> None:
+        corepack_bundle = self.module._corepack_bundle_path(self.manifest)
+        corepack_bundle.mkdir(mode=0o755)
+        corepack_bundle.chmod(0o755)
+        (corepack_bundle / "dist").mkdir(mode=0o755)
+        (corepack_bundle / "dist").chmod(0o755)
+        reviewed_files = self.module.extract_corepack_package(self.manifest, self.artifact)
+        entry_bytes = reviewed_files["dist/corepack.js"]
+        (corepack_bundle / "dist/corepack.js").write_bytes(entry_bytes)
+        (corepack_bundle / "dist/corepack.js").chmod(0o755)
+        with self.assertRaisesRegex(RuntimeError, "bundle is unsafe"):
+            self.module.verify_existing_corepack_bundle(corepack_bundle, self.manifest, reviewed_files)
+        corepack_bundle.chmod(0o700)
+        (corepack_bundle / "dist").chmod(0o700)
+        with self.assertRaisesRegex(RuntimeError, "file set"):
+            self.module.verify_existing_corepack_bundle(corepack_bundle, self.manifest, reviewed_files)
+
+    @unittest.skipUnless(platform.system() == "Darwin", "Corepack cache fence uses qualified Darwin providers")
+    def test_corepack_wrapper_rejects_dependency_and_root_drift_between_uses(self) -> None:
+        files = self.module.extract_corepack_package(self.manifest, self.artifact)
+        bundle, _ = self.module.materialize_corepack_bundle(self.manifest, files)
+        source_node = Path(shutil.which("node") or "")
+        self.assertTrue(source_node.is_file())
+        node_source = self.root / "node-source"
+        node_source.write_bytes(source_node.read_bytes())
+        node_source.chmod(0o700)
+        node, digest, _created = self.module.pin_admission_node(node_source)
+        fake_result = subprocess.CompletedProcess([str(node), "corepack"], 0, "ok", "")
+        with mock.patch.object(self.module, "run_verified_node", return_value=fake_result) as invoke:
+            self.module.run_verified_corepack(node, digest, self.manifest, files, ["--version"])
+            changed = bundle / "dist/corepack.js"
+            original = changed.read_bytes()
+            changed.write_bytes(original + b"tampered")
+            with self.assertRaisesRegex(RuntimeError, "byte verification"):
+                self.module.run_verified_corepack(node, digest, self.manifest, files, ["--version"])
+            changed.write_bytes(original)
+            self.assertEqual(invoke.call_count, 1, "changed Corepack dependency must block the next subprocess")
+            self.module.run_verified_corepack(node, digest, self.manifest, files, ["--version"])
+            old_mode = stat.S_IMODE(self.module.ROOT.stat().st_mode)
+            try:
+                self.module.ROOT.chmod(old_mode | 0o077)
+                with self.assertRaisesRegex(RuntimeError, "snapshot root"):
+                    self.module.run_verified_corepack(node, digest, self.manifest, files, ["--version"])
+            finally:
+                self.module.ROOT.chmod(old_mode)
+            self.assertEqual(invoke.call_count, 2, "unsafe private ROOT must block the next subprocess")
+
+    def test_private_snapshot_root_reuses_account_home_and_path_checks_before_node(self) -> None:
+        home = self.root / "account-home"
+        home.mkdir(mode=0o700)
+        snapshot_root = home / "Library/Application Support/provider-test"
+        snapshot_root.mkdir(parents=True, mode=0o700)
+        snapshot_root.chmod(0o700)
+        node_bytes = b"verified node fixture"
+        digest = hashlib.sha256(node_bytes).hexdigest()
+        node = snapshot_root / ("verified-node-" + digest)
+        node.write_bytes(node_bytes)
+        node.chmod(0o700)
+        old_root = self.module.ROOT
+        self.module.ROOT = snapshot_root
+        package_files = self.module.extract_corepack_package(self.manifest, self.artifact)
+        self.module.materialize_corepack_bundle(self.manifest, package_files)
+        real_lstat = Path.lstat
+
+        def altered_lstat(target: Path, *, uid: int | None = None, mode: int | None = None):
+            def inspect(path: Path):
+                result = real_lstat(path)
+                if path == target:
+                    values = list(result)
+                    if uid is not None:
+                        values[4] = uid
+                    if mode is not None:
+                        values[0] = mode
+                    return os.stat_result(values)
+                return result
+            return inspect
+
+        try:
+            with mock.patch.object(self.module, "account_home_directory", return_value=home):
+                for label, target, uid, mode in (
+                    ("root-owned-home", home, 0, None),
+                    ("root-owned-sticky-intermediate", home / "Library", 0, 0o41777),
+                ):
+                    with self.subTest(case=label), \
+                         mock.patch.object(Path, "lstat", altered_lstat(target, uid=uid, mode=mode)), \
+                         mock.patch.object(self.module.subprocess, "run") as execute:
+                        with self.assertRaisesRegex(RuntimeError, "unsafe ownership|unsafe heartbeat"):
+                            self.module.run_verified_node(node, digest, ["--version"])
+                        execute.assert_not_called()
+                    with self.subTest(corepack_case=label), \
+                         mock.patch.object(Path, "lstat", altered_lstat(target, uid=uid, mode=mode)), \
+                         mock.patch.object(self.module, "run_verified_node") as execute_corepack:
+                        with self.assertRaisesRegex(RuntimeError, "unsafe ownership|unsafe heartbeat"):
+                            self.module.run_verified_corepack(node, digest, self.manifest, package_files, ["--version"])
+                        execute_corepack.assert_not_called()
+
+                parent = home.parent
+                with mock.patch.object(Path, "lstat", altered_lstat(parent, uid=0, mode=0o41777)), \
+                     mock.patch.object(self.module.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "ok", "")) as execute:
+                    result = self.module.run_verified_node(node, digest, ["--version"], text=True)
+                    self.assertEqual(result.stdout, "ok")
+                    self.assertEqual(execute.call_count, 1, "root-owned sticky ancestry above a valid home remains allowed")
+                with mock.patch.object(Path, "lstat", altered_lstat(parent, uid=0, mode=0o41777)), \
+                     mock.patch.object(self.module, "run_verified_node",
+                                       return_value=subprocess.CompletedProcess([], 0, "ok", "")) as execute_corepack:
+                    result = self.module.run_verified_corepack(
+                        node, digest, self.manifest, package_files, ["--version"], text=True)
+                    self.assertEqual(result.stdout, "ok")
+                    self.assertEqual(execute_corepack.call_count, 1,
+                                     "Corepack may run below a valid home with sticky system ancestry")
+        finally:
+            self.module.ROOT = old_root
+
+    @unittest.skipUnless(platform.system() == "Darwin", "build provider is supported only on qualified Darwin")
+    def test_private_corepack_and_verified_node_ignore_path_shadows(self) -> None:
+        source_node = Path(shutil.which("node") or "")
+        self.assertTrue(source_node.is_file())
+        source_copy = self.root / "original-node"
+        source_copy.write_bytes(source_node.read_bytes())
+        source_copy.chmod(0o700)
+        node, digest, _created = self.module.pin_admission_node(source_copy)
+        source_copy.write_text("#!/bin/sh\nexit 98\n")
+        source_copy.chmod(0o700)
+        self.assertEqual(self.module.run_verified_node(
+            node, digest, ["--version"], check=True, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            env={"PATH": "/usr/bin:/bin", "HOME": str(self.root)},
+        ).returncode, 0)
+        child_source = ("const cp=require('node:child_process'); const out=cp.execFileSync(process.execPath,"
+                        "['-e',\"process.stdout.write(process.env.NODE_DISABLE_COMPILE_CACHE+','+process.env.DISABLE_V8_COMPILE_CACHE)\"],"
+                        "{encoding:'utf8'}); process.stdout.write(out);")
+        child_environment = {"PATH": "/usr/bin:/bin", "HOME": str(self.root),
+                             "NODE_DISABLE_COMPILE_CACHE": "0", "DISABLE_V8_COMPILE_CACHE": "0"}
+        cache_result = self.module.run_verified_node(
+            node, digest, ["-e", child_source], check=True, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
+            env=child_environment,
+        )
+        self.assertEqual(cache_result.stdout, "1,1", "both cache fences must reach Node and its build child")
+        codesign = self.module._system_codesign()
+        openssl = self.module._signed_apple_tool(Path("/usr/bin/openssl"), "com.apple.openssl", codesign)
+        self.module.verify_corepack_artifact(self.manifest, self.artifact, openssl)
+        files = self.module.extract_corepack_package(self.manifest, self.artifact)
+        bundle, _ = self.module.materialize_corepack_bundle(self.manifest, files)
+        shadows = self.root / "path-shadows"
+        shadows.mkdir()
+        marker = self.root / "path-shadow-ran"
+        for name in ("node", "corepack", "pnpm"):
+            executable = shadows / name
+            executable.write_text("#!/bin/sh\nprintf ran >> " + str(marker) + "\nexit 97\n")
+            executable.chmod(0o700)
+        environment = {"PATH": str(shadows) + ":/usr/bin:/bin", "HOME": str(self.root),
+                       "COREPACK_HOME": str(self.root / "corepack-cache"), "COREPACK_ENABLE_DOWNLOAD_PROMPT": "0"}
+        result = self.module.run_verified_corepack(
+            node, digest, self.manifest, files, ["--version"],
+            check=True, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL, env=environment,
+        )
+        self.assertEqual(result.stdout.strip(), "0.34.6")
+        self.assertFalse(marker.exists(), "ambient Node/Corepack/pnpm shadows must never execute")
+
+    @unittest.skipUnless(platform.system() == "Darwin", "raw provider proof uses qualified Apple Git")
+    def test_raw_source_inspection_avoids_status_filters_and_rejects_index_or_worktree_changes(self) -> None:
+        shadow_dir = self.root / "provider-path-shadows"
+        shadow_dir.mkdir()
+        provider_marker = self.root / "provider-path-shadow-ran"
+        for name in ("git", "openssl", "codesign"):
+            executable = shadow_dir / name
+            executable.write_text("#!/bin/sh\nprintf ran >> " + str(provider_marker) + "\nexit 96\n")
+            executable.chmod(0o700)
+        with mock.patch.dict(os.environ, {"PATH": str(shadow_dir)}):
+            git, _openssl = self.module.qualified_system_providers()
+        self.assertFalse(provider_marker.exists(), "provider qualification must ignore PATH shadows")
+        repo = self.root / "repo"
+        repo.mkdir()
+        (repo / "src").mkdir()
+        (repo / "src/entry.ts").write_text("export const value = 1;\n")
+        (repo / "src/entry.ts").chmod(0o644)
+        (repo / "scripts/bootstrap-heartbeat/providers").mkdir(parents=True)
+        for name in ("corepack-0.34.6.json", "corepack-0.34.6.tgz"):
+            source_provider = HERE / "providers" / name
+            copied_provider = repo / "scripts/bootstrap-heartbeat/providers" / name
+            copied_provider.write_bytes(source_provider.read_bytes())
+            copied_provider.chmod(stat.S_IMODE(source_provider.stat().st_mode))
+        selected_runner = repo / "scripts/bootstrap-heartbeat/runner.py"
+        selected_runner.write_bytes(RUNNER.read_bytes())
+        selected_runner.chmod(stat.S_IMODE(RUNNER.stat().st_mode))
+        for name, contents in (("package.json", '{"packageManager":"pnpm@10.34.5"}\n'),
+                               ("pnpm-lock.yaml", "lockfileVersion: '9.0'\n"),
+                               ("tsconfig.json", '{"compilerOptions":{}}\n')):
+            candidate = repo / name
+            candidate.write_text(contents)
+            candidate.chmod(0o644)
+        (repo / ".gitattributes").write_text("src/entry.ts filter=poison export-ignore export-subst\n")
+        (repo / ".gitignore").write_text("src/ignored.txt\n")
+        marker = self.root / "git-filter-ran"
+        script = self.root / "filter.sh"
+        script.write_text("#!/bin/sh\nprintf ran >> " + str(marker) + "\ncat\n")
+        script.chmod(0o700)
+        process_marker = self.root / "git-process-filter-ran"
+        process_script = self.root / "filter-process.sh"
+        process_script.write_text("#!/bin/sh\nprintf ran >> " + str(process_marker) + "\nexit 0\n")
+        process_script.chmod(0o700)
+        env = self.module.git_environment()
+        env.update({"GIT_AUTHOR_NAME": "Test", "GIT_AUTHOR_EMAIL": "test@example.invalid",
+                    "GIT_COMMITTER_NAME": "Test", "GIT_COMMITTER_EMAIL": "test@example.invalid"})
+        subprocess.run([git["path"], "init", "--quiet"], cwd=repo, env=env, check=True)
+        subprocess.run([git["path"], "add", "--all"], cwd=repo, env=env, check=True)
+        subprocess.run([git["path"], "commit", "--quiet", "-m", "fixture"], cwd=repo, env=env, check=True)
+        subprocess.run([git["path"], "config", "--local", "filter.poison.clean", str(script)],
+                       cwd=repo, env=env, check=True)
+        subprocess.run([git["path"], "config", "--local", "filter.poison.process", str(process_script)],
+                       cwd=repo, env=env, check=True)
+        subprocess.run([git["path"], "config", "--local", "core.fsmonitor", str(script)],
+                       cwd=repo, env=env, check=True)
+        real_run = self.module.subprocess.run
+        commands: list[list[str]] = []
+
+        def traced(args: list[str], *pos: object, **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+            commands.append([str(value) for value in args])
+            return real_run(args, *pos, **kwargs)
+
+        with mock.patch.object(self.module.subprocess, "run", side_effect=traced):
+            snapshot = self.module.capture_committed_build_source(repo, git)
+        self.assertEqual(snapshot["head"], subprocess.run([git["path"], "-C", str(repo), "rev-parse", "HEAD"], env=env,
+                                                          check=True, stdout=subprocess.PIPE, text=True).stdout.strip())
+        self.assertEqual(snapshot["files"]["src/entry.ts"]["bytes"], b"export const value = 1;\n")
+        self.assertEqual(snapshot["files"]["scripts/bootstrap-heartbeat/runner.py"]["bytes"], RUNNER.read_bytes())
+        materialized = self.root / "materialized"
+        self.module.materialize_committed_source(snapshot, materialized)
+        self.assertEqual((materialized / "src/entry.ts").read_bytes(), b"export const value = 1;\n")
+        self.assertEqual((materialized / "scripts/bootstrap-heartbeat/runner.py").read_bytes(), RUNNER.read_bytes())
+        self.assertFalse(marker.exists(), "Git clean/fsmonitor helpers must not run during raw source inspection")
+        self.assertFalse(process_marker.exists(), "Git process filters must not run during raw source inspection")
+        self.assertFalse(any("status" in command or "archive" in command for command in commands))
+        git_commands = [command for command in commands if command and command[0] == git["path"]]
+        self.assertTrue(git_commands)
+        self.assertTrue(all("--no-lazy-fetch" in command for command in git_commands))
+        (repo / "src/entry.ts").write_text("export const value = 2;\n")
+        with self.assertRaisesRegex(RuntimeError, "worktree|protected"):
+            self.module.capture_committed_build_source(repo, git)
+        (repo / "src/entry.ts").write_text("export const value = 1;\n")
+        (repo / "src/ignored.txt").write_text("extra\n")
+        with self.assertRaisesRegex(RuntimeError, "extra"):
+            self.module.capture_committed_build_source(repo, git)
+        (repo / "src/ignored.txt").unlink()
+        (repo / "src/linked.ts").symlink_to(repo / "src/entry.ts")
+        with self.assertRaisesRegex(RuntimeError, "symlink"):
+            self.module.capture_committed_build_source(repo, git)
+        (repo / "src/linked.ts").unlink()
+        (repo / "src/entry.ts").write_text("export const value = 3;\n")
+        subprocess.run([git["path"], "config", "--local", "--unset", "filter.poison.process"],
+                       cwd=repo, env=env, check=True)
+        subprocess.run([git["path"], "add", "src/entry.ts"], cwd=repo, env=env, check=True)
+        with self.assertRaisesRegex(RuntimeError, "staged protected"):
+            self.module.capture_committed_build_source(repo, git)
+        subprocess.run([git["path"], "reset", "--quiet", "HEAD", "--", "src/entry.ts"], cwd=repo, env=env, check=True)
+        (repo / "src/entry.ts").write_text("export const value = 1;\n")
+        scripts = repo / "scripts"
+        scripts_copy = self.root / "scripts-copy"
+        scripts.rename(scripts_copy)
+        scripts.symlink_to(scripts_copy, target_is_directory=True)
+        with self.assertRaisesRegex(RuntimeError, "intermediate symlink"):
+            self.module.capture_committed_build_source(repo, git)
+        scripts.unlink()
+        scripts_copy.rename(scripts)
+        bootstrap = scripts / "bootstrap-heartbeat"
+        bootstrap_copy = self.root / "bootstrap-heartbeat-copy"
+        bootstrap.rename(bootstrap_copy)
+        bootstrap.symlink_to(bootstrap_copy, target_is_directory=True)
+        with self.assertRaisesRegex(RuntimeError, "intermediate symlink"):
+            self.module.capture_committed_build_source(repo, git)
+        bootstrap.unlink()
+        bootstrap_copy.rename(bootstrap)
+
+        source_runner_before = selected_runner.read_bytes()
+        source_runner_mode = stat.S_IMODE(selected_runner.stat().st_mode)
+        selected_runner.write_bytes(source_runner_before + b"# worktree drift\n")
+        with self.assertRaisesRegex(RuntimeError, "worktree|protected"):
+            self.module.capture_committed_build_source(repo, git)
+        selected_runner.write_bytes(source_runner_before)
+        selected_runner.chmod(source_runner_mode ^ 0o111)
+        with self.assertRaisesRegex(RuntimeError, "worktree|protected"):
+            self.module.capture_committed_build_source(repo, git)
+        selected_runner.chmod(source_runner_mode)
+        selected_runner.unlink()
+        with self.assertRaisesRegex(RuntimeError, "missing or extra|runner is missing"):
+            self.module.capture_committed_build_source(repo, git)
+        selected_runner.write_bytes(source_runner_before)
+        selected_runner.chmod(source_runner_mode)
+        selected_runner.unlink()
+        selected_runner.symlink_to(repo / "src/entry.ts")
+        with self.assertRaisesRegex(RuntimeError, "regular file"):
+            self.module.capture_committed_build_source(repo, git)
+        selected_runner.unlink()
+        selected_runner.write_bytes(source_runner_before)
+        selected_runner.chmod(source_runner_mode)
+        selected_runner.write_bytes(source_runner_before + b"# staged drift\n")
+        subprocess.run([git["path"], "add", "scripts/bootstrap-heartbeat/runner.py"], cwd=repo, env=env, check=True)
+        with self.assertRaisesRegex(RuntimeError, "staged protected"):
+            self.module.capture_committed_build_source(repo, git)
+
+    def test_heartbeat_log_creation_append_and_bounded_trim_use_private_file(self) -> None:
+        log_path = self.module.ROOT / "heartbeat.log"
+        self.module.log("first entry")
+        self.assertEqual(stat.S_IMODE(log_path.stat().st_mode), 0o600)
+        self.module.log("second entry")
+        self.assertIn("first entry", log_path.read_text(encoding="utf-8"))
+        self.assertIn("second entry", log_path.read_text(encoding="utf-8"))
+        old_limit = self.module.MAX_HEARTBEAT_LOG
+        try:
+            self.module.MAX_HEARTBEAT_LOG = 1024
+            log_path.write_bytes(b"x" * 1800)
+            log_path.chmod(0o600)
+            self.module.log("trimmed tail")
+        finally:
+            self.module.MAX_HEARTBEAT_LOG = old_limit
+        self.assertLessEqual(log_path.stat().st_size, 1024)
+        self.assertIn(b"trimmed tail", log_path.read_bytes())
+
+    def test_heartbeat_log_rejects_unsafe_endpoints_without_normalizing_them(self) -> None:
+        root = self.root / "unsafe-endpoint-root"
+        root.mkdir(mode=0o700)
+        self.module.ROOT = root
+        victim = self.root / "log-victim"
+        victim.write_bytes(b"victim bytes remain exact\n")
+        victim.chmod(0o640)
+        victim_before = (victim.read_bytes(), stat.S_IMODE(victim.stat().st_mode), victim.stat().st_mtime_ns)
+
+        for name, target in (("symlink", victim), ("dangling", self.root / "missing-victim")):
+            with self.subTest(endpoint=name):
+                link = root / "heartbeat.log"
+                link.symlink_to(target)
+                with self.assertRaises((RuntimeError, OSError)):
+                    self.module.log("must not follow")
+                self.assertTrue(link.is_symlink())
+                link.unlink()
+                self.assertEqual((victim.read_bytes(), stat.S_IMODE(victim.stat().st_mode), victim.stat().st_mtime_ns), victim_before)
+
+        log_path = root / "heartbeat.log"
+        log_path.write_bytes(b"unsafe mode remains")
+        log_path.chmod(0o644)
+        mode_before = (log_path.read_bytes(), stat.S_IMODE(log_path.stat().st_mode), log_path.stat().st_mtime_ns)
+        with self.assertRaisesRegex(RuntimeError, "unsafe heartbeat log endpoint"):
+            self.module.log("must not chmod")
+        self.assertEqual((log_path.read_bytes(), stat.S_IMODE(log_path.stat().st_mode), log_path.stat().st_mtime_ns), mode_before)
+        log_path.unlink()
+
+        log_path.mkdir(mode=0o700)
+        with self.assertRaisesRegex(RuntimeError, "unsafe heartbeat log endpoint"):
+            self.module.log("must not write directory")
+        self.assertTrue(log_path.is_dir())
+        log_path.rmdir()
+
+        log_path.write_bytes(b"foreign owner remains untouched")
+        log_path.chmod(0o600)
+        foreign_before = (log_path.read_bytes(), stat.S_IMODE(log_path.stat().st_mode), log_path.stat().st_mtime_ns)
+        real_fstat = self.module.os.fstat
+        expected_inode = log_path.stat().st_ino
+
+        def foreign_fstat(descriptor: int):
+            result = real_fstat(descriptor)
+            if result.st_ino != expected_inode:
+                return result
+            fields = list(result)
+            fields[4] = os.geteuid() + 1
+            return os.stat_result(fields)
+
+        with mock.patch.object(self.module.os, "fstat", side_effect=foreign_fstat):
+            with self.assertRaisesRegex(RuntimeError, "unsafe heartbeat log endpoint"):
+                self.module.log("must not append as foreign owner")
+        self.assertEqual((log_path.read_bytes(), stat.S_IMODE(log_path.stat().st_mode), log_path.stat().st_mtime_ns), foreign_before)
+
+    def test_heartbeat_log_rejects_symlink_replacement_between_stat_and_open(self) -> None:
+        root = self.root / "racing-log-root"
+        root.mkdir(mode=0o700)
+        self.module.ROOT = root
+        endpoint = root / "heartbeat.log"
+        endpoint.write_bytes(b"safe initial entry\n")
+        endpoint.chmod(0o600)
+        victim = self.root / "racing-victim"
+        victim.write_bytes(b"victim bytes remain exact\n")
+        victim.chmod(0o640)
+        before = (victim.read_bytes(), stat.S_IMODE(victim.stat().st_mode), victim.stat().st_mtime_ns)
+        real_open = self.module.os.open
+        replaced = False
+
+        def replace_before_open(file, flags, mode=0o777, *, dir_fd=None):
+            nonlocal replaced
+            if not replaced and file == "heartbeat.log" and dir_fd is not None:
+                replaced = True
+                os.unlink(file, dir_fd=dir_fd)
+                os.symlink(victim, file, dir_fd=dir_fd)
+            return real_open(file, flags, mode, dir_fd=dir_fd)
+
+        with mock.patch.object(self.module.os, "open", side_effect=replace_before_open):
+            with self.assertRaises(OSError):
+                self.module.log("must not follow a replacement")
+        self.assertTrue(replaced)
+        self.assertTrue(endpoint.is_symlink())
+        self.assertEqual((victim.read_bytes(), stat.S_IMODE(victim.stat().st_mode), victim.stat().st_mtime_ns), before)
+
+    def test_outer_heartbeat_log_failure_reports_to_stderr_without_retry(self) -> None:
+        stderr = io.StringIO()
+        with mock.patch.object(self.module, "log") as log, mock.patch.object(self.module.sys, "stderr", stderr):
+            self.module.report_log_failure("heartbeat error; no wake: rejected private root")
+        log.assert_not_called()
+        self.assertIn("heartbeat log unavailable", stderr.getvalue())
+        self.assertIn("rejected private root", stderr.getvalue())
+
+
 class HeartbeatTest(unittest.TestCase):
     def setUp(self) -> None:
-        self.temp = tempfile.TemporaryDirectory(prefix=".tachiko-conductor-heartbeat-", dir=Path.home())
+        self.temp = tempfile.TemporaryDirectory(prefix="tachiko-conductor-heartbeat-", dir=Path(tempfile.gettempdir()).resolve())
         self.root = Path(self.temp.name)
+        self.account_home = self.root / "account-home"
+        self.account_home.mkdir()
+        self.python_test_support = self.root / "python-test-support"
+        self.python_test_support.mkdir()
+        (self.python_test_support / "sitecustomize.py").write_text(
+            "import os, pwd, subprocess\n"
+            "_getpwuid = pwd.getpwuid\n"
+            "def _test_getpwuid(uid):\n"
+            "    record = _getpwuid(uid)\n"
+            "    home = os.environ.get('SCD_HEARTBEAT_TEST_ACCOUNT_HOME')\n"
+            "    return pwd.struct_passwd(record[:5] + (home,) + record[6:]) if home else record\n"
+            "pwd.getpwuid = _test_getpwuid\n"
+            "_subprocess_run = subprocess.run\n"
+            "def _test_run(args, *pos, **kw):\n"
+            "    command = args[0] if isinstance(args, (list, tuple)) and args else ''\n"
+            "    preload = os.environ.get('SCD_HEARTBEAT_TEST_NODE_PRELOAD')\n"
+            "    if preload and os.path.basename(command).startswith('verified-node-'):\n"
+            "        child_env = dict(kw.get('env') or os.environ)\n"
+            "        child_env['NODE_OPTIONS'] = '--import ' + preload\n"
+            "        kw['env'] = child_env\n"
+            "    return _subprocess_run(args, *pos, **kw)\n"
+            "subprocess.run = _test_run\n",
+            encoding="utf-8",
+        )
+        real_getpwuid = pwd.getpwuid
+        self.account_lookup = mock.patch(
+            "pwd.getpwuid",
+            side_effect=lambda uid: pwd.struct_passwd(real_getpwuid(uid)[:5] + (str(self.account_home),) + real_getpwuid(uid)[6:]),
+        )
+        self.account_lookup.start()
         self.state_root = self.root / "state"
         self.payload = self.root / "payload.json"
         self.calls = self.root / "calls.jsonl"
         self.gh = self.root / "gh"
         self.wake = self.root / "wake"
         self.launchctl = self.root / "launchctl"
+        self.admission_state = self.root / "admission-state.json"
         self.plist = self.root / "LaunchAgents" / "heartbeat.plist"
         self.gh.write_text(
             "#!/usr/bin/python3\nimport os, pathlib, time\n"
@@ -43,7 +764,7 @@ class HeartbeatTest(unittest.TestCase):
             "    companion = pathlib.Path(os.environ['SCD_HEARTBEAT_TEST_ROOT']) / 'codex-code-mode-host'\n"
             "    if companion.read_text() != 'trusted companion\\n': sys.exit(86)\n"
             "with pathlib.Path(os.environ['MOCK_WAKE_CALLS']).open('a') as f: "
-            "f.write(json.dumps({'args': sys.argv[1:]}) + '\\n')\n"
+            "f.write(json.dumps({'args': sys.argv[1:], 'admission_path': os.environ.get('TACHIKO_MISSION_ADMISSION_PATH')}) + '\\n')\n"
             "print('x' * int(os.environ.get('MOCK_WAKE_OUTPUT', '0')))\n"
             "background = float(os.environ.get('MOCK_WAKE_BACKGROUND_SLEEP', '0'))\n"
             "if background:\n"
@@ -92,10 +813,16 @@ class HeartbeatTest(unittest.TestCase):
             "MOCK_WAKE_CALLS": str(self.calls),
             "MOCK_WAKE_BACKGROUND_PID": str(self.root / "background.pid"),
             "MOCK_LAUNCHCTL_FAIL_MARKER": str(self.root / "launchctl-failed-once"),
+            "MOCK_ADMISSION_STATE": str(self.admission_state),
+            "SCD_HEARTBEAT_TEST_ACCOUNT_HOME": str(self.account_home),
+            "SCD_HEARTBEAT_TEST_NODE_PRELOAD": str(HERE.parent.parent / "tests/fixtures/account-home-preload.mjs"),
+            "PYTHONPATH": str(self.python_test_support),
         })
+        self.env.pop("TACHIKO_MISSION_ADMISSION_PATH", None)
         self.write_config()
 
     def tearDown(self) -> None:
+        self.account_lookup.stop()
         self.temp.cleanup()
 
     def test_query_budget_covers_long_lived_review_threads(self) -> None:
@@ -103,8 +830,443 @@ class HeartbeatTest(unittest.TestCase):
         self.assertIn("reviewThreads(first: 100)", source)
         self.assertIn("MAX_POLL_QUERY_COST = 100", source)
 
+    def test_logging_refuses_unsafe_root_without_mutation_and_rejects_symlink_log_without_recursion(self) -> None:
+        private_parent = self.account_home / ".tachiko-conductor"
+        private_parent.mkdir(mode=0o700)
+        unsafe_root = private_parent / "unsafe-heartbeat"
+        unsafe_root.mkdir(mode=0o755)
+        unsafe_root.chmod(0o755)
+        victim = self.root / "log-victim"
+        victim.write_bytes(b"victim bytes remain exact\n")
+        unsafe_log = unsafe_root / "heartbeat.log"
+        unsafe_log.symlink_to(victim)
+        before = (victim.read_bytes(), stat.S_IMODE(victim.stat().st_mode), victim.stat().st_mtime_ns)
+        unsafe_mode = stat.S_IMODE(unsafe_root.stat().st_mode)
+        env = self.env | {"SCD_HEARTBEAT_TEST_ROOT": str(unsafe_root)}
+        rejected = self.invoke("run", "--prime", env=env, check=False)
+        self.assertEqual(rejected.returncode, 1)
+        self.assertIn("lock error; no wake", rejected.stderr)
+        self.assertEqual(stat.S_IMODE(unsafe_root.stat().st_mode), unsafe_mode)
+        self.assertTrue(unsafe_log.is_symlink(), "unsafe-root validation must preserve an existing log symlink")
+        self.assertEqual((victim.read_bytes(), stat.S_IMODE(victim.stat().st_mode), victim.stat().st_mtime_ns), before)
+
+        log_link = self.state_root / "heartbeat.log"
+        log_link.symlink_to(victim)
+        linked = self.invoke("run", "--prime", check=False)
+        self.assertEqual(linked.returncode, 1)
+        self.assertIn("heartbeat log unavailable", linked.stderr)
+        self.assertTrue(log_link.is_symlink(), "unsafe endpoint is never normalized or replaced")
+        self.assertEqual((victim.read_bytes(), stat.S_IMODE(victim.stat().st_mode), victim.stat().st_mtime_ns), before)
+
+    def test_loaded_config_rejects_pinned_admission_from_another_home(self) -> None:
+        config_path = self.state_root / "config.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["admission"]["home"] = str(self.root / "stale-home")
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+        result = self.invoke("run", check=False)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("pinned heartbeat admission home does not match", result.stderr)
+        self.assertEqual(self.records(), [], "stale pinned account root must be rejected before wake")
+        config["admission"]["home"] = str(self.account_home)
+        config["admission"]["registry"] = str(self.root / "stale-registry.json")
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+        result = self.invoke("run", check=False)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("pinned heartbeat admission registry does not match", result.stderr)
+        self.assertEqual(self.records(), [])
+        config["admission"]["registry"] = str(self.account_home / ".tachiko-conductor/mission-admission/registry.json")
+        config["admission"]["runs"] = str(self.root / "stale-runs")
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+        result = self.invoke("run", check=False)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("pinned heartbeat Run directory does not match", result.stderr)
+        self.assertEqual(self.records(), [])
+        config["admission"]["runs"] = str(self.account_home / ".tachiko-conductor/runs")
+        config["admission"]["receipts"] = str(self.root / "stale-receipts")
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+        result = self.invoke("run", check=False)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("pinned heartbeat receipt directory does not match", result.stderr)
+        self.assertEqual(self.records(), [])
+
+    def test_loaded_config_requires_exact_captured_runner_and_private_bytes(self) -> None:
+        config_path = self.state_root / "config.json"
+        valid = json.loads(config_path.read_text(encoding="utf-8"))
+        self.assertEqual(self.invoke("status").returncode, 0)
+        for label, mutate in (
+            ("missing provenance", lambda candidate: candidate["admission_build"].pop("source_runner")),
+            ("extra field", lambda candidate: candidate["admission_build"]["source_runner"].update(extra="unexpected")),
+            ("digest mismatch", lambda candidate: candidate["admission_build"]["source_runner"].update(sha256="0" * 64)),
+            ("blob mismatch", lambda candidate: candidate["admission_build"]["source_runner"].update(blob="0" * 40)),
+            ("unsupported source mode", lambda candidate: candidate["admission_build"]["source_runner"].update(source_mode="100600")),
+            ("installed mode mismatch", lambda candidate: candidate["admission_build"]["source_runner"].update(installed_mode="0755")),
+        ):
+            with self.subTest(case=label):
+                candidate = json.loads(json.dumps(valid))
+                mutate(candidate)
+                config_path.write_text(json.dumps(candidate), encoding="utf-8")
+                rejected = self.invoke("status", check=False)
+                self.assertNotEqual(rejected.returncode, 0)
+                self.assertIn("runner", rejected.stderr.lower())
+                config_path.write_text(json.dumps(valid), encoding="utf-8")
+
+        runner = Path(valid["runner"])
+        original = runner.read_bytes()
+        runner.write_bytes(original + b"# private snapshot tampered\n")
+        rejected = self.invoke("status", check=False)
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("runner", rejected.stderr.lower())
+        runner.write_bytes(original)
+        runner.chmod(0o755)
+        rejected = self.invoke("status", check=False)
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("runner", rejected.stderr.lower())
+        runner.chmod(0o700)
+
+    def test_generated_provider_identity_passes_full_config_validation(self) -> None:
+        config = json.loads((self.state_root / "config.json").read_text(encoding="utf-8"))
+        corepack = config["admission_build"]["providers"]["corepack"]
+        provider_manifest = json.loads((HERE / "providers/corepack-0.34.6.json").read_bytes())
+        source_bytes = (HERE / "providers/corepack-0.34.6.json").read_bytes()
+        self.assertEqual(corepack["manifestSha256"], hashlib.sha256(
+            (json.dumps(provider_manifest, sort_keys=True, separators=(",", ":")) + "\n").encode()
+        ).hexdigest())
+        self.assertEqual(corepack["sourceManifestSha256"], hashlib.sha256(source_bytes).hexdigest())
+        self.assertEqual(corepack["path"], str(self.state_root / ("verified-corepack-" + corepack["manifestSha256"]) / "dist/corepack.js"))
+        result = self.invoke("run", "--prime", check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_loaded_config_rejects_symlink_retargeted_account_admission_roots(self) -> None:
+        conductor = self.account_home / ".tachiko-conductor"
+        alternate = self.root / "alternate-account-root"
+        alternate.mkdir()
+        conductor.symlink_to(alternate, target_is_directory=True)
+        try:
+            result = self.invoke("run", check=False)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("symlink or wrong filesystem type", result.stderr)
+            self.assertEqual(self.records(), [], "retargeted account root is rejected before wake")
+            self.assertFalse((alternate / "mission-admission").exists())
+        finally:
+            conductor.unlink()
+
+        conductor.mkdir(mode=0o700)
+        mission = conductor / "mission-admission"
+        alternate_mission = self.root / "alternate-mission-admission"
+        alternate_mission.mkdir()
+        mission.symlink_to(alternate_mission, target_is_directory=True)
+        try:
+            result = self.invoke("run", check=False)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("symlink or wrong filesystem type", result.stderr)
+            self.assertEqual(self.records(), [])
+            self.assertFalse((alternate_mission / "registry.json").exists())
+        finally:
+            mission.unlink()
+
+        mission.mkdir(mode=0o700)
+        canonical_receipts = mission / "heartbeat-receipts"
+        alternate_receipts = self.root / "alternate-heartbeat-receipts"
+        alternate_receipts.mkdir()
+        canonical_receipts.symlink_to(alternate_receipts, target_is_directory=True)
+        try:
+            result = self.invoke("run", check=False)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("symlink or wrong filesystem type", result.stderr)
+            self.assertEqual(self.records(), [])
+            self.assertEqual(list(alternate_receipts.iterdir()), [])
+        finally:
+            canonical_receipts.unlink()
+
+    def test_admission_domain_accepts_physical_canonical_aliases_and_rejects_divergent_roots(self) -> None:
+        spec = importlib.util.spec_from_file_location("heartbeat_admission_domain_under_test", RUNNER)
+        assert spec and spec.loader
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        canonical_runs = self.account_home / ".tachiko-conductor/runs"
+        canonical_receipts = self.account_home / ".tachiko-conductor/mission-admission/heartbeat-receipts"
+        canonical_registry = self.account_home / ".tachiko-conductor/mission-admission/registry.json"
+        canonical_runs.mkdir(parents=True)
+        canonical_receipts.mkdir(parents=True, mode=0o700)
+        canonical_registry.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+        canonical_registry.parent.chmod(0o700)
+        canonical_receipts.chmod(0o700)
+        canonical_registry.write_text("{}", encoding="utf-8")
+        canonical_registry.chmod(0o600)
+        runs_alias = self.root / "runs-alias"
+        receipts_alias = self.root / "receipts-alias"
+        registry_alias = self.root / "registry-alias.json"
+        runs_alias.symlink_to(canonical_runs, target_is_directory=True)
+        receipts_alias.symlink_to(canonical_receipts, target_is_directory=True)
+        registry_alias.symlink_to(canonical_registry)
+        repo = Path.cwd().resolve()
+
+        with mock.patch.dict(os.environ, {
+            "TACHIKO_DATA_DIR": str(runs_alias),
+            "TACHIKO_HEARTBEAT_ADMISSION_RECEIPTS_DIR": str(receipts_alias),
+            "TACHIKO_MISSION_ADMISSION_PATH": str(registry_alias),
+        }):
+            domain = module.admission_domain(repo, None, None)
+        self.assertEqual(Path(domain["runs"]), canonical_runs.resolve())
+        self.assertEqual(Path(domain["receipts"]), canonical_receipts.resolve())
+        self.assertEqual(Path(domain["registry"]), canonical_registry.resolve())
+        for variable, divergent, message in (
+            ("TACHIKO_DATA_DIR", self.root / "other-runs", "Run directory must resolve"),
+            ("TACHIKO_HEARTBEAT_ADMISSION_RECEIPTS_DIR", self.root / "other-receipts", "receipt directory must resolve"),
+        ):
+            with mock.patch.dict(os.environ, {variable: str(divergent)}):
+                with self.assertRaisesRegex(RuntimeError, message):
+                    module.admission_domain(repo, None, None)
+
+    def test_account_path_permissions_accept_safe_modes_and_reject_drift_without_repair(self) -> None:
+        spec = importlib.util.spec_from_file_location("heartbeat_account_permissions_under_test", RUNNER)
+        assert spec and spec.loader
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        conductor = self.account_home / ".tachiko-conductor"
+        runs = conductor / "runs"
+        admission = conductor / "mission-admission"
+        receipts = admission / "heartbeat-receipts"
+        runs.mkdir(parents=True, mode=0o755)
+        admission.mkdir(parents=True, mode=0o700)
+        receipts.mkdir(mode=0o700)
+        conductor.chmod(0o755)
+        runs.chmod(0o755)
+        admission.chmod(0o700)
+        receipts.chmod(0o700)
+        run_file = runs / "run.json"
+        registry = admission / "registry.json"
+        lock = conductor / "dispatch" / "once.lock"
+        run_file.write_text("{}\n", encoding="utf-8")
+        run_file.chmod(0o644)
+        registry.write_text("{}\n", encoding="utf-8")
+        registry.chmod(0o600)
+        lock.parent.mkdir(mode=0o755)
+        lock.write_text("{}\n", encoding="utf-8")
+        lock.chmod(0o600)
+        module.assert_safe_account_owned_path(self.account_home, runs, "directory")
+        module.assert_safe_account_owned_path(self.account_home, run_file, "file")
+        module.assert_safe_account_owned_path(self.account_home, registry, "file")
+        module.assert_safe_account_owned_path(self.account_home, lock, "file")
+
+        foreign_owner_targets = (
+            (conductor, "directory"),
+            (registry, "file"),
+            (run_file, "file"),
+            (lock, "file"),
+        )
+        original_lstat = Path.lstat
+        for target, endpoint in foreign_owner_targets:
+            before_bytes = target.read_bytes() if endpoint == "file" else None
+            before = target.stat()
+
+            class ForeignOwnerStat:
+                def __init__(self, original):
+                    self._original = original
+                    self.st_uid = original.st_uid + 100_000
+
+                def __getattr__(self, name):
+                    return getattr(self._original, name)
+
+            def lstat_with_foreign_owner(candidate):
+                original = original_lstat(candidate)
+                if candidate == target:
+                    return ForeignOwnerStat(original)
+                return original
+
+            with mock.patch.object(Path, "lstat", new=lstat_with_foreign_owner):
+                with self.assertRaisesRegex(RuntimeError, "Unsafe|unsafe"):
+                    module.assert_safe_account_owned_path(self.account_home, target, endpoint)
+
+            after = target.stat()
+            self.assertEqual(after.st_mode, before.st_mode, str(target))
+            self.assertEqual(after.st_mtime_ns, before.st_mtime_ns, str(target))
+            if before_bytes is not None:
+                self.assertEqual(target.read_bytes(), before_bytes, str(target))
+
+        self.root.chmod(0o777)
+        with self.assertRaisesRegex(RuntimeError, "ancestry"):
+            module.assert_safe_account_owned_path(self.account_home, run_file, "file")
+        self.root.chmod(0o1777)
+        with self.assertRaisesRegex(RuntimeError, "ancestry"):
+            module.assert_safe_account_owned_path(self.account_home, run_file, "file")
+        self.root.chmod(0o700)
+        with mock.patch.object(module.os, "geteuid", return_value=os.geteuid() + 1):
+            with self.assertRaisesRegex(RuntimeError, "ancestry|account home"):
+                module.assert_safe_account_owned_path(self.account_home, run_file, "file")
+
+        registry_bytes = registry.read_bytes()
+        registry_mtime = registry.stat().st_mtime_ns
+        registry.chmod(0o644)
+        unsafe_mode = registry.stat().st_mode & 0o777
+        with self.assertRaisesRegex(RuntimeError, "Unsafe|unsafe"):
+            module.assert_safe_account_owned_path(self.account_home, registry, "file")
+        self.assertEqual(registry.read_bytes(), registry_bytes)
+        self.assertEqual(registry.stat().st_mode & 0o777, unsafe_mode)
+        self.assertEqual(registry.stat().st_mtime_ns, registry_mtime)
+        registry.chmod(0o600)
+
+        admission.chmod(0o755)
+        unsafe_directory_mode = admission.stat().st_mode & 0o777
+        with self.assertRaisesRegex(RuntimeError, "Unsafe|unsafe"):
+            module.assert_safe_account_owned_path(self.account_home, registry, "file")
+        self.assertEqual(admission.stat().st_mode & 0o777, unsafe_directory_mode)
+
+        admission.chmod(0o700)
+        receipts.chmod(0o755)
+        unsafe_receipt_directory_mode = receipts.stat().st_mode & 0o777
+        with self.assertRaisesRegex(RuntimeError, "Unsafe|unsafe"):
+            module.assert_safe_account_owned_path(self.account_home, receipts, "directory")
+        self.assertEqual(receipts.stat().st_mode & 0o777, unsafe_receipt_directory_mode)
+        receipts.chmod(0o700)
+        self.account_home.chmod(0o777)
+        unsafe_home_mode = self.account_home.stat().st_mode & 0o777
+        with self.assertRaisesRegex(RuntimeError, "Unsafe|unsafe"):
+            module.assert_safe_account_owned_path(self.account_home, registry, "file")
+        self.assertEqual(self.account_home.stat().st_mode & 0o777, unsafe_home_mode)
+
+    def test_account_home_lookup_ignores_divergent_ambient_home_values(self) -> None:
+        saved_home = self.env.get("HOME")
+        first = self.root / "ambient-home-a"
+        second = self.root / "ambient-home-b"
+        first.mkdir()
+        second.mkdir()
+        try:
+            with mock.patch.dict(os.environ, {"HOME": str(first)}):
+                module_a = importlib.util.spec_from_file_location("heartbeat_home_a", RUNNER)
+                assert module_a and module_a.loader
+                runner_a = importlib.util.module_from_spec(module_a)
+                module_a.loader.exec_module(runner_a)
+            with mock.patch.dict(os.environ, {"HOME": str(second)}):
+                module_b = importlib.util.spec_from_file_location("heartbeat_home_b", RUNNER)
+                assert module_b and module_b.loader
+                runner_b = importlib.util.module_from_spec(module_b)
+                module_b.loader.exec_module(runner_b)
+            self.assertEqual(runner_a.account_home_directory(), self.account_home.resolve())
+            self.assertEqual(runner_b.account_home_directory(), self.account_home.resolve())
+            self.assertFalse((first / ".tachiko-conductor").exists())
+            self.assertFalse((second / ".tachiko-conductor").exists())
+        finally:
+            if saved_home is None:
+                self.env.pop("HOME", None)
+            else:
+                self.env["HOME"] = saved_home
+
+    def test_runtime_import_closure_rejects_dynamic_loaders_and_traversal(self) -> None:
+        saved_testing = os.environ.get("SCD_HEARTBEAT_TESTING")
+        saved_root = os.environ.get("SCD_HEARTBEAT_TEST_ROOT")
+        os.environ["SCD_HEARTBEAT_TESTING"] = "1"
+        os.environ["SCD_HEARTBEAT_TEST_ROOT"] = str(self.state_root)
+        try:
+            spec = importlib.util.spec_from_file_location("heartbeat_closure_under_test", RUNNER)
+            assert spec and spec.loader
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+        finally:
+            if saved_testing is None: os.environ.pop("SCD_HEARTBEAT_TESTING", None)
+            else: os.environ["SCD_HEARTBEAT_TESTING"] = saved_testing
+            if saved_root is None: os.environ.pop("SCD_HEARTBEAT_TEST_ROOT", None)
+            else: os.environ["SCD_HEARTBEAT_TEST_ROOT"] = saved_root
+
+        node_source = Path(shutil.which("node") or "")
+        self.assertTrue(node_source.is_file(), "closure test needs a Node executable to pin")
+        node, node_digest, _created = module.pin_admission_node(node_source)
+        compiler_root = Path.cwd() / "node_modules/typescript"
+        self.assertTrue(compiler_root.is_dir(), "closure test needs the repository-pinned TypeScript parser")
+        with tempfile.TemporaryDirectory(dir=self.root) as temporary:
+            output = Path(temporary)
+            entry = Path("mission-admission/heartbeat-admission-cli.js")
+            (output / entry).parent.mkdir(parents=True)
+            cases = [
+                ("await import('./other.js');", "dynamic import"),
+                ("import { createRequire } from 'node:module'; createRequire(import.meta.url);", "createRequire"),
+                ("import { createRequire } from 'node:module'; const x = module.createRequire(import.meta.url);", "module.createRequire"),
+                ("import '../outside.js';", "path traversal"),
+            ]
+            for source, label in cases:
+                with self.subTest(loader=label):
+                    (output / entry).write_text(source, encoding="utf-8")
+                    expected = "missing or escapes" if label == "path traversal" else "unsupported dynamic module loading"
+                    with self.assertRaisesRegex(RuntimeError, expected):
+                        module.validate_runtime_import_closure(node, node_digest, compiler_root, output, {entry}, entry)
+
+            static_entry = "import './other.js'; export const loaded = true;\n"
+            (output / entry).write_text(static_entry, encoding="utf-8")
+            other = Path("mission-admission/other.js")
+            (output / other).write_text("export const dependency = true;\n", encoding="utf-8")
+            self.assertEqual(
+                module.validate_runtime_import_closure(node, node_digest, compiler_root, output,
+                                                       {entry, other}, entry),
+                {entry, other},
+                "valid static relative imports remain supported",
+            )
+
+    def test_existing_staged_bundle_requires_exact_manifest_and_output_bytes(self) -> None:
+        saved_testing = os.environ.get("SCD_HEARTBEAT_TESTING")
+        saved_root = os.environ.get("SCD_HEARTBEAT_TEST_ROOT")
+        os.environ["SCD_HEARTBEAT_TESTING"] = "1"
+        os.environ["SCD_HEARTBEAT_TEST_ROOT"] = str(self.state_root)
+        try:
+            spec = importlib.util.spec_from_file_location("heartbeat_bundle_under_test", RUNNER)
+            assert spec and spec.loader
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+        finally:
+            if saved_testing is None: os.environ.pop("SCD_HEARTBEAT_TESTING", None)
+            else: os.environ["SCD_HEARTBEAT_TESTING"] = saved_testing
+            if saved_root is None: os.environ.pop("SCD_HEARTBEAT_TEST_ROOT", None)
+            else: os.environ["SCD_HEARTBEAT_TEST_ROOT"] = saved_root
+
+        bundle = self.root / "pinned-bundle"
+        bundle.mkdir(mode=0o700)
+        bundle.chmod(0o700)
+        nested = bundle / "mission-admission" / "entry.js"
+        nested.parent.mkdir(parents=True)
+        content = b"export {}\n"
+        nested.write_bytes(content)
+        manifest = b'{"entry":"mission-admission/entry.js"}\n'
+        (bundle / "build-manifest.json").write_bytes(manifest)
+        expected = {Path("mission-admission/entry.js"): hashlib.sha256(content).hexdigest()}
+        module.verify_existing_admission_bundle(bundle, manifest, expected)
+
+        nested.write_bytes(content + b"// tampered\n")
+        with self.assertRaisesRegex(RuntimeError, "byte verification"):
+            module.verify_existing_admission_bundle(bundle, manifest, expected)
+        nested.write_bytes(content)
+        (bundle / "unlisted.js").write_text("// unmanifested", encoding="utf-8")
+        with self.assertRaisesRegex(RuntimeError, "file set"):
+            module.verify_existing_admission_bundle(bundle, manifest, expected)
+        (bundle / "unlisted.js").unlink()
+        (bundle / "build-manifest.json").write_bytes(b'{"entry":"changed"}\n')
+        with self.assertRaisesRegex(RuntimeError, "mismatched build manifest"):
+            module.verify_existing_admission_bundle(bundle, manifest, expected)
+
+    def test_dangling_digest_bundle_symlink_is_existing_and_refused(self) -> None:
+        saved_testing = os.environ.get("SCD_HEARTBEAT_TESTING")
+        saved_root = os.environ.get("SCD_HEARTBEAT_TEST_ROOT")
+        os.environ["SCD_HEARTBEAT_TESTING"] = "1"
+        os.environ["SCD_HEARTBEAT_TEST_ROOT"] = str(self.state_root)
+        try:
+            spec = importlib.util.spec_from_file_location("heartbeat_symlink_bundle_under_test", RUNNER)
+            assert spec and spec.loader
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+        finally:
+            if saved_testing is None: os.environ.pop("SCD_HEARTBEAT_TESTING", None)
+            else: os.environ["SCD_HEARTBEAT_TESTING"] = saved_testing
+            if saved_root is None: os.environ.pop("SCD_HEARTBEAT_TEST_ROOT", None)
+            else: os.environ["SCD_HEARTBEAT_TEST_ROOT"] = saved_root
+
+        dangling = self.root / "verified-admission-deadbeef"
+        self.assertFalse(module.existing_admission_bundle(dangling))
+        dangling.symlink_to(self.root / "missing-target")
+        with self.assertRaisesRegex(RuntimeError, "directory is unsafe"):
+            module.existing_admission_bundle(dangling)
+        self.assertTrue(dangling.is_symlink(), "refusal must not replace or follow the dangling alias")
+
     def write_config(self, *, safety: int = 1800) -> None:
-        self.state_root.mkdir(parents=True, exist_ok=True)
+        self.state_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self.state_root.chmod(0o700)
         gh_digest = hashlib.sha256(self.gh.read_bytes()).hexdigest()
         gh_snapshot = self.state_root / ("verified-gh-" + gh_digest)
         gh_snapshot.write_bytes(self.gh.read_bytes())
@@ -113,8 +1275,155 @@ class HeartbeatTest(unittest.TestCase):
         runner_snapshot = self.state_root / ("verified-runner-" + runner_digest)
         runner_snapshot.write_bytes(RUNNER.read_bytes())
         runner_snapshot.chmod(0o700)
+        node = Path(shutil.which("node") or "")
+        self.assertTrue(node.is_file(), "Node is required for the pinned admission helper tests")
+        node_digest = hashlib.sha256(node.read_bytes()).hexdigest()
+        node_snapshot = self.state_root / ("verified-node-" + node_digest)
+        node_snapshot.write_bytes(node.read_bytes())
+        node_snapshot.chmod(0o700)
+        helper_root = self.state_root / "verified-admission-test"
+        helper_entry = helper_root / "mission-admission" / "heartbeat-admission-cli.js"
+        helper_entry.parent.mkdir(parents=True, exist_ok=True)
+        helper_source = (
+            "import fs from 'node:fs';\n"
+            "const statePath = " + json.dumps(str(self.admission_state)) + ";\n"
+            "let s = {}; try { s = JSON.parse(fs.readFileSync(statePath, 'utf8')); } catch {}\n"
+            "const q = JSON.parse(fs.readFileSync(0, 'utf8'));\n"
+            "if (q.action === 'inspect') { console.log(JSON.stringify({schemaVersion:1,outcome:'inspected',lane:s.active?{status:'active',generation:s.generation}:{status:'released',generation:s.releasedGeneration||((s.generation||0)+1)}}));\n"
+            "} else if (q.action === 'recover') {\n"
+            " if (s.uncommittedReceipt && q.expectedGeneration === null && q.supervisorId === s.supervisorId) { console.log(JSON.stringify({schemaVersion:1,outcome:'uncommitted_receipt',generation:s.generation,receiptId:s.receiptId,supervisorId:s.supervisorId})); process.exit(0); }\n"
+            " if (s.discardedPredecessor && q.expectedGeneration === null) { console.log(JSON.stringify({schemaVersion:1,outcome:'discarded_predecessor',laneId:s.laneId,generation:s.generation,receiptId:s.receiptId,supervisorId:s.markerSupervisorId})); process.exit(0); }\n"
+            " if ((s.capacityWait || s.capacityWaitHistoricalReceipt) && !s.active && q.expectedGeneration === null) { console.log(JSON.stringify({schemaVersion:1,outcome:'capacity_wait'})); process.exit(0); }\n"
+            " if (s.releasedPredecessor && !s.active && q.expectedGeneration === null) { console.log(JSON.stringify({schemaVersion:1,outcome:'released_predecessor',laneId:s.laneId,generation:s.generation,releasedGeneration:s.releasedGeneration,receiptId:s.receiptId,supervisorId:s.supervisorId})); process.exit(0); }\n"
+            " if (s.active && s.settlementPending && s.supervisorId === q.supervisorId && (q.expectedGeneration === null || q.expectedGeneration === s.generation)) console.log(JSON.stringify({schemaVersion:1,outcome:'settlement_pending',generation:s.generation,receiptId:s.receiptId}));\n"
+            " else if (s.active && s.supervisorId === q.supervisorId && (q.expectedGeneration === null || q.expectedGeneration === s.generation)) console.log(JSON.stringify({schemaVersion:1,outcome:'recoverable',generation:s.generation,receiptId:s.receiptId}));\n"
+            " else if (!s.active && q.expectedGeneration !== null && s.releasedGeneration === q.expectedGeneration + 1) console.log(JSON.stringify({schemaVersion:1,outcome:'already_settled',generation:q.expectedGeneration,receiptId:s.receiptId}));\n"
+            " else if (!s.active && q.expectedGeneration === null && (!s.generation || s.discardedUncommitted)) console.log(JSON.stringify({schemaVersion:1,outcome:'absent'}));\n"
+            " else console.log(JSON.stringify({schemaVersion:1,outcome:'not_owned'}));\n"
+            "} else if (q.action === 'discard_uncommitted') {\n"
+            " if (s.uncommittedReceipt && q.supervisorId === s.supervisorId && q.expectedGeneration === s.generation && q.receiptId === s.receiptId) { s.uncommittedReceipt = false; s.discardedUncommitted = true; s.discardedPredecessor = true; s.markerSupervisorId = q.supervisorId; fs.writeFileSync(statePath, JSON.stringify(s)); console.log(JSON.stringify({schemaVersion:1,outcome:'discarded_uncommitted',generation:q.expectedGeneration,receiptId:q.receiptId,supervisorId:q.supervisorId})); } else console.log(JSON.stringify({schemaVersion:1,outcome:'not_owned'}));\n"
+            "} else if (q.action === 'reserve') {\n"
+            " if (s.mode === 'waiting') { console.log(JSON.stringify({schemaVersion:1,outcome:'waiting'})); process.exit(0); }\n"
+            " if (s.mode === 'owned_elsewhere') { console.log(JSON.stringify({schemaVersion:1,outcome:'owned_elsewhere'})); process.exit(0); }\n"
+            " if (s.mode === 'corrupt') { process.exit(2); }\n"
+            " if (s.active) { console.log(JSON.stringify({schemaVersion:1,outcome:'already_reserved',generation:s.generation,receiptId:s.receiptId,revision:s.generation})); process.exit(0); }\n"
+            " s.generation = (s.generation || 0) + 1; s.receiptId = '00000000-0000-4000-8000-' + String(s.generation).padStart(12,'0');\n"
+            " s.supervisorId = q.supervisorId; s.active = true; fs.writeFileSync(statePath, JSON.stringify(s));\n"
+            " console.log(JSON.stringify({schemaVersion:1,outcome:'reserved',generation:s.generation,receiptId:s.receiptId,revision:s.generation}));\n"
+            "} else if (q.action === 'settle') {\n"
+            " if (s.mode === 'stale') process.exit(2);\n"
+            " if (!s.active || q.expectedGeneration !== s.generation || q.receiptId !== s.receiptId || q.supervisorId !== s.supervisorId || !q.stopProof?.childrenStopped || !q.stopProof?.supervisorStopped || q.stopProof.observedAt === 'pending') process.exit(2);\n"
+            " if (s.failSettlement) { s.failSettlement = false; fs.writeFileSync(statePath, JSON.stringify(s)); process.exit(2); }\n"
+            " s.active = false; s.settlementPending = false; s.releasedGeneration = s.generation + 1; fs.writeFileSync(statePath, JSON.stringify(s)); console.log(JSON.stringify({schemaVersion:1,outcome:'settled'}));\n"
+            "}\n"
+        )
+        helper_entry.write_text(helper_source, encoding="utf-8")
+        package_json = helper_root / "package.json"
+        package_json.write_text('{"type":"module"}\n', encoding="utf-8")
+        helper_files = []
+        for path in (package_json, helper_entry):
+            path_digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            helper_files.append({"path": str(path), "sha256": path_digest})
+        provider_manifest = json.loads((HERE / "providers/corepack-0.34.6.json").read_bytes())
+        provider_manifest_bytes = (HERE / "providers/corepack-0.34.6.json").read_bytes()
+        canonical_manifest_bytes = (json.dumps(provider_manifest, sort_keys=True, separators=(",", ":")) + "\n").encode()
+        provider_manifest_digest = hashlib.sha256(canonical_manifest_bytes).hexdigest()
+        corepack_bundle = self.state_root / ("verified-corepack-" + provider_manifest_digest)
+        corepack_bundle.mkdir(mode=0o700, exist_ok=True)
+        corepack_bundle.chmod(0o700)
+        provider_artifact = (HERE / "providers/corepack-0.34.6.tgz").read_bytes()
+        with tarfile.open(fileobj=io.BytesIO(provider_artifact), mode="r:gz") as archive:
+            members = {member.name: member for member in archive.getmembers() if member.isfile()}
+            self.assertEqual(set(members), {"package/" + item["path"] for item in provider_manifest["files"]})
+            for item in provider_manifest["files"]:
+                member = members["package/" + item["path"]]
+                self.assertEqual(member.mode, item["mode"])
+                stream = archive.extractfile(member)
+                self.assertIsNotNone(stream)
+                data = stream.read()
+                self.assertEqual(len(data), item["size"])
+                self.assertEqual(hashlib.sha256(data).hexdigest(), item["sha256"])
+                relative = Path(item["path"])
+                directory = corepack_bundle
+                for component in relative.parts[:-1]:
+                    directory = directory / component
+                    directory.mkdir(mode=0o700, exist_ok=True)
+                    directory.chmod(0o700)
+                target = corepack_bundle / relative
+                target.write_bytes(data)
+                target.chmod(item["mode"])
+        corepack_entry = str(corepack_bundle / "dist/corepack.js")
+        corepack_entry_bytes = Path(corepack_entry).read_bytes()
+        closure = hashlib.sha256()
+        for item in provider_manifest["files"]:
+            closure.update(item["path"].encode() + b"\0" + str(item["mode"]).encode() + b"\0")
+            closure.update(bytes.fromhex(item["sha256"]))
+        corepack_identity = {
+            "version": provider_manifest["version"], "path": corepack_entry,
+            "entrySha256": hashlib.sha256(corepack_entry_bytes).hexdigest(),
+            "closureSha256": closure.hexdigest(), "manifestSha256": provider_manifest_digest,
+            "sourceManifestSha256": hashlib.sha256(provider_manifest_bytes).hexdigest(),
+            "artifactSha256": hashlib.sha256(provider_artifact).hexdigest(),
+        }
+        def provider_identity(path: str, identifier: str, seed: int) -> dict[str, object]:
+            return {"path": path, "sha256": format(seed, "064x"), "identifier": identifier,
+                    "designatedRequirement": f'identifier "{identifier}" or anchor apple',
+                    "verifiedRequirement": "anchor apple",
+                    "device": 1, "inode": seed, "uid": 0, "gid": 0, "mode": 0o755}
+        helper_build = {
+            "source_commit": "a" * 40, "source_tree": "b" * 40, "source_snapshot_sha256": "c" * 64,
+            "source_runner": {
+                "path": "scripts/bootstrap-heartbeat/runner.py",
+                "blob": hashlib.sha1(b"blob " + str(len(RUNNER.read_bytes())).encode() + b"\0" + RUNNER.read_bytes()).hexdigest(),
+                "source_mode": "100755" if stat.S_IMODE(RUNNER.stat().st_mode) & 0o111 else "100644",
+                "sha256": hashlib.sha256(RUNNER.read_bytes()).hexdigest(), "installed_mode": "0700",
+            },
+            "package_json_sha256": "d" * 64, "lockfile_sha256": "e" * 64,
+            "node_path": str(node_snapshot), "node_sha256": node_digest, "node_version": "v22.0.0",
+            "providers": {
+                "git": {**provider_identity("/usr/bin/git", "com.apple.git", 15),
+                        "resolver": provider_identity("/usr/bin/xcrun", "com.apple.xcrun", 16)},
+                "openssl": provider_identity("/usr/bin/openssl", "com.apple.openssl", 17),
+                "corepack": corepack_identity,
+            },
+            "corepack_version": "0.34.6", "pnpm_version": "10.34.5",
+            "typescript_version": "5.9.3", "typescript_package_sha256": "1" * 64,
+            "typescript_tree_sha256": "2" * 64,
+            "install_command": ["corepack", "pnpm@10.34.5", "install", "--frozen-lockfile", "--ignore-scripts"],
+            "build_command": ["corepack", "pnpm@10.34.5", "build"],
+            "executed_commands": [[str(node_snapshot), corepack_entry, "--version"],
+                                  [str(node_snapshot), corepack_entry, "pnpm@10.34.5", "install", "--frozen-lockfile", "--ignore-scripts"],
+                                  [str(node_snapshot), corepack_entry, "pnpm@10.34.5", "--version"],
+                                  [str(node_snapshot), corepack_entry, "pnpm@10.34.5", "build"]],
+            "entry": "mission-admission/heartbeat-admission-cli.js",
+            "files": [{"path": Path(item["path"]).relative_to(helper_root).as_posix(), "sha256": item["sha256"]}
+                      for item in sorted(helper_files, key=lambda i: i["path"])],
+        }
+        manifest_bytes = (json.dumps(helper_build, sort_keys=True, separators=(",", ":")) + "\n").encode()
+        manifest_path = helper_root / "build-manifest.json"
+        manifest_path.write_bytes(manifest_bytes)
+        helper_files.append({"path": str(manifest_path), "sha256": hashlib.sha256(manifest_bytes).hexdigest()})
+        closure_digest = hashlib.sha256(manifest_bytes).hexdigest()
+        canonical_helper_root = self.state_root / ("verified-admission-" + closure_digest)
+        if canonical_helper_root.exists():
+            shutil.rmtree(canonical_helper_root)
+        os.rename(helper_root, canonical_helper_root)
+        helper_root = canonical_helper_root
+        helper_root.chmod(0o700)
+        helper_entry = helper_root / "mission-admission" / "heartbeat-admission-cli.js"
+        for item in helper_files:
+            relative = Path(item["path"]).relative_to(self.state_root / "verified-admission-test")
+            item["path"] = str(helper_root / relative)
+        admission = {
+            "repository": "nurockplayer/tachiko-conductor", "workspace": str(Path.cwd().resolve()),
+            "home": str(self.account_home),
+            "registry": str(self.account_home / ".tachiko-conductor/mission-admission/registry.json"),
+            "runs": str(self.account_home / ".tachiko-conductor/runs"),
+            "receipts": str(self.account_home / ".tachiko-conductor/mission-admission/heartbeat-receipts"),
+            "config": {"schemaVersion": 1, "revision": "test-config-v2", "limits": {"maxCaptains": 2, "maxWriters": 2, "maxHighAutonomy": 1}},
+        }
         config = {
-            "schema": 1,
+            "schema": 3,
             "gh": str(gh_snapshot),
             "gh_sha256": gh_digest,
             "repo": str(Path.cwd()),
@@ -125,14 +1434,55 @@ class HeartbeatTest(unittest.TestCase):
             "wake_timeout_seconds": 1500,
             "safety_interval_seconds": safety,
             "wake_executable_relocatable": True,
+            "wake_target_kind": "test",
             "wake_command": [str(self.wake), "dispatchable-target"],
             "wake_env": {},
             "required_files": [{
                 "path": str(self.wake), "sha256": hashlib.sha256(self.wake.read_bytes()).hexdigest()
             }],
+            "admission": admission,
+            "admission_node": str(node_snapshot), "admission_node_sha256": node_digest,
+            "admission_helper": str(helper_entry), "admission_helper_sha256": closure_digest,
+            "admission_helper_files": helper_files, "admission_build": helper_build,
             "installed_at": 1000,
         }
         (self.state_root / "config.json").write_text(json.dumps(config), encoding="utf-8")
+
+    def selected_source_fixture(self) -> tuple[Path, Path]:
+        cached = getattr(self, "_selected_source_fixture", None)
+        if cached is not None:
+            return cached
+        repo = self.root / "selected-source-repository"
+        repo.mkdir()
+        tracked = subprocess.run(["git", "ls-files", "-z"], cwd=Path.cwd(), check=True,
+                                 stdout=subprocess.PIPE).stdout.split(b"\0")
+        for raw_name in tracked:
+            if not raw_name:
+                continue
+            name = raw_name.decode("utf-8")
+            if not (name.startswith("src/") or name in {"package.json", "pnpm-lock.yaml", "tsconfig.json"}
+                    or name.startswith("scripts/bootstrap-heartbeat/providers/")
+                    or name == "scripts/bootstrap-heartbeat/runner.py"):
+                continue
+            source = Path.cwd() / name
+            if not source.is_file() or source.is_symlink():
+                continue
+            target = repo / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, target)
+            target.chmod(stat.S_IMODE(source.stat().st_mode))
+        env = dict(os.environ, GIT_AUTHOR_NAME="Heartbeat Test", GIT_AUTHOR_EMAIL="heartbeat-test@example.invalid",
+                   GIT_COMMITTER_NAME="Heartbeat Test", GIT_COMMITTER_EMAIL="heartbeat-test@example.invalid",
+                   GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull)
+        subprocess.run(["git", "init", "--quiet"], cwd=repo, env=env, check=True)
+        subprocess.run(["git", "add", "--all"], cwd=repo, env=env, check=True)
+        subprocess.run(["git", "commit", "--quiet", "-m", "selected heartbeat source fixture"],
+                       cwd=repo, env=env, check=True)
+        runner = repo / "scripts/bootstrap-heartbeat/runner.py"
+        if not runner.is_file():
+            raise AssertionError("selected source fixture omitted the heartbeat runner")
+        self._selected_source_fixture = (repo, runner)
+        return repo, runner
 
     def write_payload(self, oid: str, *, reverse: bool = False, truncated: bool = False) -> None:
         issues = [
@@ -197,9 +1547,18 @@ class HeartbeatTest(unittest.TestCase):
         self.payload.write_text(json.dumps(data), encoding="utf-8")
 
     def invoke(self, command: str = "run", *args: str, env: dict[str, str] | None = None,
-               check: bool = True) -> subprocess.CompletedProcess[str]:
+               check: bool = True, runner: Path | None = None) -> subprocess.CompletedProcess[str]:
+        if command == "install" and runner is None:
+            fixture_repo, fixture_runner = self.selected_source_fixture()
+            mutable_args = list(args)
+            for index, argument in enumerate(mutable_args[:-1]):
+                if argument == "--repo" and Path(mutable_args[index + 1]).resolve() == Path.cwd().resolve():
+                    mutable_args[index + 1] = str(fixture_repo)
+                    break
+            args = tuple(mutable_args)
+            runner = fixture_runner
         return subprocess.run(
-            [sys.executable, str(RUNNER), command, *args], env=env or self.env,
+            [sys.executable, str(runner or RUNNER), command, *args], env=env or self.env,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=check,
         )
 
@@ -235,6 +1594,1306 @@ class HeartbeatTest(unittest.TestCase):
         self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="2805"))
         self.assertEqual(len(self.records()), 4, "failed wake must retry unconsumed change")
         self.assertEqual(self.records()[0]["args"], ["dispatchable-target"])
+
+    def test_admission_capacity_denial_and_existing_receipt_never_spawn(self) -> None:
+        self.invoke("run", "--prime")
+        self.write_payload("B")
+        self.admission_state.write_text(json.dumps({"mode": "waiting"}), encoding="utf-8")
+        denied = self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1001"), check=False)
+        self.assertEqual(denied.returncode, 0, denied.stderr)
+        self.assertEqual(self.records(), [], "capacity denial remains a quiet model-free result")
+        self.admission_state.write_text(json.dumps({"active": True, "generation": 1, "receiptId": "old"}), encoding="utf-8")
+        retry = self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1002"), check=False)
+        self.assertEqual(retry.returncode, 0, retry.stderr)
+        self.assertEqual(self.records(), [], "already-reserved reconciliation never authorizes another model")
+
+    def _set_pending_admission(self, phase: str, *, boot_id: str = "test-boot", pid: int = 999999) -> None:
+        state = self.state()
+        state["pending_admission"] = {
+            "supervisor_id": "old-supervisor", "host_id": "test-host", "boot_id": boot_id,
+            "pid": pid, "process_identity": "dead-owner-identity", "phase": phase,
+            "generation": 1, "receipt_id": "00000000-0000-4000-8000-000000000001", "started_at": 1000,
+        }
+        (self.state_root / "state.json").write_text(json.dumps(state), encoding="utf-8")
+        self.admission_state.write_text(json.dumps({
+            "active": True, "generation": 1,
+            "receiptId": "00000000-0000-4000-8000-000000000001", "supervisorId": "old-supervisor",
+        }), encoding="utf-8")
+
+    def test_reentry_reconciles_verified_prior_boot_before_unchanged_fingerprint(self) -> None:
+        self.invoke("run", "--prime")
+        self._set_pending_admission("spawn_uncertain", boot_id="prior-boot")
+        result = self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1001"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(json.loads(self.admission_state.read_text(encoding="utf-8"))["active"])
+        self.assertIsNone(self.state()["pending_admission"])
+        self.assertEqual(self.records(), [], "recovery precedes the unchanged-state return and never spawns")
+
+    def test_same_boot_uncertain_execution_remains_fenced(self) -> None:
+        self.invoke("run", "--prime")
+        self._set_pending_admission("spawn_uncertain")
+        result = self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1001"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(json.loads(self.admission_state.read_text(encoding="utf-8"))["active"])
+        self.assertEqual(self.state()["pending_admission"]["phase"], "spawn_uncertain")
+        self.assertEqual(self.records(), [])
+
+    def test_durable_settlement_receipt_retries_same_boot_uncertain_execution_without_spawn(self) -> None:
+        self.invoke("run", "--prime")
+        self._set_pending_admission("spawn_uncertain")
+        admission = json.loads(self.admission_state.read_text(encoding="utf-8"))
+        admission.update(settlementPending=True, failSettlement=True)
+        self.admission_state.write_text(json.dumps(admission), encoding="utf-8")
+
+        failed = self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1001"), check=False)
+        self.assertEqual(failed.returncode, 1)
+        self.assertIsNotNone(self.state()["pending_admission"], "failed exact settlement keeps durable pending state")
+        self.assertTrue(json.loads(self.admission_state.read_text(encoding="utf-8"))["active"])
+        self.assertEqual(self.records(), [], "settlement retry never spawns a wake")
+
+        retried = self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1002"))
+        self.assertEqual(retried.returncode, 0, retried.stderr)
+        self.assertIsNone(self.state()["pending_admission"])
+        settled = json.loads(self.admission_state.read_text(encoding="utf-8"))
+        self.assertFalse(settled["active"])
+        self.assertEqual(settled["releasedGeneration"], 2)
+        self.assertEqual(self.records(), [], "recovery precedes polling and never spawns a wake")
+
+    def test_recoverable_active_rejects_partial_wrong_phase_and_mismatched_bindings(self) -> None:
+        saved_testing = os.environ.get("SCD_HEARTBEAT_TESTING")
+        saved_root = os.environ.get("SCD_HEARTBEAT_TEST_ROOT")
+        os.environ["SCD_HEARTBEAT_TESTING"] = "1"
+        os.environ["SCD_HEARTBEAT_TEST_ROOT"] = str(self.state_root)
+        try:
+            spec = importlib.util.spec_from_file_location("heartbeat_binding_runner_under_test", RUNNER)
+            assert spec and spec.loader
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+        finally:
+            if saved_testing is None:
+                os.environ.pop("SCD_HEARTBEAT_TESTING", None)
+            else:
+                os.environ["SCD_HEARTBEAT_TESTING"] = saved_testing
+            if saved_root is None:
+                os.environ.pop("SCD_HEARTBEAT_TEST_ROOT", None)
+            else:
+                os.environ["SCD_HEARTBEAT_TEST_ROOT"] = saved_root
+
+        exact_receipt_id = "00000000-0000-4000-8000-000000000001"
+        config = {"admission": {"repository": "nurockplayer/tachiko-conductor", "workspace": str(Path.cwd())}}
+        cases = (
+            ("partial null generation", {"generation": None, "receipt_id": exact_receipt_id}, "reserved_pre_execution", "test-host", "test-boot"),
+            ("partial null receipt", {"generation": 1, "receipt_id": None}, "reserved_pre_execution", "test-host", "test-boot"),
+            ("mismatched generation", {"generation": 2, "receipt_id": exact_receipt_id}, "reserved_pre_execution", "test-host", "test-boot"),
+            ("mismatched receipt", {"generation": 1, "receipt_id": "00000000-0000-4000-8000-000000000002"}, "reserved_pre_execution", "test-host", "test-boot"),
+            ("uncertain phase after reboot", {"generation": None, "receipt_id": None}, "spawn_uncertain", "test-host", "prior-boot"),
+            ("wrong host", {"generation": None, "receipt_id": None}, "reserved_pre_execution", "other-host", "prior-boot"),
+        )
+        for label, identity, phase, host_id, boot_id in cases:
+            with self.subTest(case=label):
+                pending = {
+                    "supervisor_id": "old-supervisor", "host_id": host_id, "boot_id": boot_id,
+                    "pid": 999999, "process_identity": "dead-owner-identity", "phase": phase,
+                    **identity, "started_at": 1000,
+                }
+                state = {"pending_admission": pending}
+                calls: list[str] = []
+
+                def admission_call(_config: dict[str, object], request: dict[str, object]) -> dict[str, object]:
+                    calls.append(str(request["action"]))
+                    if request["action"] == "recover":
+                        return {"schemaVersion": 1, "outcome": "recoverable", "generation": 1,
+                                "receiptId": exact_receipt_id}
+                    return {"schemaVersion": 1, "outcome": "settled"}
+
+                with mock.patch.object(module, "admission_call", side_effect=admission_call), \
+                        mock.patch.object(module, "durable_host_boot_identity", return_value=("test-host", "test-boot")), \
+                        mock.patch.object(module, "process_identity", return_value=None), \
+                        mock.patch.object(module, "save_state") as save:
+                    with self.assertRaises(RuntimeError):
+                        module.reconcile_pending_admission(config, state)
+                self.assertEqual(calls, [] if label == "wrong host" else ["recover"],
+                                 "fenced recovery must not settle")
+                save.assert_not_called()
+                self.assertEqual(state["pending_admission"], pending)
+
+        live_pending = {
+            "supervisor_id": "old-supervisor", "host_id": "test-host", "boot_id": "test-boot",
+            "pid": 123, "process_identity": "live-owner-identity", "phase": "reserved_pre_execution",
+            "generation": None, "receipt_id": None, "started_at": 1000,
+        }
+        live_state = {"pending_admission": dict(live_pending)}
+        live_calls: list[str] = []
+
+        def live_admission_call(_config: dict[str, object], request: dict[str, object]) -> dict[str, object]:
+            live_calls.append(str(request["action"]))
+            return {"schemaVersion": 1, "outcome": "recoverable", "generation": 1, "receiptId": exact_receipt_id}
+
+        with mock.patch.object(module, "admission_call", side_effect=live_admission_call), \
+                mock.patch.object(module, "durable_host_boot_identity", return_value=("test-host", "test-boot")), \
+                mock.patch.object(module, "process_identity", return_value="live-owner-identity"), \
+                mock.patch.object(module, "save_state") as save:
+            self.assertFalse(module.reconcile_pending_admission(config, live_state))
+        self.assertEqual(live_calls, ["recover"])
+        save.assert_not_called()
+        self.assertEqual(live_state["pending_admission"], live_pending)
+
+    def test_atomic_write_fsyncs_temp_then_rename_then_parent_and_propagates_failures(self) -> None:
+        saved_testing = os.environ.get("SCD_HEARTBEAT_TESTING")
+        saved_root = os.environ.get("SCD_HEARTBEAT_TEST_ROOT")
+        os.environ["SCD_HEARTBEAT_TESTING"] = "1"
+        os.environ["SCD_HEARTBEAT_TEST_ROOT"] = str(self.state_root)
+        try:
+            spec = importlib.util.spec_from_file_location("heartbeat_atomic_write_runner_under_test", RUNNER)
+            assert spec and spec.loader
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+        finally:
+            if saved_testing is None:
+                os.environ.pop("SCD_HEARTBEAT_TESTING", None)
+            else:
+                os.environ["SCD_HEARTBEAT_TESTING"] = saved_testing
+            if saved_root is None:
+                os.environ.pop("SCD_HEARTBEAT_TEST_ROOT", None)
+            else:
+                os.environ["SCD_HEARTBEAT_TEST_ROOT"] = saved_root
+
+        target = self.root / "durable-state" / "state.json"
+        events: list[str] = []
+        real_fsync = os.fsync
+        real_replace = os.replace
+
+        def tracked_fsync(descriptor: int) -> None:
+            events.append("directory-fsync" if stat.S_ISDIR(os.fstat(descriptor).st_mode) else "file-fsync")
+            real_fsync(descriptor)
+
+        def tracked_replace(source: str | os.PathLike[str], destination: str | os.PathLike[str]) -> None:
+            events.append("replace")
+            real_replace(source, destination)
+
+        with mock.patch.object(module.os, "fsync", side_effect=tracked_fsync), \
+                mock.patch.object(module.os, "replace", side_effect=tracked_replace):
+            module.atomic_write(target, b"durable-new-state", sync_hierarchy=lambda _directory: None)
+        self.assertEqual(events, ["file-fsync", "replace", "directory-fsync"],
+                         "the rename is durable only after the temp file and parent directory syncs")
+        self.assertEqual(target.read_bytes(), b"durable-new-state")
+        self.assertEqual(target.stat().st_mode & 0o777, 0o600)
+
+        target.write_bytes(b"old-state")
+        real_fsync = os.fsync
+
+        def fail_file_fsync(descriptor: int) -> None:
+            if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+                real_fsync(descriptor)
+                return
+            raise OSError("injected file fsync failure")
+
+        with mock.patch.object(module.os, "fsync", side_effect=fail_file_fsync):
+            with self.assertRaisesRegex(OSError, "injected file fsync failure"):
+                module.atomic_write(target, b"must-not-replace", sync_hierarchy=lambda _directory: None)
+        self.assertEqual(target.read_bytes(), b"old-state")
+        self.assertEqual(list(target.parent.glob("state.json.tmp-*")), [], "failed temp publication removes its owned file")
+
+        def fail_directory_fsync(descriptor: int) -> None:
+            if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+                raise OSError("injected parent fsync failure")
+            real_fsync(descriptor)
+
+        with mock.patch.object(module.os, "fsync", side_effect=fail_directory_fsync):
+            with self.assertRaisesRegex(OSError, "injected parent fsync failure"):
+                module.atomic_write(target, b"renamed-but-not-durable", sync_hierarchy=lambda _directory: None)
+        self.assertEqual(target.read_bytes(), b"renamed-but-not-durable",
+                         "failure after replace is propagated while the visible exact state remains inspectable")
+
+    def test_durable_directory_hierarchy_failure_retries_visible_edges_and_blocks_state_and_lock(self) -> None:
+        saved_testing = os.environ.get("SCD_HEARTBEAT_TESTING")
+        saved_root = os.environ.get("SCD_HEARTBEAT_TEST_ROOT")
+        os.environ["SCD_HEARTBEAT_TESTING"] = "1"
+        os.environ["SCD_HEARTBEAT_TEST_ROOT"] = str(self.state_root)
+        try:
+            spec = importlib.util.spec_from_file_location("heartbeat_directory_durability_runner_under_test", RUNNER)
+            assert spec and spec.loader
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+        finally:
+            if saved_testing is None:
+                os.environ.pop("SCD_HEARTBEAT_TESTING", None)
+            else:
+                os.environ["SCD_HEARTBEAT_TESTING"] = saved_testing
+            if saved_root is None:
+                os.environ.pop("SCD_HEARTBEAT_TEST_ROOT", None)
+            else:
+                os.environ["SCD_HEARTBEAT_TEST_ROOT"] = saved_root
+
+        state_file = self.root / "fresh-authority" / "nested" / "state.json"
+        failed_parent = state_file.parent.parent
+        seen: list[Path] = []
+        fail = True
+
+        def sync_hierarchy(directory: Path) -> None:
+            seen.append(directory)
+            if fail and directory == failed_parent:
+                raise OSError("injected hierarchy parent fsync failure")
+            module.fsync_directory(directory)
+
+        with self.assertRaisesRegex(OSError, "hierarchy parent fsync failure"):
+            module.atomic_write(state_file, b"must-not-publish", sync_hierarchy=sync_hierarchy)
+        self.assertTrue(failed_parent.is_dir(), "a visible directory survives uncertain parent sync for retry")
+        self.assertFalse(state_file.exists())
+        self.assertEqual(list(state_file.parent.glob("state.json.tmp-*")), [])
+        self.assertEqual(seen[-1], failed_parent)
+
+        seen.clear()
+        with self.assertRaisesRegex(OSError, "hierarchy parent fsync failure"):
+            module.atomic_write(state_file, b"must-still-not-publish", sync_hierarchy=sync_hierarchy)
+        self.assertEqual(seen[-1], failed_parent, "a visible component's containing parent is re-synced on retry")
+        self.assertFalse(state_file.exists())
+
+        fail = False
+        seen.clear()
+        module.atomic_write(state_file, b"durable-after-retry", sync_hierarchy=sync_hierarchy)
+        self.assertEqual(state_file.read_bytes(), b"durable-after-retry")
+        self.assertIn(failed_parent, seen)
+
+        lock_seen: list[Path] = []
+        lock_fail = True
+
+        def sync_lock_hierarchy(directory: Path) -> None:
+            lock_seen.append(directory)
+            if lock_fail and directory == module.ROOT.parent:
+                raise OSError("injected ROOT lock hierarchy failure")
+            module.fsync_directory(directory)
+
+        with mock.patch.object(module, "sync_directory_hierarchy", side_effect=sync_lock_hierarchy):
+            with self.assertRaisesRegex(OSError, "ROOT lock hierarchy failure"):
+                module.acquire_lock(verbose=False)
+            self.assertTrue(module.ROOT.is_dir())
+            self.assertFalse(module.LOCK.exists(), "ROOT lock must not be opened before the hierarchy barrier")
+            self.assertEqual(lock_seen[-1], module.ROOT.parent)
+            with self.assertRaisesRegex(OSError, "ROOT lock hierarchy failure"):
+                module.acquire_lock(verbose=False)
+            self.assertEqual(lock_seen[-1], module.ROOT.parent, "visible ROOT is re-synced before each lock attempt")
+            lock_fail = False
+            stream = module.acquire_lock(verbose=False)
+            self.assertIsNotNone(stream)
+            stream.close()
+
+    def test_prior_boot_spawn_uncertain_with_exact_bound_receipt_still_settles(self) -> None:
+        saved_testing = os.environ.get("SCD_HEARTBEAT_TESTING")
+        saved_root = os.environ.get("SCD_HEARTBEAT_TEST_ROOT")
+        os.environ["SCD_HEARTBEAT_TESTING"] = "1"
+        os.environ["SCD_HEARTBEAT_TEST_ROOT"] = str(self.state_root)
+        try:
+            spec = importlib.util.spec_from_file_location("heartbeat_bound_uncertain_runner_under_test", RUNNER)
+            assert spec and spec.loader
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+        finally:
+            if saved_testing is None:
+                os.environ.pop("SCD_HEARTBEAT_TESTING", None)
+            else:
+                os.environ["SCD_HEARTBEAT_TESTING"] = saved_testing
+            if saved_root is None:
+                os.environ.pop("SCD_HEARTBEAT_TEST_ROOT", None)
+            else:
+                os.environ["SCD_HEARTBEAT_TEST_ROOT"] = saved_root
+
+        receipt_id = "00000000-0000-4000-8000-000000000001"
+        pending = {
+            "supervisor_id": "old-supervisor", "host_id": "test-host", "boot_id": "prior-boot",
+            "pid": 999999, "process_identity": "old-owner-identity", "phase": "spawn_uncertain",
+            "generation": 1, "receipt_id": receipt_id, "started_at": 1000,
+        }
+        state = {"pending_admission": dict(pending)}
+        calls: list[str] = []
+
+        def admission_call(_config: dict[str, object], request: dict[str, object]) -> dict[str, object]:
+            calls.append(str(request["action"]))
+            if request["action"] == "recover":
+                return {"schemaVersion": 1, "outcome": "recoverable", "generation": 1, "receiptId": receipt_id}
+            return {"schemaVersion": 1, "outcome": "settled"}
+
+        config = {"admission": {"repository": "nurockplayer/tachiko-conductor", "workspace": str(Path.cwd())}}
+        with mock.patch.object(module, "admission_call", side_effect=admission_call), \
+                mock.patch.object(module, "durable_host_boot_identity", return_value=("test-host", "test-boot")), \
+                mock.patch.object(module, "process_identity") as process_identity, \
+                mock.patch.object(module, "save_state") as save:
+            self.assertTrue(module.reconcile_pending_admission(config, state))
+        self.assertEqual(calls, ["recover", "settle"])
+        process_identity.assert_not_called()
+        save.assert_called_once_with(state)
+        self.assertIsNone(state["pending_admission"])
+
+    def test_same_boot_dead_preexecution_owner_can_settle_exact_generation(self) -> None:
+        self.invoke("run", "--prime")
+        self._set_pending_admission("reserved_pre_execution")
+        result = self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1001"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(json.loads(self.admission_state.read_text(encoding="utf-8"))["active"])
+        self.assertIsNone(self.state()["pending_admission"])
+        self.assertEqual(self.records(), [])
+
+    def _set_capacity_wait_pending(self, *, phase: str = "reserved_pre_execution", host_id: str = "test-host", historical_receipt: bool = False) -> None:
+        state = self.state()
+        state["pending_admission"] = {
+            "supervisor_id": "old-supervisor", "host_id": host_id, "boot_id": "test-boot",
+            "pid": 999999, "process_identity": "dead-owner-identity", "phase": phase,
+            "generation": None, "receipt_id": None, "started_at": 1000,
+        }
+        (self.state_root / "state.json").write_text(json.dumps(state), encoding="utf-8")
+        self.admission_state.write_text(json.dumps({"capacityWait": not historical_receipt, "capacityWaitHistoricalReceipt": historical_receipt, "mode": "waiting"}), encoding="utf-8")
+
+    def _set_uncommitted_receipt_pending(self, *, phase: str = "reserved_pre_execution", host_id: str = "test-host", owner: str = "old-supervisor", receipt_owner: str | None = None, boot_id: str = "test-boot") -> None:
+        state = self.state()
+        state["pending_admission"] = {
+            "supervisor_id": owner, "host_id": host_id, "boot_id": boot_id,
+            "pid": 999999, "process_identity": "dead-owner-identity", "phase": phase,
+            "generation": None, "receipt_id": None, "started_at": 1000,
+        }
+        (self.state_root / "state.json").write_text(json.dumps(state), encoding="utf-8")
+        workspace = str(Path.cwd().resolve())
+        lane_id = "heartbeat:" + hashlib.sha256(
+            ("nurockplayer/tachiko-conductor" + "\0" + workspace).encode()
+        ).hexdigest()[:32]
+        self.admission_state.write_text(json.dumps({
+            "uncommittedReceipt": True, "generation": 7,
+            "receiptId": "00000000-0000-4000-8000-000000000007", "supervisorId": receipt_owner or owner,
+            "laneId": lane_id,
+        }), encoding="utf-8")
+
+    def _set_released_predecessor_pending(self, *, phase: str = "reserved_pre_execution", host_id: str = "test-host",
+                                         boot_id: str = "test-boot", receipt_id: str = "00000000-0000-4000-8000-000000000006") -> None:
+        state = self.state()
+        state["pending_admission"] = {
+            "supervisor_id": "new-supervisor", "host_id": host_id, "boot_id": boot_id,
+            "pid": 999999, "process_identity": "dead-owner-identity", "phase": phase,
+            "generation": None, "receipt_id": None, "started_at": 1000,
+        }
+        (self.state_root / "state.json").write_text(json.dumps(state), encoding="utf-8")
+        repository = "nurockplayer/tachiko-conductor"
+        workspace = str(Path.cwd().resolve())
+        lane_id = "heartbeat:" + hashlib.sha256((repository + "\0" + workspace).encode()).hexdigest()[:32]
+        self.admission_state.write_text(json.dumps({
+            "mode": "waiting", "releasedPredecessor": True, "active": False,
+            "generation": 6, "releasedGeneration": 7,
+            "receiptId": receipt_id, "supervisorId": "previous-supervisor",
+            "status": "settled", "laneId": lane_id,
+        }), encoding="utf-8")
+
+    def _set_discarded_predecessor_pending(self, *, owner: str = "new-supervisor", marker_owner: str = "old-supervisor",
+                                           receipt_id: str = "00000000-0000-4000-8000-000000000006",
+                                           phase: str = "reserved_pre_execution", host_id: str = "test-host",
+                                           lane_id: str | None = None) -> None:
+        state = self.state()
+        state["pending_admission"] = {
+            "supervisor_id": owner, "host_id": host_id, "boot_id": "test-boot",
+            "pid": 999999, "process_identity": "dead-owner-identity", "phase": phase,
+            "generation": None, "receipt_id": None, "started_at": 1000,
+        }
+        (self.state_root / "state.json").write_text(json.dumps(state), encoding="utf-8")
+        workspace = str(Path.cwd().resolve())
+        exact_lane_id = "heartbeat:" + hashlib.sha256(
+            ("nurockplayer/tachiko-conductor" + "\0" + workspace).encode()
+        ).hexdigest()[:32]
+        self.admission_state.write_text(json.dumps({
+            "mode": "waiting", "discardedPredecessor": True, "generation": 6,
+            "receiptId": receipt_id, "markerSupervisorId": marker_owner,
+            "laneId": lane_id or exact_lane_id,
+        }), encoding="utf-8")
+
+    def test_capacity_wait_crash_clears_only_dead_generation_free_preexecution_intent(self) -> None:
+        self.invoke("run", "--prime")
+        self._set_capacity_wait_pending()
+        result = self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1001"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIsNone(self.state()["pending_admission"])
+        self.assertTrue(json.loads(self.admission_state.read_text(encoding="utf-8"))["capacityWait"],
+                        "capacity reconciliation preserves the parked lane and never releases it")
+        self.assertEqual(self.records(), [], "capacity recovery never spawns")
+
+    def test_later_cycle_capacity_wait_crash_accepts_prior_settled_tombstone_without_spawning(self) -> None:
+        self.invoke("run", "--prime")
+        self._set_capacity_wait_pending(historical_receipt=True)
+        result = self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1001"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIsNone(self.state()["pending_admission"])
+        receipt_evidence = json.loads(self.admission_state.read_text(encoding="utf-8"))
+        self.assertTrue(receipt_evidence["capacityWaitHistoricalReceipt"], "the historical receipt remains evidence only; the parked lane is not retired")
+        self.assertEqual(self.records(), [])
+
+    def test_capacity_wait_refuses_wrong_host_or_execution_possible_intent(self) -> None:
+        for phase, host_id in (("reserved_pre_execution", "other-host"), ("spawn_uncertain", "test-host")):
+            with self.subTest(phase=phase, host_id=host_id):
+                self.invoke("run", "--prime")
+                self._set_capacity_wait_pending(phase=phase, host_id=host_id)
+                result = self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1001"), check=False)
+                self.assertEqual(result.returncode, 1)
+                self.assertIsNotNone(self.state()["pending_admission"])
+                self.assertEqual(self.records(), [])
+
+    def test_uncommitted_candidate_is_discarded_only_for_dead_generation_free_preexecution_owner(self) -> None:
+        for phase, host_id, owner, receipt_owner in (
+            ("reserved_pre_execution", "test-host", "old-supervisor", "other-supervisor"),
+            ("spawn_uncertain", "test-host", "old-supervisor", "old-supervisor"),
+            ("reserved_pre_execution", "other-host", "old-supervisor", "old-supervisor"),
+        ):
+            with self.subTest(phase=phase, host_id=host_id, owner=owner, receipt_owner=receipt_owner):
+                self.invoke("run", "--prime")
+                self._set_uncommitted_receipt_pending(phase=phase, host_id=host_id, owner=owner, receipt_owner=receipt_owner)
+                result = self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1001"), check=False)
+                self.assertEqual(result.returncode, 1)
+                self.assertIsNotNone(self.state()["pending_admission"])
+                self.assertTrue(json.loads(self.admission_state.read_text(encoding="utf-8"))["uncommittedReceipt"])
+                self.assertEqual(self.records(), [])
+
+        self.invoke("run", "--prime")
+        self._set_uncommitted_receipt_pending(phase="spawn_uncertain", boot_id="prior-boot")
+        rebooted_uncertain = self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1001"), check=False)
+        self.assertEqual(rebooted_uncertain.returncode, 1, "a reboot alone cannot clear an absent spawn-uncertain intent")
+        self.assertIsNotNone(self.state()["pending_admission"])
+        self.assertEqual(self.records(), [])
+
+        self.invoke("run", "--prime")
+        self._set_uncommitted_receipt_pending()
+        result = self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1001"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIsNone(self.state()["pending_admission"])
+        admission = json.loads(self.admission_state.read_text(encoding="utf-8"))
+        self.assertTrue(admission["discardedUncommitted"])
+        self.assertEqual(admission["generation"], 7, "discard does not consume or release a registry generation")
+        self.assertEqual(self.records(), [], "clearing a prepublication candidate is never itself spawn authority")
+
+    def test_crash_after_uncommitted_receipt_discard_retries_absent_without_spawning(self) -> None:
+        self.invoke("run", "--prime")
+        self._set_uncommitted_receipt_pending()
+        failed = self.invoke("run", env=dict(
+            self.env, SCD_HEARTBEAT_TEST_NOW="1001", SCD_HEARTBEAT_TEST_FAIL_CLEAR_PENDING="1",
+        ), check=False)
+        self.assertEqual(failed.returncode, 1)
+        self.assertIsNotNone(self.state()["pending_admission"], "failed pending-state save must preserve intent")
+        self.assertTrue(json.loads(self.admission_state.read_text(encoding="utf-8"))["discardedUncommitted"],
+                        "the exact private orphan was durably removed before the failed state save")
+
+        retried = self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1002"))
+        self.assertEqual(retried.returncode, 0, retried.stderr)
+        self.assertIsNone(self.state()["pending_admission"])
+        self.assertEqual(self.records(), [], "absent retry after discard cannot reuse stale execution intent")
+
+    def test_crash_after_marker_publication_reconciles_later_supervisor_without_spawning(self) -> None:
+        self.invoke("run", "--prime")
+        self._set_discarded_predecessor_pending()
+        failed_save = self.invoke("run", env=dict(
+            self.env, SCD_HEARTBEAT_TEST_NOW="1001", SCD_HEARTBEAT_TEST_FAIL_CLEAR_PENDING="1",
+        ), check=False)
+        self.assertEqual(failed_save.returncode, 1)
+        self.assertIsNotNone(self.state()["pending_admission"], "the failed save retains the null-generation intent")
+        marker = json.loads(self.admission_state.read_text(encoding="utf-8"))
+        self.assertTrue(marker["discardedPredecessor"], "the durable tokenless marker survives the failed state save")
+
+        retry = self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1002"))
+        self.assertEqual(retry.returncode, 0, retry.stderr)
+        self.assertIsNone(self.state()["pending_admission"])
+        self.assertEqual(self.records(), [], "a later supervisor may clear only after dead-owner proof and marker recovery")
+
+    def test_discarded_marker_rejects_bad_owner_phase_host_and_uuid_without_traceback(self) -> None:
+        cases = (
+            {"phase": "spawn_uncertain"},
+            {"host_id": "other-host"},
+            {"receipt_id": "not-a-uuid"},
+            {"receipt_id": "x" * 36},
+            {"lane_id": "heartbeat:foreign"},
+        )
+        for overrides in cases:
+            with self.subTest(overrides=overrides):
+                self.invoke("run", "--prime")
+                self._set_discarded_predecessor_pending(**overrides)
+                before = json.loads(self.admission_state.read_text(encoding="utf-8"))
+                result = self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1001"), check=False)
+                self.assertEqual(result.returncode, 1)
+                self.assertNotIn("Traceback", result.stderr, "malformed marker UUID is handled as a fenced recovery result")
+                self.assertIsNotNone(self.state()["pending_admission"])
+                self.assertEqual(json.loads(self.admission_state.read_text(encoding="utf-8")), before)
+                self.assertEqual(self.records(), [])
+
+    def test_real_typescript_discard_marker_survives_python_restart(self) -> None:
+        saved_testing = os.environ.get("SCD_HEARTBEAT_TESTING")
+        saved_root = os.environ.get("SCD_HEARTBEAT_TEST_ROOT")
+        os.environ["SCD_HEARTBEAT_TESTING"] = "1"
+        os.environ["SCD_HEARTBEAT_TEST_ROOT"] = str(self.state_root)
+        try:
+            spec = importlib.util.spec_from_file_location("heartbeat_marker_runner_under_test", RUNNER)
+            assert spec and spec.loader
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+        finally:
+            if saved_testing is None: os.environ.pop("SCD_HEARTBEAT_TESTING", None)
+            else: os.environ["SCD_HEARTBEAT_TESTING"] = saved_testing
+            if saved_root is None: os.environ.pop("SCD_HEARTBEAT_TEST_ROOT", None)
+            else: os.environ["SCD_HEARTBEAT_TEST_ROOT"] = saved_root
+
+        workspace = self.root / "real-helper-workspace"
+        workspace.mkdir()
+        helper_registry = self.root / "real-helper-host" / "registry.json"
+        helper_receipt = self.root / "real-helper-receipts" / "heartbeat.json"
+        admission_config = {
+            "schemaVersion": 1, "revision": "discard-marker-cross-language-v1",
+            "limits": {"maxCaptains": 1, "maxWriters": 1, "maxHighAutonomy": 1},
+        }
+        registry_module = (Path.cwd() / "src/mission-admission/registry.ts").resolve().as_uri()
+        admission_module = (Path.cwd() / "src/mission-admission/heartbeat-admission.ts").resolve().as_uri()
+        bridge = self.state_root / "real-heartbeat-admission-bridge.mjs"
+        bridge.write_text(
+            "import fs from 'node:fs';\n"
+            "import { MissionAdmissionRegistry } from " + json.dumps(registry_module) + ";\n"
+            "import { handleHeartbeatAdmission } from " + json.dumps(admission_module) + ";\n"
+            "const q = JSON.parse(fs.readFileSync(0, 'utf8'));\n"
+            "const config = JSON.parse(process.env.TEST_ADMISSION_CONFIG);\n"
+            "const options = { filePath: process.env.TEST_ADMISSION_REGISTRY, config, "
+            "...(q.injectPublicationFailure ? { beforePublish: () => { throw new Error('injected publication failure'); } } : {}) };\n"
+            "const registry = new MissionAdmissionRegistry(options);\n"
+            "if (q.bridgeAction === 'occupy') {\n"
+            " const result = registry.admit({laneId:'test-capacity-holder',role:'production_captain',highAutonomy:true,evidence:{repository:'acme/holder',issue:117}});\n"
+            " console.log(JSON.stringify(result));\n"
+            "} else if (q.bridgeAction === 'readLane') {\n"
+            " console.log(JSON.stringify(registry.readLane(q.laneId)));\n"
+            "} else {\n"
+            " delete q.injectPublicationFailure; delete q.bridgeAction; delete q.laneId;\n"
+            " console.log(JSON.stringify(handleHeartbeatAdmission(q,{registry,receiptPath:()=>process.env.TEST_ADMISSION_RECEIPT})));\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        node = shutil.which("node")
+        self.assertIsNotNone(node)
+        node_env = dict(os.environ, TEST_ADMISSION_REGISTRY=str(helper_registry),
+                        TEST_ADMISSION_RECEIPT=str(helper_receipt),
+                        TEST_ADMISSION_CONFIG=json.dumps(admission_config))
+
+        def real_helper(request: dict[str, object], *, allow_failure: bool = False) -> tuple[subprocess.CompletedProcess[str], dict[str, object] | None]:
+            result = subprocess.run([str(node), "--import", "tsx", str(bridge)], cwd=Path.cwd(), env=node_env,
+                                    input=json.dumps(request), text=True, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, check=False)
+            if result.returncode != 0:
+                if allow_failure:
+                    return result, None
+                self.fail("real TypeScript helper failed: " + result.stderr)
+            if allow_failure:
+                self.fail("real TypeScript helper unexpectedly published the injected candidate")
+            return result, json.loads(result.stdout)
+
+        repository = "nurockplayer/tachiko-conductor"
+        workspace_text = str(workspace.resolve())
+        self.invoke("run", "--prime")
+        runtime_config = {"admission": {"repository": repository, "workspace": workspace_text}}
+
+        def python_recovery(_config: dict[str, object], request: dict[str, object]) -> dict[str, object]:
+            outcome = real_helper(request)[1]
+            assert outcome is not None
+            return outcome
+
+        def reconcile_state(state: dict[str, object], *, fail_save: bool = False) -> bool:
+            with mock.patch.object(module, "admission_call", side_effect=python_recovery), \
+                    mock.patch.object(module, "durable_host_boot_identity", return_value=("test-host", "test-boot")), \
+                    mock.patch.object(module, "process_identity", return_value=None):
+                if fail_save:
+                    with mock.patch.object(module, "save_state", side_effect=OSError("simulated pending save failure")):
+                        return module.reconcile_pending_admission(runtime_config, state)
+                return module.reconcile_pending_admission(runtime_config, state)
+
+        prior_supervisor = "prior-supervisor"
+        reserved = real_helper({"schemaVersion": 1, "action": "reserve", "repository": repository,
+                                "workspace": workspace_text, "supervisorId": prior_supervisor})[1]
+        assert reserved is not None
+        self.assertEqual(reserved["outcome"], "reserved")
+        generation = reserved["generation"]
+        receipt_id = reserved["receiptId"]
+        settled = real_helper({
+            "schemaVersion": 1, "action": "settle", "repository": repository, "workspace": workspace_text,
+            "supervisorId": prior_supervisor, "expectedGeneration": generation, "receiptId": receipt_id,
+            "stopProof": {"childrenStopped": True, "supervisorStopped": True, "observedAt": "2026-09-24T00:00:00Z"},
+        })[1]
+        assert settled is not None
+        self.assertEqual(settled["outcome"], "settled")
+        lane_id = reserved["laneId"]
+        legacy_receipt_id = "-" * 36
+        settled_receipt = json.loads(helper_receipt.read_text(encoding="utf-8"))
+        settled_receipt["receiptId"] = legacy_receipt_id
+        helper_receipt.write_text(json.dumps(settled_receipt), encoding="utf-8")
+        released_lane = real_helper({"bridgeAction": "readLane", "laneId": lane_id})[1]
+        assert released_lane is not None
+        self.assertEqual((released_lane["status"], released_lane["generation"]), ("released", generation + 1))
+        released_recovery = real_helper({"schemaVersion": 1, "action": "recover", "repository": repository,
+                                         "workspace": workspace_text, "supervisorId": "released-reader",
+                                         "expectedGeneration": None})[1]
+        assert released_recovery is not None
+        self.assertEqual(released_recovery["outcome"], "released_predecessor")
+        self.assertEqual(released_recovery["receiptId"], legacy_receipt_id)
+        released_state = self.state()
+        released_state["pending_admission"] = {
+            "supervisor_id": "released-reader", "host_id": "test-host", "boot_id": "test-boot",
+            "pid": 999999, "process_identity": "dead-owner-identity", "phase": "reserved_pre_execution",
+            "generation": None, "receipt_id": None, "started_at": 999,
+        }
+        module.STATE.write_text(json.dumps(released_state), encoding="utf-8")
+        self.assertTrue(reconcile_state(released_state), "Python must accept the prior receipt grammar for released recovery")
+        self.assertIsNone(released_state["pending_admission"])
+
+        failed, _ = real_helper({"schemaVersion": 1, "action": "reserve", "repository": repository,
+                                 "workspace": workspace_text, "supervisorId": prior_supervisor,
+                                 "injectPublicationFailure": True}, allow_failure=True)
+        self.assertNotEqual(failed.returncode, 0)
+        orphan = json.loads(helper_receipt.read_text(encoding="utf-8"))
+        orphan["receiptId"] = legacy_receipt_id
+        helper_receipt.write_text(json.dumps(orphan), encoding="utf-8")
+        self.assertEqual((orphan["status"], orphan["token"]["generation"]), ("active", generation + 2))
+        unchanged_lane = real_helper({"bridgeAction": "readLane", "laneId": lane_id})[1]
+        assert unchanged_lane is not None
+        self.assertEqual((unchanged_lane["status"], unchanged_lane["generation"]), ("released", generation + 1))
+        orphan_recovery = real_helper({"schemaVersion": 1, "action": "recover", "repository": repository,
+                                       "workspace": workspace_text, "supervisorId": prior_supervisor,
+                                       "expectedGeneration": None})[1]
+        assert orphan_recovery is not None
+        self.assertEqual(orphan_recovery["outcome"], "uncommitted_receipt")
+        marker_result = real_helper({"schemaVersion": 1, "action": "discard_uncommitted", "repository": repository,
+                                     "workspace": workspace_text, "supervisorId": prior_supervisor,
+                                     "expectedGeneration": orphan_recovery["generation"],
+                                     "receiptId": orphan_recovery["receiptId"]})[1]
+        assert marker_result is not None
+        self.assertEqual(marker_result["outcome"], "discarded_uncommitted")
+        marker = json.loads(helper_receipt.read_text(encoding="utf-8"))
+        self.assertEqual(marker["kind"], "discarded_uncommitted")
+        self.assertEqual(marker["receiptId"], legacy_receipt_id, "marker retains exact accepted legacy identity")
+        self.assertNotIn("token", marker)
+
+        state = self.state()
+        state["pending_admission"] = {
+            "supervisor_id": "marker-reader", "host_id": "test-host", "boot_id": "test-boot",
+            "pid": 999999, "process_identity": "dead-owner-identity", "phase": "reserved_pre_execution",
+            "generation": None, "receipt_id": None, "started_at": 1000,
+        }
+        module.STATE.write_text(json.dumps(state), encoding="utf-8")
+        with self.assertRaisesRegex(OSError, "simulated pending save failure"):
+            reconcile_state(state, fail_save=True)
+        self.assertIsNone(state["pending_admission"], "the failed save occurs after marker recovery, in memory only")
+        self.assertIsNotNone(self.state()["pending_admission"], "disk still retains the pending intent across simulated crash")
+
+        restarted_state = self.state()
+        self.assertTrue(reconcile_state(restarted_state))
+        self.assertIsNone(restarted_state["pending_admission"])
+        self.assertIsNone(self.state()["pending_admission"], "Python restart persists marker-backed pending clear")
+
+        # A later supervisor may recover the marker before reserve, then a
+        # subsequent crash may leave the same null-generation intent after
+        # capacity has parked generation G+2.
+        holder = real_helper({"bridgeAction": "occupy"})[1]
+        assert holder is not None
+        self.assertEqual(holder["outcome"], "admitted")
+        later_state = self.state()
+        later_state["pending_admission"] = {
+            "supervisor_id": "later-supervisor", "host_id": "test-host", "boot_id": "test-boot",
+            "pid": 999999, "process_identity": "dead-owner-identity", "phase": "reserved_pre_execution",
+            "generation": None, "receipt_id": None, "started_at": 1001,
+        }
+        module.STATE.write_text(json.dumps(later_state), encoding="utf-8")
+        self.assertTrue(reconcile_state(later_state))
+        self.assertIsNone(later_state["pending_admission"])
+        capacity_wait = real_helper({"schemaVersion": 1, "action": "reserve", "repository": repository,
+                                     "workspace": workspace_text, "supervisorId": "later-supervisor"})[1]
+        assert capacity_wait is not None
+        self.assertEqual(capacity_wait["outcome"], "waiting")
+        parked_lane = real_helper({"bridgeAction": "readLane", "laneId": lane_id})[1]
+        assert parked_lane is not None
+        self.assertEqual((parked_lane["status"], parked_lane["generation"]), ("parked", generation + 2))
+        after_capacity = self.state()
+        after_capacity["pending_admission"] = {
+            "supervisor_id": "another-later-supervisor", "host_id": "test-host", "boot_id": "test-boot",
+            "pid": 999999, "process_identity": "dead-owner-identity", "phase": "reserved_pre_execution",
+            "generation": None, "receipt_id": None, "started_at": 1002,
+        }
+        module.STATE.write_text(json.dumps(after_capacity), encoding="utf-8")
+        self.assertTrue(reconcile_state(after_capacity))
+        self.assertIsNone(after_capacity["pending_admission"])
+        self.assertIsNone(self.state()["pending_admission"], "later capacity marker recovery also persists its clear")
+        self.assertEqual(self.records(), [], "real helper marker recovery and capacity denial never spawn")
+
+    def test_real_helper_recovery_binds_null_pending_before_settlement_and_retries_both_crashes(self) -> None:
+        saved_testing = os.environ.get("SCD_HEARTBEAT_TESTING")
+        saved_root = os.environ.get("SCD_HEARTBEAT_TEST_ROOT")
+        os.environ["SCD_HEARTBEAT_TESTING"] = "1"
+        os.environ["SCD_HEARTBEAT_TEST_ROOT"] = str(self.state_root)
+        try:
+            spec = importlib.util.spec_from_file_location("heartbeat_recoverable_runner_under_test", RUNNER)
+            assert spec and spec.loader
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+        finally:
+            if saved_testing is None:
+                os.environ.pop("SCD_HEARTBEAT_TESTING", None)
+            else:
+                os.environ["SCD_HEARTBEAT_TESTING"] = saved_testing
+            if saved_root is None:
+                os.environ.pop("SCD_HEARTBEAT_TEST_ROOT", None)
+            else:
+                os.environ["SCD_HEARTBEAT_TEST_ROOT"] = saved_root
+
+        workspace = self.root / "real-recovery-workspace"
+        workspace.mkdir()
+        helper_registry = self.root / "real-recovery-host" / "registry.json"
+        helper_receipt = self.root / "real-recovery-receipts" / "heartbeat.json"
+        admission_config = {
+            "schemaVersion": 1, "revision": "recoverable-restart-v1",
+            "limits": {"maxCaptains": 1, "maxWriters": 1, "maxHighAutonomy": 1},
+        }
+        registry_module = (Path.cwd() / "src/mission-admission/registry.ts").resolve().as_uri()
+        admission_module = (Path.cwd() / "src/mission-admission/heartbeat-admission.ts").resolve().as_uri()
+        bridge = self.state_root / "real-recoverable-admission-bridge.mjs"
+        bridge.write_text(
+            "import fs from 'node:fs';\n"
+            "import { MissionAdmissionRegistry } from " + json.dumps(registry_module) + ";\n"
+            "import { handleHeartbeatAdmission } from " + json.dumps(admission_module) + ";\n"
+            "const q=JSON.parse(fs.readFileSync(0,'utf8'));\n"
+            "const config=JSON.parse(process.env.TEST_ADMISSION_CONFIG);\n"
+            "const options={filePath:process.env.TEST_ADMISSION_REGISTRY,config,"
+            "...(q.injectPublicationFailure?{beforePublish:()=>{throw new Error('injected registry publication failure')}}:{})};\n"
+            "const registry=new MissionAdmissionRegistry(options);\n"
+            "if(q.bridgeAction==='readLane') console.log(JSON.stringify(registry.readLane(q.laneId)));\n"
+            "else {delete q.injectPublicationFailure;delete q.bridgeAction;delete q.laneId;"
+            "console.log(JSON.stringify(handleHeartbeatAdmission(q,{registry,receiptPath:()=>process.env.TEST_ADMISSION_RECEIPT})));}\n",
+            encoding="utf-8",
+        )
+        node = shutil.which("node")
+        self.assertIsNotNone(node)
+        node_env = dict(os.environ, TEST_ADMISSION_REGISTRY=str(helper_registry),
+                        TEST_ADMISSION_RECEIPT=str(helper_receipt),
+                        TEST_ADMISSION_CONFIG=json.dumps(admission_config))
+
+        def real_helper(request: dict[str, object]) -> dict[str, object]:
+            result = subprocess.run([str(node), "--import", "tsx", str(bridge)], cwd=Path.cwd(), env=node_env,
+                                    input=json.dumps(request), text=True, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, check=False)
+            if result.returncode != 0:
+                raise RuntimeError("pinned admission helper rejected the ownership transaction")
+            return json.loads(result.stdout)
+
+        repository = "nurockplayer/tachiko-conductor"
+        workspace_text = str(workspace.resolve())
+        reserved = real_helper({"schemaVersion": 1, "action": "reserve", "repository": repository,
+                                "workspace": workspace_text, "supervisorId": "restarting-supervisor"})
+        self.assertEqual(reserved["outcome"], "reserved")
+        generation = reserved["generation"]
+        receipt_id = reserved["receiptId"]
+        lane_id = reserved["laneId"]
+        runtime_config = {"admission": {"repository": repository, "workspace": workspace_text}}
+
+        self.invoke("run", "--prime")
+        state = self.state()
+        state["pending_admission"] = {
+            "supervisor_id": "restarting-supervisor", "host_id": "test-host", "boot_id": "test-boot",
+            "pid": 999999, "process_identity": "dead-owner-identity", "phase": "reserved_pre_execution",
+            "generation": None, "receipt_id": None, "started_at": 1000,
+        }
+        module.STATE.write_text(json.dumps(state), encoding="utf-8")
+        calls: list[str] = []
+        inject_settle_failure = False
+
+        def python_admission_call(_config: dict[str, object], request: dict[str, object]) -> dict[str, object]:
+            nonlocal inject_settle_failure
+            action = str(request["action"])
+            calls.append(action)
+            call = dict(request)
+            if action == "settle" and inject_settle_failure:
+                call["injectPublicationFailure"] = True
+                inject_settle_failure = False
+            return real_helper(call)
+
+        def patch_reconcile():
+            return (
+                mock.patch.object(module, "admission_call", side_effect=python_admission_call),
+                mock.patch.object(module, "durable_host_boot_identity", return_value=("test-host", "test-boot")),
+                mock.patch.object(module, "process_identity", return_value=None),
+            )
+
+        patches = patch_reconcile()
+        with patches[0], patches[1], patches[2], \
+                mock.patch.object(module, "save_state", side_effect=OSError("simulated pre-bind save failure")):
+            with self.assertRaisesRegex(OSError, "simulated pre-bind save failure"):
+                module.reconcile_pending_admission(runtime_config, state)
+        self.assertEqual(calls, ["recover"], "failed exact-generation binding must not issue settle")
+        self.assertEqual((state["pending_admission"]["generation"], state["pending_admission"]["receipt_id"]), (None, None))
+        durable = self.state()["pending_admission"]
+        self.assertEqual((durable["generation"], durable["receipt_id"]), (None, None))
+        active_receipt = json.loads(helper_receipt.read_text(encoding="utf-8"))
+        self.assertEqual((active_receipt["status"], active_receipt["token"]["generation"]), ("active", generation))
+        active_lane = real_helper({"bridgeAction": "readLane", "laneId": lane_id})
+        self.assertEqual((active_lane["status"], active_lane["generation"]), ("active", generation))
+
+        inject_settle_failure = True
+        patches = patch_reconcile()
+        with patches[0], patches[1], patches[2]:
+            with self.assertRaisesRegex(RuntimeError, "pinned admission helper rejected"):
+                module.reconcile_pending_admission(runtime_config, state)
+        durable = self.state()["pending_admission"]
+        self.assertEqual((durable["generation"], durable["receipt_id"]), (generation, receipt_id),
+                         "exact registry identity is durably bound before the settlement request")
+        self.assertEqual((state["pending_admission"]["generation"], state["pending_admission"]["receipt_id"]),
+                         (generation, receipt_id))
+        settled_receipt = json.loads(helper_receipt.read_text(encoding="utf-8"))
+        self.assertEqual((settled_receipt["status"], settled_receipt["token"]["generation"]), ("settled", generation))
+        active_lane = real_helper({"bridgeAction": "readLane", "laneId": lane_id})
+        self.assertEqual((active_lane["status"], active_lane["generation"]), ("active", generation),
+                         "second interruption is after settled receipt publication but before registry release")
+
+        restarted = self.state()
+        patches = patch_reconcile()
+        with patches[0], patches[1], patches[2]:
+            self.assertTrue(module.reconcile_pending_admission(runtime_config, restarted))
+        self.assertIsNone(restarted["pending_admission"])
+        self.assertIsNone(self.state()["pending_admission"])
+        released_lane = real_helper({"bridgeAction": "readLane", "laneId": lane_id})
+        self.assertEqual((released_lane["status"], released_lane["generation"]), ("released", generation + 1))
+        self.assertEqual(self.records(), [], "both restart recoveries settle exact ownership without spawning")
+
+    def test_uncommitted_discard_retry_can_be_denied_by_capacity_again(self) -> None:
+        self.invoke("run", "--prime")
+        self.write_payload("B")
+        self._set_uncommitted_receipt_pending()
+        admission = json.loads(self.admission_state.read_text(encoding="utf-8"))
+        admission["mode"] = "waiting"
+        self.admission_state.write_text(json.dumps(admission), encoding="utf-8")
+
+        first = self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1001"))
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertIsNone(self.state()["pending_admission"])
+        self.assertEqual(self.state()["last_attempt_reason"], "normalized GitHub state changed")
+        self.assertEqual(self.records(), [])
+
+        self.write_payload("C")
+        restarted = self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1002"))
+        self.assertEqual(restarted.returncode, 0, restarted.stderr)
+        self.assertIsNone(self.state()["pending_admission"])
+        self.assertEqual(self.records(), [], "a second capacity denial across restart remains no-spawn")
+
+    def test_released_predecessor_clears_crashed_owned_elsewhere_intent_then_retries_without_spawn(self) -> None:
+        self.invoke("run", "--prime")
+        self.write_payload("B")
+        self.admission_state.write_text(json.dumps({"mode": "owned_elsewhere"}), encoding="utf-8")
+        failed_clear = self.invoke("run", env=dict(
+            self.env, SCD_HEARTBEAT_TEST_NOW="1001", SCD_HEARTBEAT_TEST_FAIL_CLEAR_PENDING="1",
+        ), check=False)
+        self.assertEqual(failed_clear.returncode, 1)
+        pending = self.state()["pending_admission"]
+        self.assertIsNotNone(pending, "crash/failure after owned_elsewhere must preserve the null-generation intent")
+        self.assertEqual(pending["phase"], "reserved_pre_execution")
+        self.assertIsNone(pending["generation"])
+        self.assertIsNone(pending["receipt_id"])
+
+        predecessor = {
+            "mode": "waiting", "releasedPredecessor": True, "active": False,
+            "generation": 6, "releasedGeneration": 7,
+            "receiptId": "00000000-0000-4000-8000-000000000006", "supervisorId": "previous-supervisor",
+            "status": "settled", "laneId": "heartbeat:" + hashlib.sha256(("nurockplayer/tachiko-conductor\0" + str(Path.cwd().resolve())).encode()).hexdigest()[:32],
+        }
+        self.admission_state.write_text(json.dumps(predecessor), encoding="utf-8")
+        retried = self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1002"))
+        self.assertEqual(retried.returncode, 0, retried.stderr)
+        self.assertIsNone(self.state()["pending_admission"])
+        after = json.loads(self.admission_state.read_text(encoding="utf-8"))
+        self.assertEqual(after, predecessor, "read-only classification and repeated capacity denial preserve the tombstone/lane")
+        self.assertEqual(self.records(), [], "only a fresh reserved result may spawn")
+
+    def test_released_predecessor_accepts_legacy_receipt_id_grammar(self) -> None:
+        self.invoke("run", "--prime")
+        legacy_receipt_id = "-" * 36
+        self._set_released_predecessor_pending(receipt_id=legacy_receipt_id)
+        result = self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1001"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIsNone(self.state()["pending_admission"])
+        self.assertEqual(self.records(), [], "legacy released predecessor recovery cannot spawn")
+
+    def test_released_predecessor_refuses_wrong_phase_or_host_after_reboot(self) -> None:
+        for phase, host_id, boot_id, bad_tombstone in (
+            ("spawn_uncertain", "test-host", "prior-boot", None),
+            ("reserved_pre_execution", "other-host", "prior-boot", None),
+            ("reserved_pre_execution", "test-host", "test-boot", {"releasedGeneration": 8}),
+            ("reserved_pre_execution", "test-host", "test-boot", {"laneId": "heartbeat:foreign"}),
+            ("reserved_pre_execution", "test-host", "test-boot", {"receiptId": "not-a-uuid"}),
+            ("reserved_pre_execution", "test-host", "test-boot", {"receiptId": "x" * 36}),
+        ):
+            with self.subTest(phase=phase, host_id=host_id, bad_tombstone=bad_tombstone):
+                self.invoke("run", "--prime")
+                self._set_released_predecessor_pending(phase=phase, host_id=host_id, boot_id=boot_id)
+                before = json.loads(self.admission_state.read_text(encoding="utf-8"))
+                if bad_tombstone is not None:
+                    before.update(bad_tombstone)
+                    self.admission_state.write_text(json.dumps(before), encoding="utf-8")
+                result = self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1001"), check=False)
+                self.assertEqual(result.returncode, 1)
+                self.assertIsNotNone(self.state()["pending_admission"])
+                self.assertEqual(json.loads(self.admission_state.read_text(encoding="utf-8")), before)
+                self.assertEqual(self.records(), [])
+
+    def test_same_boot_uncertain_intent_clears_only_after_registry_proves_exact_release(self) -> None:
+        self.invoke("run", "--prime")
+        self._set_pending_admission("spawn_uncertain")
+        receipt = json.loads(self.admission_state.read_text(encoding="utf-8"))
+        receipt.update(active=False, releasedGeneration=2)
+        self.admission_state.write_text(json.dumps(receipt), encoding="utf-8")
+        result = self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1001"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIsNone(self.state()["pending_admission"])
+        final_admission = json.loads(self.admission_state.read_text(encoding="utf-8"))
+        self.assertEqual(final_admission["generation"], 1, "orphan reconciliation never reserves a successor generation")
+        self.assertEqual(self.records(), [])
+
+    def test_caught_spawn_uncertain_state_write_failure_settles_before_any_child(self) -> None:
+        self.invoke("run", "--prime")
+        self.write_payload("B")
+        result = self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1001",
+                                                SCD_HEARTBEAT_TEST_FAIL_PHASE_SAVE="spawn_uncertain"), check=False)
+        self.assertEqual(result.returncode, 1)
+        self.assertFalse(json.loads(self.admission_state.read_text(encoding="utf-8"))["active"])
+        self.assertEqual(self.records(), [], "known pre-spawn failure settles the exact generation")
+
+    def test_initial_generation_binding_save_failure_keeps_active_reservation_for_restart_recovery(self) -> None:
+        self.invoke("run", "--prime")
+        self.write_payload("B")
+        failed = self.invoke("run", env=dict(
+            self.env, SCD_HEARTBEAT_TEST_NOW="1001", SCD_HEARTBEAT_TEST_FAIL_BOUND_ADMISSION_SAVE="1",
+        ), check=False)
+        self.assertEqual(failed.returncode, 1)
+        pending = self.state()["pending_admission"]
+        self.assertEqual(pending["phase"], "reserved_pre_execution")
+        self.assertIsNone(pending["generation"], "failed write-ahead binding preserves the durable null generation")
+        self.assertIsNone(pending["receipt_id"])
+        admission = json.loads(self.admission_state.read_text(encoding="utf-8"))
+        self.assertTrue(admission["active"], "the failed write must not settle or release the active reservation")
+        self.assertEqual(admission["generation"], 1)
+        self.assertEqual(self.records(), [])
+
+        # Restore the primed input so restart reconciliation is the only
+        # admission action; otherwise the changed B payload would immediately
+        # authorize a second generation after the exact orphan is settled.
+        self.write_payload("A")
+        restarted = self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1002"))
+        self.assertEqual(restarted.returncode, 0, restarted.stderr)
+        self.assertIsNone(self.state()["pending_admission"])
+        settled = json.loads(self.admission_state.read_text(encoding="utf-8"))
+        self.assertFalse(settled["active"])
+        self.assertEqual(settled["releasedGeneration"], 2)
+        self.assertEqual(self.records(), [], "restart binds then settles the exact prior generation without spawning")
+
+    def test_guard_setup_failure_settles_exact_generation_and_releases_runner_lock(self) -> None:
+        self.invoke("run", "--prime")
+        self.write_payload("B")
+        failed = self.invoke("run", env=dict(
+            self.env, SCD_HEARTBEAT_TEST_NOW="1001", SCD_HEARTBEAT_TEST_FAIL_GUARD_SETUP="1",
+        ), check=False)
+        self.assertEqual(failed.returncode, 1)
+        failed_admission = json.loads(self.admission_state.read_text(encoding="utf-8"))
+        self.assertFalse(failed_admission["active"])
+        self.assertEqual(failed_admission["releasedGeneration"], failed_admission["generation"] + 1)
+        self.assertEqual(self.records(), [], "guard setup failure precedes Popen")
+
+        retry = self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1002"))
+        self.assertEqual(retry.returncode, 0, retry.stderr)
+        self.assertEqual(len(self.records()), 1, "the runner lock and exact admission were released for retry")
+
+    def test_corrupt_or_tampered_admission_helper_fails_closed(self) -> None:
+        self.invoke("run", "--prime")
+        self.write_payload("B")
+        self.admission_state.write_text(json.dumps({"mode": "corrupt"}), encoding="utf-8")
+        result = self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1001"), check=False)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(self.records(), [])
+        self.admission_state.write_text("{}", encoding="utf-8")
+        config = json.loads((self.state_root / "config.json").read_text(encoding="utf-8"))
+        Path(config["admission_helper"]).write_text("// replaced\n", encoding="utf-8")
+        result = self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1002"), check=False)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(self.records(), [], "helper byte tampering must deny ownership and model launch")
+
+    def test_config_rejects_noncanonical_helper_root_and_duplicate_paths(self) -> None:
+        self.invoke("run", "--prime")
+        config_path = self.state_root / "config.json"
+        pristine = json.loads(config_path.read_text(encoding="utf-8"))
+
+        wrong_root = json.loads(json.dumps(pristine))
+        wrong_root["admission_helper"] = str(self.root / "other-bundle" / "mission-admission" / "heartbeat-admission-cli.js")
+        config_path.write_text(json.dumps(wrong_root), encoding="utf-8")
+        self.assertEqual(self.invoke("run", check=False).returncode, 1)
+
+        duplicate = json.loads(json.dumps(pristine))
+        duplicate["admission_helper_files"].append(dict(duplicate["admission_helper_files"][0]))
+        config_path.write_text(json.dumps(duplicate), encoding="utf-8")
+        self.assertEqual(self.invoke("run", check=False).returncode, 1)
+        self.assertEqual(self.records(), [], "malformed closure identities fail before any model-capable wake")
+
+    def test_wake_environment_cannot_override_admission_domain(self) -> None:
+        config_path = self.state_root / "config.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["wake_env"] = {"TACHIKO_MISSION_ADMISSION_PATH": str(self.root / "attacker-registry.json")}
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+        self.assertEqual(self.invoke("run", "--prime", check=False).returncode, 1)
+        self.assertFalse((self.root / "attacker-registry.json").exists())
+        self.assertEqual(self.records(), [])
+
+    def test_wake_child_uses_pinned_admission_domain_over_conflicting_ambient_environment(self) -> None:
+        self.invoke("run", "--prime")
+        config = json.loads((self.state_root / "config.json").read_text(encoding="utf-8"))
+        self.write_payload("ambient-domain")
+        alternate = self.root / "ambient-registry.json"
+        result = self.invoke(
+            "run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1179",
+                            TACHIKO_MISSION_ADMISSION_PATH=str(alternate),
+                            TACHIKO_MISSION_ADMISSION_CONFIG="{}",
+                            TACHIKO_DATA_DIR=str(self.root / "wrong-runs")),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(self.records()), 1)
+        self.assertEqual(self.records()[0]["admission_path"], config["admission"]["registry"])
+        self.assertNotEqual(self.records()[0]["admission_path"], str(alternate))
+        self.assertFalse(alternate.exists())
+
+    def test_guard_settlement_failure_times_out_without_consuming_or_unlocking(self) -> None:
+        self.invoke("run", "--prime")
+        self.write_payload("B")
+        config_path = self.state_root / "config.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["wake_timeout_seconds"] = 1
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+        self.admission_state.write_text(json.dumps({"mode": "stale"}), encoding="utf-8")
+        result = self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1001"), check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(self.records()), 1)
+        self.assertNotEqual(self.state()["successful_fingerprint"], self.state()["last_attempt_fingerprint"])
+        receipt = json.loads(self.admission_state.read_text(encoding="utf-8"))
+        self.assertTrue(receipt["active"], "ambiguous settlement must retain the registry generation")
+        self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1002"))
+        self.assertEqual(len(self.records()), 1, "ambiguous guard settlement must not permit overlap")
+        receipt.pop("mode", None)
+        self.admission_state.write_text(json.dumps(receipt), encoding="utf-8")
+        deadline = time.time() + 7
+        while (self.state_root / "runner.lock").read_bytes() and time.time() < deadline:
+            time.sleep(0.1)
+        self.assertEqual((self.state_root / "runner.lock").read_bytes(), b"", "guard may settle after state repair")
+
+    def test_real_pinned_helper_competes_with_native_lane_then_guard_settles(self) -> None:
+        selected_repo, selected_runner = self.selected_source_fixture()
+        saved_testing = os.environ.get("SCD_HEARTBEAT_TESTING")
+        saved_root = os.environ.get("SCD_HEARTBEAT_TEST_ROOT")
+        os.environ["SCD_HEARTBEAT_TESTING"] = "1"
+        os.environ["SCD_HEARTBEAT_TEST_ROOT"] = str(self.state_root)
+        try:
+            spec = importlib.util.spec_from_file_location("heartbeat_runner_under_test", selected_runner)
+            self.assertIsNotNone(spec and spec.loader)
+            module = importlib.util.module_from_spec(spec)
+            assert spec and spec.loader
+            spec.loader.exec_module(module)
+        finally:
+            if saved_testing is None: os.environ.pop("SCD_HEARTBEAT_TESTING", None)
+            else: os.environ["SCD_HEARTBEAT_TESTING"] = saved_testing
+            if saved_root is None: os.environ.pop("SCD_HEARTBEAT_TEST_ROOT", None)
+            else: os.environ["SCD_HEARTBEAT_TEST_ROOT"] = saved_root
+
+        node_source = Path(shutil.which("node") or "")
+        node, node_digest, _ = module.pin_admission_node(node_source)
+        ambient_entry = Path.cwd() / "dist/mission-admission/heartbeat-admission-cli.js"
+        ambient_entry.parent.mkdir(parents=True, exist_ok=True)
+        had_ambient = ambient_entry.exists()
+        ambient_bytes = ambient_entry.read_bytes() if had_ambient else None
+        poison = b"// stale untracked dist must never be pinned\n"
+        ambient_entry.write_bytes(poison)
+        saved_testing = os.environ.get("SCD_HEARTBEAT_TESTING")
+        saved_root = os.environ.get("SCD_HEARTBEAT_TEST_ROOT")
+        os.environ["SCD_HEARTBEAT_TESTING"] = "1"
+        os.environ["SCD_HEARTBEAT_TEST_ROOT"] = str(self.state_root)
+        try:
+            selected_git, _selected_openssl = module.qualified_system_providers()
+            selected_source = module.capture_committed_build_source(selected_repo, selected_git)
+            module.verify_executing_runner(selected_repo, selected_source)
+            runner_snapshot, runner_digest, _runner_created = module.pin_runner_source(selected_source)
+            helper, helper_digest, helper_files, helper_build, _ = module.pin_admission_helper(
+                selected_repo, node, selected_source)
+        finally:
+            if saved_testing is None: os.environ.pop("SCD_HEARTBEAT_TESTING", None)
+            else: os.environ["SCD_HEARTBEAT_TESTING"] = saved_testing
+            if saved_root is None: os.environ.pop("SCD_HEARTBEAT_TEST_ROOT", None)
+            else: os.environ["SCD_HEARTBEAT_TEST_ROOT"] = saved_root
+            if had_ambient:
+                assert ambient_bytes is not None
+                ambient_entry.write_bytes(ambient_bytes)
+            else:
+                ambient_entry.unlink(missing_ok=True)
+        self.assertNotEqual(Path(helper).read_bytes(), poison)
+        expected_head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=selected_repo, check=True,
+                                       text=True, stdout=subprocess.PIPE).stdout.strip()
+        self.assertEqual(helper_build["source_commit"], expected_head)
+        self.assertEqual(helper_build["source_runner"], module.source_runner_record(selected_source))
+        self.assertEqual(helper_build["pnpm_version"], "10.34.5")
+        self.assertEqual(helper_build["typescript_version"], "5.9.3")
+        admission = {
+            "repository": "nurockplayer/tachiko-conductor", "workspace": str((self.root / "workspace").resolve()),
+            "home": str(self.account_home.resolve()),
+            "registry": str((self.account_home / ".tachiko-conductor" / "mission-admission" / "registry.json").resolve()),
+            "runs": str(self.account_home / ".tachiko-conductor" / "runs"),
+            "receipts": str(self.account_home / ".tachiko-conductor" / "mission-admission" / "heartbeat-receipts"),
+            "config": {"schemaVersion": 1, "revision": "cross-language-smoke-v1", "limits": {"maxCaptains": 2, "maxWriters": 2, "maxHighAutonomy": 1}},
+        }
+        Path(admission["workspace"]).mkdir()
+        config_path = self.state_root / "config.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config.update({"runner": str(runner_snapshot), "runner_sha256": runner_digest,
+                       "admission": admission, "admission_node": str(node), "admission_node_sha256": node_digest,
+                       "admission_helper": str(helper), "admission_helper_sha256": helper_digest,
+                       "admission_helper_files": helper_files, "admission_build": helper_build})
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+        runtime_config = dict(config)
+        runtime_config["wake_env"] = {}
+        module.verify_admission_helper(config)
+        helper_root = Path(helper).parents[1]
+        extra_bundle_file = helper_root / "unlisted.js"
+        extra_bundle_file.write_text("// not in manifest", encoding="utf-8")
+        try:
+            with self.assertRaisesRegex(RuntimeError, "unlisted or missing"):
+                module.verify_admission_helper(config)
+        finally:
+            extra_bundle_file.unlink()
+        symlink_bundle_file = helper_root / "symlink.js"
+        symlink_bundle_file.symlink_to(Path(helper))
+        try:
+            with self.assertRaisesRegex(RuntimeError, "symlink"):
+                module.verify_admission_helper(config)
+        finally:
+            symlink_bundle_file.unlink()
+        mismatched_source = json.loads(json.dumps(config))
+        mismatched_source["admission_build"]["source_commit"] = "0" * len(helper_build["source_commit"])
+        with self.assertRaisesRegex(RuntimeError, "closure digest or entry"):
+            module.validate_config(mismatched_source)
+        transitive = Path(helper).parents[1] / "mission-admission/registry.js"
+        transitive_bytes = transitive.read_bytes()
+        transitive.unlink()
+        try:
+            with self.assertRaisesRegex(OSError, "No such file"):
+                module.verify_admission_helper(config)
+        finally:
+            transitive.write_bytes(transitive_bytes)
+        transitive.write_bytes(transitive_bytes + b"// tampered\n")
+        try:
+            with self.assertRaisesRegex(RuntimeError, "closure failed verification"):
+                module.verify_admission_helper(config)
+        finally:
+            transitive.write_bytes(transitive_bytes)
+        helper_env = module.admission_helper_environment(runtime_config)
+        node_preload = HERE.parent.parent / "tests/fixtures/account-home-preload.mjs"
+        registry_js = Path(helper).parents[1] / "mission-admission/registry.js"
+        host_registry_js = Path(helper).parents[1] / "mission-admission/host-registry.js"
+        direct_source = (
+            "import { createHostAdmissionRegistry } from " + json.dumps(host_registry_js.as_uri()) + ";\n"
+            "const registry = createHostAdmissionRegistry();\n"
+            "const result = registry.admit({laneId:'native-direct-smoke',role:'production_captain',highAutonomy:true,evidence:{repository:'nurockplayer/tachiko-conductor',issue:117,workspace:" + json.dumps(admission["workspace"]) + "}});\n"
+            "console.log(JSON.stringify(result));\n"
+        )
+        direct = subprocess.run([str(node), "--import", str(node_preload), "--input-type=module", "-e", direct_source], env=helper_env,
+                                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+        direct_result = json.loads(direct.stdout)
+        self.assertEqual(direct_result["outcome"], "admitted")
+
+        self.invoke("run", "--prime")
+        self.write_payload("B")
+        denied = self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1001"), check=False)
+        self.assertEqual(denied.returncode, 0, denied.stderr + (self.state_root / "heartbeat.log").read_text())
+        self.assertEqual(self.records(), [], "a native/direct production lane must deny the heartbeat wake")
+
+        release_source = (
+            "import { MissionAdmissionRegistry } from " + json.dumps(registry_js.as_uri()) + ";\n"
+            "const registry = new MissionAdmissionRegistry({filePath: process.env.TACHIKO_MISSION_ADMISSION_PATH, config: JSON.parse(process.env.TACHIKO_MISSION_ADMISSION_CONFIG)});\n"
+            "const lane = registry.readLane('native-direct-smoke');\n"
+            "registry.release({laneId:lane.laneId,generation:lane.generation,token:" + json.dumps(direct_result["token"]["token"]) + "},true);\n"
+        )
+        subprocess.run([str(node), "--import", str(node_preload), "--input-type=module", "-e", release_source], env=helper_env,
+                       text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+        resumed = self.invoke("run", env=dict(
+            self.env, SCD_HEARTBEAT_TEST_NOW="1002",
+            TACHIKO_MISSION_ADMISSION_PATH=str(self.root / "attacker-registry.json"),
+        ), check=False)
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        self.assertEqual(len(self.records()), 1)
+        self.assertEqual(self.records()[0]["admission_path"], admission["registry"],
+                         "native CLI in the wake must use the helper's fixed registry domain")
+        original_helper_environment = module.admission_helper_environment
+        with mock.patch.object(
+            module, "admission_helper_environment",
+            side_effect=lambda selected: {**original_helper_environment(selected), "NODE_OPTIONS": "--import " + str(node_preload)},
+        ):
+            inspect = module.admission_call(runtime_config, {
+                "schemaVersion": 1, "action": "inspect", "repository": admission["repository"],
+                "workspace": admission["workspace"],
+            })
+        self.assertEqual(inspect["outcome"], "inspected")
+        heartbeat_lane = inspect["lane"]
+        self.assertIsNotNone(heartbeat_lane)
+        self.assertEqual(heartbeat_lane["status"], "released", "guard must settle the exact registry generation")
+
+    def test_empty_process_snapshot_requires_kernel_group_absence(self) -> None:
+        saved_testing = os.environ.get("SCD_HEARTBEAT_TESTING")
+        saved_root = os.environ.get("SCD_HEARTBEAT_TEST_ROOT")
+        os.environ["SCD_HEARTBEAT_TESTING"] = "1"
+        os.environ["SCD_HEARTBEAT_TEST_ROOT"] = str(self.state_root)
+        try:
+            spec = importlib.util.spec_from_file_location("heartbeat_group_scan_under_test", RUNNER)
+            assert spec and spec.loader
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+        finally:
+            if saved_testing is None: os.environ.pop("SCD_HEARTBEAT_TESTING", None)
+            else: os.environ["SCD_HEARTBEAT_TESTING"] = saved_testing
+            if saved_root is None: os.environ.pop("SCD_HEARTBEAT_TEST_ROOT", None)
+            else: os.environ["SCD_HEARTBEAT_TEST_ROOT"] = saved_root
+        empty_ps = subprocess.CompletedProcess(["ps"], 0, stdout="", stderr="")
+        with mock.patch.object(module.Path, "is_dir", return_value=False), \
+             mock.patch.object(module.subprocess, "run", return_value=empty_ps), \
+             mock.patch.object(module.os, "killpg", return_value=None):
+            self.assertIsNone(module.process_group_has_live_members(12345),
+                              "a fork after the process snapshot must not be mistaken for an empty group")
+        with mock.patch.object(module.Path, "is_dir", return_value=False), \
+             mock.patch.object(module.subprocess, "run", return_value=empty_ps), \
+             mock.patch.object(module.os, "killpg", side_effect=ProcessLookupError()):
+            self.assertFalse(module.process_group_has_live_members(12345),
+                             "only kernel-confirmed process-group absence proves stop")
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "the synchronized /proc race regression requires Linux")
+    def test_process_group_scan_miss_after_fork_remains_unknown(self) -> None:
+        saved_testing = os.environ.get("SCD_HEARTBEAT_TESTING")
+        saved_root = os.environ.get("SCD_HEARTBEAT_TEST_ROOT")
+        os.environ["SCD_HEARTBEAT_TESTING"] = "1"
+        os.environ["SCD_HEARTBEAT_TEST_ROOT"] = str(self.state_root)
+        try:
+            spec = importlib.util.spec_from_file_location("heartbeat_fork_scan_under_test", RUNNER)
+            assert spec and spec.loader
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+        finally:
+            if saved_testing is None: os.environ.pop("SCD_HEARTBEAT_TESTING", None)
+            else: os.environ["SCD_HEARTBEAT_TESTING"] = saved_testing
+            if saved_root is None: os.environ.pop("SCD_HEARTBEAT_TEST_ROOT", None)
+            else: os.environ["SCD_HEARTBEAT_TEST_ROOT"] = saved_root
+
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(5)"], start_new_session=True)
+        original_iterdir = module.Path.iterdir
+        try:
+            def snapshot_without_target(directory: Path):
+                entries = list(original_iterdir(directory))
+                if str(directory) == "/proc":
+                    # Model a process forked into the guarded PGID just after
+                    # the directory snapshot was taken.
+                    entries = [entry for entry in entries if entry.name != str(child.pid)]
+                return iter(entries)
+
+            with mock.patch.object(module.Path, "iterdir", snapshot_without_target):
+                self.assertIsNone(module.process_group_has_live_members(child.pid),
+                                  "a child omitted from the process snapshot must remain guarded by kernel PGID evidence")
+        finally:
+            child.terminate()
+            child.wait(timeout=5)
 
     def test_canonicalization_ignores_connection_order(self) -> None:
         self.invoke("run", "--prime")
@@ -488,7 +3147,9 @@ class HeartbeatTest(unittest.TestCase):
             time.sleep(0.1)
         self.assertEqual(
             len(self.records()), 2,
-            "guard must terminate the timed-out direct target before releasing the lock",
+            "guard must terminate the timed-out direct target before releasing the lock; log=" +
+            (self.state_root / "heartbeat.log").read_text() + " registry=" +
+            self.admission_state.read_text() + " lock=" + (self.state_root / "runner.lock").read_text(),
         )
 
     def test_orphan_timeout_kills_term_resistant_process_group_before_unlock(self) -> None:
@@ -524,33 +3185,55 @@ class HeartbeatTest(unittest.TestCase):
             time.sleep(0.1)
         self.assertEqual(len(self.records()), 2, "guard must unlock only after process-group cleanup")
 
-    def test_wake_descendant_cannot_retain_lock_after_direct_child_exits(self) -> None:
+    def test_wake_descendant_retains_lock_until_process_group_is_empty(self) -> None:
         self.invoke("run", "--prime")
         self.write_payload("B")
         background_pid_path = self.root / "background.pid"
         background = dict(self.env, SCD_HEARTBEAT_TEST_NOW="1001", MOCK_WAKE_BACKGROUND_SLEEP="5")
-        self.invoke("run", env=background)
+        first = subprocess.Popen([sys.executable, str(RUNNER), "run"], env=background)
+        deadline = time.time() + 5
+        while not background_pid_path.exists() and time.time() < deadline:
+            time.sleep(0.02)
+        self.assertTrue(background_pid_path.exists(), "wake target must create the test descendant")
         background_pid = int(background_pid_path.read_text(encoding="utf-8"))
         try:
             os.kill(background_pid, 0)
             self.write_payload("C")
             self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1002"))
             self.assertEqual(
-                len(self.records()), 2,
-                "a background descendant must not retain the single-writer lock",
+                len(self.records()), 1,
+                "a live descendant must retain the single-writer admission and lock",
             )
+            first.wait(timeout=10)
+            self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1003"))
+            self.assertEqual(len(self.records()), 2, "fresh admission may resume after guard settles the prior generation")
         finally:
+            if first.poll() is None:
+                first.kill()
+                first.wait(timeout=5)
             try:
                 os.kill(background_pid, 9)
             except ProcessLookupError:
                 pass
+
+    def test_long_guard_handoff_frame_is_delivered_completely(self) -> None:
+        self.invoke("run", "--prime")
+        self.write_payload("B")
+        config_path = self.state_root / "config.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["wake_env"] = {"MOCK_LONG_HANDOFF": "x" * 20_000}
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+        result = self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1001"), check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(self.admission_state.exists())
+        self.assertFalse(json.loads(self.admission_state.read_text()) ["active"])
 
     def test_direct_exit_does_not_wait_for_descendant_output_eof(self) -> None:
         self.invoke("run", "--prime")
         self.write_payload("B")
         config_path = self.state_root / "config.json"
         config = json.loads(config_path.read_text(encoding="utf-8"))
-        config["wake_timeout_seconds"] = 2
+        config["wake_timeout_seconds"] = 10
         config_path.write_text(json.dumps(config), encoding="utf-8")
         background_pid_path = self.root / "background.pid"
         environment = dict(
@@ -564,8 +3247,10 @@ class HeartbeatTest(unittest.TestCase):
         background_pid = int(background_pid_path.read_text(encoding="utf-8"))
         try:
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertLess(time.monotonic() - started, 1.5)
+            self.assertGreaterEqual(time.monotonic() - started, 4.0, "successful state waits for the descendant group to stop")
+            self.assertLess(time.monotonic() - started, 8.0)
             self.assertEqual(self.state()["last_attempt_exit"], 0)
+            self.assertEqual(self.state()["successful_fingerprint"], self.state()["last_attempt_fingerprint"])
         finally:
             try:
                 os.kill(background_pid, 9)
@@ -584,7 +3269,7 @@ class HeartbeatTest(unittest.TestCase):
         result = self.invoke("run", env=stalled, check=False)
         heartbeat_log = (self.state_root / "heartbeat.log").read_text(encoding="utf-8")
         self.assertEqual(result.returncode, 124, result.stderr + heartbeat_log)
-        self.assertLess(time.monotonic() - started, 1.8)
+        self.assertLess(time.monotonic() - started, 3.0)
         self.assertEqual(self.state()["last_attempt_exit"], 124)
         self.assertNotEqual(self.state()["successful_fingerprint"], self.state()["last_attempt_fingerprint"])
         self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1002"))
@@ -667,19 +3352,30 @@ class HeartbeatTest(unittest.TestCase):
         if (self.state_root / "state.json").exists():
             (self.state_root / "state.json").unlink()
         command = json.dumps([str(self.wake), "future-dispatch-once"])
+        home = self.account_home.resolve()
+        canonical_registry = home / ".tachiko-conductor" / "mission-admission" / "registry.json"
+        canonical_registry.parent.mkdir(parents=True)
+        canonical_registry.parent.chmod(0o700)
+        canonical_registry.write_text("{}", encoding="utf-8")
+        canonical_registry.chmod(0o600)
+        registry_alias = self.root / "registry-alias.json"
+        registry_alias.symlink_to(canonical_registry)
         args = (
             "--repo", str(Path.cwd()), "--interval", "180", "--safety-interval", "1800",
             "--wake-command-json", command, "--acknowledge-relocatable-wake-target", "--no-load",
+            "--admission-registry-path", str(registry_alias),
         )
-        self.invoke("install", *args)
+        install_env = dict(self.env, HOME=str(home))
+        self.invoke("install", *args, env=install_env)
         before = (self.state_root / "state.json").read_bytes()
-        self.invoke("install", *args)
+        self.invoke("install", *args, env=install_env)
         self.assertEqual((self.state_root / "state.json").read_bytes(), before)
         with self.plist.open("rb") as stream:
             plist = plistlib.load(stream)
         config = json.loads((self.state_root / "config.json").read_text(encoding="utf-8"))
+        self.assertEqual(config["admission"]["registry"], str(canonical_registry))
         self.assertEqual(plist["StartInterval"], 180)
-        self.assertEqual(plist["WorkingDirectory"], str(Path.cwd()))
+        self.assertEqual(plist["WorkingDirectory"], str(self.selected_source_fixture()[0]))
         self.assertEqual(plist["ProgramArguments"], ["/usr/bin/python3", config["runner"], "run"])
         self.assertEqual(Path(config["runner"]).parent, self.state_root)
         self.assertEqual(Path(config["runner"]).name, "verified-runner-" + config["runner_sha256"])
@@ -687,11 +3383,225 @@ class HeartbeatTest(unittest.TestCase):
             hashlib.sha256(Path(config["runner"]).read_bytes()).hexdigest(), config["runner_sha256"]
         )
         self.assertEqual(config["wake_command"], [str(self.wake), "future-dispatch-once"])
-        self.assertEqual(self.invoke("status").returncode, 0)
+        selected_repo, selected_runner = self.selected_source_fixture()
+        selected_runner.write_bytes(selected_runner.read_bytes() + b"# checkout moved after installation\n")
+        subprocess.run(["git", "add", "scripts/bootstrap-heartbeat/runner.py"], cwd=selected_repo, check=True)
+        subprocess.run(["git", "commit", "--quiet", "-m", "move checkout after installation"], cwd=selected_repo,
+                       env=dict(os.environ, GIT_AUTHOR_NAME="Heartbeat Test", GIT_AUTHOR_EMAIL="heartbeat-test@example.invalid",
+                                GIT_COMMITTER_NAME="Heartbeat Test", GIT_COMMITTER_EMAIL="heartbeat-test@example.invalid",
+                                GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull), check=True)
+        installed_runner = Path(config["runner"])
+        self.assertEqual(self.invoke("status", runner=installed_runner).returncode, 0)
+        self.assertEqual(self.invoke("run", "--prime", runner=installed_runner).returncode, 0)
         self.invoke("uninstall", "--no-load")
         self.invoke("uninstall", "--no-load")
         self.assertFalse(self.plist.exists())
         self.assertTrue((self.state_root / "state.json").exists(), "uninstall preserves evidence/state")
+
+    def test_install_rejects_other_checkout_and_dirty_selected_runner_without_publication(self) -> None:
+        self.invoke("run", "--prime")
+        selected_repo, selected_runner = self.selected_source_fixture()
+        alternate_repo = self.root / "alternate-selected-repository"
+        shutil.copytree(selected_repo, alternate_repo, ignore=shutil.ignore_patterns(".git"))
+        subprocess.run(["git", "init", "--quiet"], cwd=alternate_repo, check=True)
+        git_env = dict(os.environ, GIT_AUTHOR_NAME="Heartbeat Test", GIT_AUTHOR_EMAIL="heartbeat-test@example.invalid",
+                       GIT_COMMITTER_NAME="Heartbeat Test", GIT_COMMITTER_EMAIL="heartbeat-test@example.invalid",
+                       GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull)
+        subprocess.run(["git", "add", "--all"], cwd=alternate_repo, env=git_env, check=True)
+        subprocess.run(["git", "commit", "--quiet", "-m", "alternate source identity"], cwd=alternate_repo,
+                       env=git_env, check=True)
+        command = json.dumps([str(self.wake), "future-dispatch-once"])
+        alternate = self.invoke(
+            "install", "--repo", str(alternate_repo), "--wake-command-json", command,
+            "--acknowledge-relocatable-wake-target", "--no-load", runner=selected_runner, check=False,
+        )
+        self.assertNotEqual(alternate.returncode, 0)
+        self.assertIn("not the selected repository source", alternate.stderr)
+
+        self.plist.parent.mkdir(parents=True, exist_ok=True)
+        self.plist.write_bytes(b"prior plist remains\n")
+        before = {
+            "config": (self.state_root / "config.json").read_bytes(),
+            "state": (self.state_root / "state.json").read_bytes(),
+            "plist": self.plist.read_bytes(),
+        }
+        original_runner = selected_runner.read_bytes()
+        selected_runner.write_bytes(original_runner + b"# dirty selected source\n")
+        dirty = self.invoke(
+            "install", "--repo", str(selected_repo), "--wake-command-json", command,
+            "--acknowledge-relocatable-wake-target", "--no-load", runner=selected_runner, check=False,
+        )
+        self.assertNotEqual(dirty.returncode, 0)
+        self.assertIn("worktree", dirty.stderr)
+        self.assertEqual((self.state_root / "config.json").read_bytes(), before["config"])
+        self.assertEqual((self.state_root / "state.json").read_bytes(), before["state"])
+        self.assertEqual(self.plist.read_bytes(), before["plist"])
+
+    def test_install_rechecks_source_before_config_plist_and_service_publication(self) -> None:
+        previous_environment = os.environ.copy()
+        def restore_environment() -> None:
+            os.environ.clear()
+            os.environ.update(previous_environment)
+        self.addCleanup(restore_environment)
+        selected_repo, selected_runner = self.selected_source_fixture()
+        old_testing = os.environ.get("SCD_HEARTBEAT_TESTING")
+        old_root = os.environ.get("SCD_HEARTBEAT_TEST_ROOT")
+        os.environ["SCD_HEARTBEAT_TESTING"] = "1"
+        os.environ["SCD_HEARTBEAT_TEST_ROOT"] = str(self.state_root)
+        try:
+            spec = importlib.util.spec_from_file_location("heartbeat_install_order_under_test", selected_runner)
+            self.assertIsNotNone(spec and spec.loader)
+            module = importlib.util.module_from_spec(spec)
+            assert spec and spec.loader
+            spec.loader.exec_module(module)
+        finally:
+            if old_testing is None: os.environ.pop("SCD_HEARTBEAT_TESTING", None)
+            else: os.environ["SCD_HEARTBEAT_TESTING"] = old_testing
+            if old_root is None: os.environ.pop("SCD_HEARTBEAT_TEST_ROOT", None)
+            else: os.environ["SCD_HEARTBEAT_TEST_ROOT"] = old_root
+
+        existing_config = (self.state_root / "config.json").read_bytes()
+        existing_state = (self.state_root / "state.json").read_bytes() if (self.state_root / "state.json").exists() else None
+        self.plist.parent.mkdir(parents=True, exist_ok=True)
+        existing_plist = b"prior plist bytes\n"
+        self.plist.write_bytes(existing_plist)
+        selected_source = module.capture_committed_build_source(selected_repo, module.qualified_system_providers()[0])
+        original_runner = selected_runner.read_bytes()
+        helper_config = json.loads(existing_config)
+        helper_source_root = Path(helper_config["admission_helper"]).parents[1]
+        helper_result_build = json.loads(json.dumps(helper_config["admission_build"]))
+        helper_result_build.update({
+            "source_commit": selected_source["head"],
+            "source_tree": selected_source["tree"],
+            "source_snapshot_sha256": selected_source["snapshot_sha256"],
+            "source_runner": module.source_runner_record(selected_source),
+        })
+        helper_manifest_bytes = (json.dumps(helper_result_build, sort_keys=True, separators=(",", ":")) + "\n").encode()
+        helper_digest = hashlib.sha256(helper_manifest_bytes).hexdigest()
+        helper_bundle = self.state_root / ("verified-admission-" + helper_digest)
+        helper_bundle.mkdir(mode=0o700)
+        helper_bundle.chmod(0o700)
+        helper_result_files: list[dict[str, str]] = []
+        for item in helper_result_build["files"]:
+            relative = Path(item["path"])
+            source_file = helper_source_root / relative
+            target_file = helper_bundle / relative
+            target_file.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            target_file.parent.chmod(0o700)
+            target_file.write_bytes(source_file.read_bytes())
+            target_file.chmod(0o600)
+            helper_result_files.append({"path": str(target_file), "sha256": item["sha256"]})
+        helper_manifest = helper_bundle / "build-manifest.json"
+        helper_manifest.write_bytes(helper_manifest_bytes)
+        helper_manifest.chmod(0o600)
+        helper_result_files.append({"path": str(helper_manifest), "sha256": helper_digest})
+        helper_entry = helper_bundle / "mission-admission/heartbeat-admission-cli.js"
+        helper_result = (helper_entry, helper_digest, helper_result_files, helper_result_build, False)
+        command = json.dumps([str(self.wake), "future-dispatch-once"])
+        os.environ.update(self.env)
+        args = module.parser().parse_args([
+            "install", "--repo", str(selected_repo), "--wake-command-json", command,
+            "--acknowledge-relocatable-wake-target",
+        ])
+
+        for boundary, mutation_call in (("config", 2), ("plist directory", 3),
+                                        ("plist", 4), ("service bootout", 5),
+                                        ("service bootstrap", 6)):
+            selected_runner.write_bytes(original_runner)
+            selected_runner.chmod(stat.S_IMODE(RUNNER.stat().st_mode))
+            subprocess.run(["git", "reset", "--quiet", "HEAD", "--", "scripts/bootstrap-heartbeat/runner.py"],
+                           cwd=selected_repo, check=True)
+            source_checks = 0
+            launchctl_calls: list[tuple[str, ...]] = []
+            real_check = module.verify_build_source_unchanged
+
+            def fake_launchctl(*call: str, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+                launchctl_calls.append(call)
+                return subprocess.CompletedProcess(call, 0, "", "")
+
+            def move_source(repo: Path, git: dict[str, str], captured: dict[str, object]) -> None:
+                nonlocal source_checks
+                source_checks += 1
+                if source_checks == mutation_call:
+                    selected_runner.write_bytes(original_runner + f"# moved at {boundary}\n".encode())
+                real_check(repo, git, captured)
+
+            previous_umask = os.umask(0o077)
+            try:
+                with mock.patch.object(module, "pin_admission_helper", return_value=helper_result), \
+                     mock.patch.object(module, "verify_build_source_unchanged", side_effect=move_source), \
+                     mock.patch.object(module, "launchctl", side_effect=fake_launchctl):
+                    with self.assertRaisesRegex(RuntimeError, "protected worktree|runner differs"):
+                        module.install(args)
+            finally:
+                os.umask(previous_umask)
+                selected_runner.write_bytes(original_runner)
+                selected_runner.chmod(stat.S_IMODE(RUNNER.stat().st_mode))
+            self.assertEqual(source_checks, mutation_call)
+            self.assertEqual((self.state_root / "config.json").read_bytes(), existing_config)
+            if existing_state is None:
+                self.assertFalse((self.state_root / "state.json").exists())
+            else:
+                self.assertEqual((self.state_root / "state.json").read_bytes(), existing_state)
+            self.assertEqual(self.plist.read_bytes(), existing_plist)
+            if boundary == "service bootstrap":
+                self.assertEqual([call[0] for call in launchctl_calls], ["bootout", "bootout", "bootstrap"])
+            else:
+                self.assertEqual(launchctl_calls, [], "source movement must refuse before service changes")
+
+        selected_runner.write_bytes(original_runner)
+        selected_runner.chmod(stat.S_IMODE(RUNNER.stat().st_mode))
+        for field in ("source_runner.blob", "source_commit", "source_tree", "source_snapshot_sha256"):
+            with self.subTest(helper_capture_field=field):
+                mismatched_build = json.loads(json.dumps(helper_result[3]))
+                if field == "source_runner.blob":
+                    original_value = mismatched_build["source_runner"]["blob"]
+                else:
+                    original_value = mismatched_build[field]
+                replacement = "1" * len(original_value) if original_value[0] == "0" else "0" * len(original_value)
+                if field == "source_runner.blob":
+                    mismatched_build["source_runner"]["blob"] = replacement
+                else:
+                    mismatched_build[field] = replacement
+                    self.assertEqual(mismatched_build["source_runner"], module.source_runner_record(selected_source))
+                mismatched_helper = (helper_result[0], helper_result[1], helper_result[2], mismatched_build, False)
+                previous_umask = os.umask(0o077)
+                launchctl_calls: list[tuple[str, ...]] = []
+                try:
+                    with mock.patch.object(module, "pin_admission_helper", return_value=mismatched_helper), \
+                         mock.patch.object(module, "launchctl", side_effect=fake_launchctl):
+                        with self.assertRaisesRegex(RuntimeError, "do not share one captured source"):
+                            module.install(args)
+                finally:
+                    os.umask(previous_umask)
+                self.assertEqual(launchctl_calls, [], "mismatched source provenance must refuse before service changes")
+                self.assertEqual((self.state_root / "config.json").read_bytes(), existing_config)
+                if existing_state is None:
+                    self.assertFalse((self.state_root / "state.json").exists())
+                else:
+                    self.assertEqual((self.state_root / "state.json").read_bytes(), existing_state)
+                self.assertEqual(self.plist.read_bytes(), existing_plist)
+
+    def test_install_rejects_noncanonical_admission_registry_paths(self) -> None:
+        command = json.dumps([str(self.wake), "future-dispatch-once"])
+        args = (
+            "install", "--repo", str(Path.cwd()), "--wake-command-json", command,
+            "--acknowledge-relocatable-wake-target", "--no-load",
+        )
+        home = self.root.resolve()
+        install_env = dict(self.env, HOME=str(home))
+        explicit = self.invoke(
+            *args, "--admission-registry-path", str(self.root / "alternate" / "registry.json"),
+            env=install_env, check=False,
+        )
+        self.assertNotEqual(explicit.returncode, 0)
+        self.assertIn("canonical per-user host path", explicit.stderr)
+        inherited = self.invoke(
+            *args, env=dict(install_env, TACHIKO_MISSION_ADMISSION_PATH=str(self.root / "alternate" / "registry.json")),
+            check=False,
+        )
+        self.assertNotEqual(inherited.returncode, 0)
+        self.assertIn("canonical per-user host path", inherited.stderr)
 
     def test_reinstall_cannot_race_an_active_wake_snapshot(self) -> None:
         self.invoke("run", "--prime")
@@ -964,7 +3874,7 @@ class HeartbeatTest(unittest.TestCase):
         self.invoke(
             "install", "--repo", str(Path.cwd()), "--wake-command-json", command,
             "--acknowledge-relocatable-wake-target", "--required-file", str(cli),
-            "--no-load",
+            "--no-load", env=dict(self.env, HOME=str(self.root.resolve())),
         )
         config = json.loads((self.state_root / "config.json").read_text(encoding="utf-8"))
         self.assertIn({

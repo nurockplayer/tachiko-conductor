@@ -1,0 +1,140 @@
+import path from 'node:path';
+import { existsSync, realpathSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+
+import { AdmissionStateError, MissionAdmissionRegistry, validateAdmissionConfig, type AdmissionConfig } from './registry.js';
+import { dispatchWakePath, signalDispatchWake } from '../dispatch/wake.js';
+import { assertSafeAccountOwnedPath, resolveAccountHomeDirectory } from '../account-home.js';
+
+export const DEFAULT_MISSION_ADMISSION_CONFIG: AdmissionConfig = {
+  schemaVersion: 1,
+  revision: 'mission-admission-v1',
+  limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 },
+};
+
+export const MISSION_ADMISSION_PATH_ENV = 'TACHIKO_MISSION_ADMISSION_PATH';
+export const MISSION_ADMISSION_CONFIG_ENV = 'TACHIKO_MISSION_ADMISSION_CONFIG';
+export const MANUAL_OWNER_RECEIPTS_DIR_ENV = 'TACHIKO_MANUAL_OWNER_RECEIPTS_DIR';
+export const HEARTBEAT_OWNER_RECEIPTS_DIR_ENV = 'TACHIKO_HEARTBEAT_ADMISSION_RECEIPTS_DIR';
+export const RUN_OWNER_RECEIPTS_DIR_ENV = 'TACHIKO_RUN_OWNER_RECEIPTS_DIR';
+
+export interface HostAdmissionResolverOptions {
+  readonly env?: NodeJS.ProcessEnv;
+  readonly homeDirectory?: string;
+}
+
+function physicalPath(candidate: string): string {
+  let cursor = path.resolve(candidate);
+  const suffix: string[] = [];
+  while (!existsSync(cursor)) {
+    const parent = path.dirname(cursor);
+    if (parent === cursor) throw new AdmissionStateError('Cannot resolve a physical host admission path.');
+    suffix.unshift(path.basename(cursor));
+    cursor = parent;
+  }
+  return path.resolve(realpathSync.native(cursor), ...suffix);
+}
+
+export function resolveHostAdmissionPath({ env = process.env, homeDirectory = resolveAccountHomeDirectory() }: HostAdmissionResolverOptions = {}): string {
+  const lexicalCanonicalPath = path.join(homeDirectory, '.tachiko-conductor', 'mission-admission', 'registry.json');
+  assertSafeAccountOwnedPath(homeDirectory, lexicalCanonicalPath, 'file');
+  assertSafeAccountOwnedPath(homeDirectory, `${lexicalCanonicalPath}.lock`, 'file');
+  const canonicalPath = physicalPath(lexicalCanonicalPath);
+  const runsDirectory = physicalPath(env.TACHIKO_DATA_DIR ?? path.join(homeDirectory, '.tachiko-conductor', 'runs'));
+  const candidate = env[MISSION_ADMISSION_PATH_ENV] ?? canonicalPath;
+  if (!path.isAbsolute(candidate)) throw new AdmissionStateError(`${MISSION_ADMISSION_PATH_ENV} must be an absolute host path.`);
+  const resolved = physicalPath(candidate);
+  if (resolved !== canonicalPath) {
+    throw new AdmissionStateError(`${MISSION_ADMISSION_PATH_ENV} must resolve to the canonical per-user host admission registry.`);
+  }
+  const relativeToRuns = path.relative(runsDirectory, resolved);
+  if (relativeToRuns === '' || (!relativeToRuns.startsWith(`..${path.sep}`) && relativeToRuns !== '..' && !path.isAbsolute(relativeToRuns))) {
+    throw new AdmissionStateError('Mission admission registry must be outside the per-Run data directory.');
+  }
+  return resolved;
+}
+
+export function resolveHostAdmissionConfig(env: NodeJS.ProcessEnv = process.env): AdmissionConfig {
+  const raw = env[MISSION_ADMISSION_CONFIG_ENV];
+  if (raw === undefined || raw.trim() === '') return structuredClone(DEFAULT_MISSION_ADMISSION_CONFIG);
+  let value: unknown;
+  try { value = JSON.parse(raw); } catch { throw new AdmissionStateError(`${MISSION_ADMISSION_CONFIG_ENV} must contain versioned JSON configuration.`); }
+  validateAdmissionConfig(value);
+  return structuredClone(value);
+}
+
+export function createHostAdmissionRegistry(options: HostAdmissionResolverOptions = {}): MissionAdmissionRegistry {
+  const env = options.env ?? process.env;
+  const homeDirectory = options.homeDirectory ?? resolveAccountHomeDirectory();
+  const filePath = resolveHostAdmissionPath({ ...options, homeDirectory });
+  const validateRegistryPath = () => {
+    assertSafeAccountOwnedPath(homeDirectory, filePath, 'file');
+    assertSafeAccountOwnedPath(homeDirectory, `${filePath}.lock`, 'file');
+    assertSafeAccountOwnedPath(homeDirectory, path.join(homeDirectory, '.tachiko-conductor', 'dispatch', 'once.lock'), 'file');
+    assertSafeAccountOwnedPath(homeDirectory, path.join(homeDirectory, '.tachiko-conductor', 'dispatch', 'once.lock.admission'), 'file');
+  };
+  validateRegistryPath();
+  return new MissionAdmissionRegistry({
+    filePath,
+    config: resolveHostAdmissionConfig(env),
+    validatePath: validateRegistryPath,
+    onPublishedTransition: () => {
+      try { signalDispatchWake(dispatchWakePath(env, homeDirectory)); } catch { /* registry publication is authoritative; the safety poll recovers lost hints */ }
+    },
+  });
+}
+
+function containsPath(parent: string, child: string): boolean {
+  const relative = path.relative(parent, child);
+  return relative === '' || (!relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative));
+}
+
+function canonicalReceiptDirectory(env: NodeJS.ProcessEnv, variable: string, canonicalPath: string, homeDirectory: string): string {
+  assertSafeAccountOwnedPath(homeDirectory, canonicalPath, 'directory');
+  const canonical = physicalPath(canonicalPath);
+  const candidate = env[variable] ?? canonicalPath;
+  if (!path.isAbsolute(candidate) || physicalPath(candidate) !== canonical) {
+    throw new AdmissionStateError(`${variable} must resolve to its canonical per-user private receipt directory.`);
+  }
+  return canonical;
+}
+
+export function resolveManualOwnerReceiptPath(repository: string, workspace: string, { env = process.env, homeDirectory = resolveAccountHomeDirectory() }: HostAdmissionResolverOptions = {}): string {
+  if (!path.isAbsolute(workspace) || !/^[a-z0-9_.-]+\/[a-z0-9_.-]+$/.test(repository)) throw new AdmissionStateError('Manual owner receipt requires canonical repository and absolute workspace identity.');
+  const physicalWorkspace = physicalPath(workspace);
+  const runsDirectory = physicalPath(env.TACHIKO_DATA_DIR ?? path.join(homeDirectory, '.tachiko-conductor', 'runs'));
+  const receiptDirectory = canonicalReceiptDirectory(env, MANUAL_OWNER_RECEIPTS_DIR_ENV, path.join(homeDirectory, '.tachiko-conductor', 'mission-admission', 'manual-receipts'), homeDirectory);
+  const receiptId = createHash('sha256').update(`${repository}\0${physicalWorkspace}`).digest('hex');
+  const receiptPath = path.join(receiptDirectory, `${receiptId}.json`);
+  assertSafeAccountOwnedPath(homeDirectory, receiptPath, 'file');
+  if (containsPath(physicalWorkspace, receiptPath) || containsPath(runsDirectory, receiptPath)) {
+    throw new AdmissionStateError('Manual owner receipt must be outside the repository workspace and per-Run data directory.');
+  }
+  return receiptPath;
+}
+
+export function resolveHeartbeatOwnerReceiptPath(repository: string, workspace: string, { env = process.env, homeDirectory = resolveAccountHomeDirectory() }: HostAdmissionResolverOptions = {}): string {
+  if (!/^[a-z0-9_.-]+\/[a-z0-9_.-]+$/.test(repository) || !path.isAbsolute(workspace)) throw new AdmissionStateError('Heartbeat admission receipt requires canonical repository and absolute workspace identity.');
+  const physicalWorkspace = physicalPath(workspace);
+  const runsDirectory = physicalPath(env.TACHIKO_DATA_DIR ?? path.join(homeDirectory, '.tachiko-conductor', 'runs'));
+  const receiptDirectory = canonicalReceiptDirectory(env, HEARTBEAT_OWNER_RECEIPTS_DIR_ENV, path.join(homeDirectory, '.tachiko-conductor', 'mission-admission', 'heartbeat-receipts'), homeDirectory);
+  const receiptId = createHash('sha256').update(`${repository}\0${physicalWorkspace}`).digest('hex');
+  const receiptPath = path.join(receiptDirectory, `${receiptId}.json`);
+  assertSafeAccountOwnedPath(homeDirectory, receiptPath, 'file');
+  if (containsPath(physicalWorkspace, receiptPath) || containsPath(runsDirectory, receiptPath)) {
+    throw new AdmissionStateError('Heartbeat admission receipt must be outside the workspace and per-Run data directory.');
+  }
+  return receiptPath;
+}
+
+export function resolveRunOwnerReceiptPath(repository: string, runId: string, evidence?: import('./registry.js').MissionEvidence, { env = process.env, homeDirectory = resolveAccountHomeDirectory() }: HostAdmissionResolverOptions = {}): string {
+  if (!/^[a-z0-9_.-]+\/[a-z0-9_.-]+$/.test(repository) || !/^[A-Za-z0-9._-]+$/.test(runId)) throw new AdmissionStateError('Run owner receipt requires canonical repository and safe Run identity.');
+  const receiptDirectory = canonicalReceiptDirectory(env, RUN_OWNER_RECEIPTS_DIR_ENV, path.join(homeDirectory, '.tachiko-conductor', 'mission-admission', 'run-receipts'), homeDirectory);
+  const runsDirectory = physicalPath(env.TACHIKO_DATA_DIR ?? path.join(homeDirectory, '.tachiko-conductor', 'runs'));
+  const receiptPath = path.join(receiptDirectory, `${createHash('sha256').update(`${repository}\0${runId}`).digest('hex')}.json`);
+  assertSafeAccountOwnedPath(homeDirectory, receiptPath, 'file');
+  if (containsPath(runsDirectory, receiptPath) || (evidence?.workspace !== undefined && containsPath(physicalPath(evidence.workspace), receiptPath))) {
+    throw new AdmissionStateError('Run owner receipt must be outside the repository workspace and per-Run data directory.');
+  }
+  return receiptPath;
+}

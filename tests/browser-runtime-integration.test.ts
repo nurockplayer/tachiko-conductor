@@ -35,13 +35,28 @@ async function freePort(): Promise<number> {
   });
 }
 
-async function withClient<T>(endpoint: string, action: (client: Client) => Promise<T>): Promise<T> {
+function reportIntegrationPhase(startedAt: number, phase: string, state: 'start' | 'done'): void {
+  const elapsedMs = Math.round(performance.now() - startedAt);
+  console.log(`[browser-runtime-integration] ${new Date().toISOString()} +${elapsedMs}ms ${phase} ${state}`);
+}
+
+async function withClient<T>(endpoint: string, action: (client: Client) => Promise<T>, diagnostic?: { readonly startedAt: number; readonly label: string }): Promise<T> {
   const client = new Client({ name: 'tachiko-browser-integration-test', version: '0.1.0' });
+  const phase = (name: string, state: 'start' | 'done') => {
+    if (diagnostic !== undefined) reportIntegrationPhase(diagnostic.startedAt, `${diagnostic.label}.${name}`, state);
+  };
   try {
+    phase('connect', 'start');
     await client.connect(new StreamableHTTPClientTransport(new URL(endpoint)));
-    return await action(client);
+    phase('connect', 'done');
+    phase('tool-action', 'start');
+    const result = await action(client);
+    phase('tool-action', 'done');
+    return result;
   } finally {
+    phase('close', 'start');
     await client.close().catch(() => undefined);
+    phase('close', 'done');
   }
 }
 
@@ -63,6 +78,8 @@ function contentText(result: unknown): string {
 
 describe('managed Playwright MCP integration', () => {
   it('keeps the bootstrap browser context alive across transient client disconnects', { timeout: 60_000 }, async () => {
+    const diagnosticStartedAt = performance.now();
+    const phase = (name: string, state: 'start' | 'done') => reportIntegrationPhase(diagnosticStartedAt, name, state);
     const root = mkdtempSync(path.join(os.tmpdir(), 'tachiko-browser-bootstrap-integration-'));
     const runtime = new ManagedPlaywrightMcpRuntime({
       profileRoot: path.join(root, 'profiles'),
@@ -73,34 +90,57 @@ describe('managed Playwright MCP integration', () => {
     let handle: BrowserRuntimeHandle | undefined;
     let bootstrapLease: { close(): Promise<void> } | undefined;
     try {
-      handle = await runtime.start({ profile: 'bootstrap', port: await freePort(), headless: true });
+      phase('freePort', 'start');
+      const port = await freePort();
+      phase('freePort', 'done');
+      phase('runtime.start', 'start');
+      handle = await runtime.start({ profile: 'bootstrap', port, headless: true });
+      phase('runtime.start', 'done');
+      phase('openBrowserForBootstrap', 'start');
       bootstrapLease = await openBrowserForBootstrap(handle.snapshot.endpoint);
+      phase('openBrowserForBootstrap', 'done');
 
       await withClient(handle.snapshot.endpoint, async (client) => {
+        phase('first-client.callTool', 'start');
         const written = await client.callTool({
           name: 'browser_evaluate',
           arguments: {
             function: "() => { globalThis.__tachikoBootstrapSentinel = 'still-open'; return globalThis.__tachikoBootstrapSentinel; }",
           },
         });
+        phase('first-client.callTool', 'done');
+        phase('first-client.assertions', 'start');
         assert.notEqual(written.isError, true);
         assert.match(contentText(written), /still-open/);
-      });
+        phase('first-client.assertions', 'done');
+      }, { startedAt: diagnosticStartedAt, label: 'first-client' });
 
+      phase('disconnect-wait-4500ms', 'start');
       await new Promise<void>((resolve) => setTimeout(resolve, 4_500));
+      phase('disconnect-wait-4500ms', 'done');
 
       await withClient(handle.snapshot.endpoint, async (client) => {
+        phase('second-client.callTool', 'start');
         const read = await client.callTool({
           name: 'browser_evaluate',
           arguments: { function: '() => globalThis.__tachikoBootstrapSentinel' },
         });
+        phase('second-client.callTool', 'done');
+        phase('second-client.assertions', 'start');
         assert.notEqual(read.isError, true);
         assert.match(contentText(read), /still-open/);
-      });
+        phase('second-client.assertions', 'done');
+      }, { startedAt: diagnosticStartedAt, label: 'second-client' });
     } finally {
+      phase('bootstrapLease.close', 'start');
       await bootstrapLease?.close().catch(() => undefined);
+      phase('bootstrapLease.close', 'done');
+      phase('runtime.handle.stop', 'start');
       await handle?.stop().catch(() => undefined);
+      phase('runtime.handle.stop', 'done');
+      phase('temporary-root.cleanup', 'start');
       rmSync(root, { recursive: true, force: true });
+      phase('temporary-root.cleanup', 'done');
     }
   });
 

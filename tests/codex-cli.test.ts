@@ -1,14 +1,19 @@
 import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { describe, it } from 'node:test';
 
 import { CodexCliAdapter } from '../src/agents/codex-cli.js';
+import { IMPLEMENTATION_PACKET_LIMITS, buildImplementationPacket } from '../src/agents/implementation-packet.js';
 import {
   CODEX_CAPABILITY_FALLBACK_REVISION,
   runtimeCapabilityCatalog,
 } from '../src/agents/model-capability.js';
 import { EXECUTION_CONFIGURATION_ERROR_CODE } from '../src/execution-profiles.js';
-import { WorkspaceGuardFailure } from '../src/adapters/agent.js';
+import { ExecutionAdmissionRefusal, GOVERNED_PUBLICATION_CONFINEMENT_REQUIRED, WorkspaceGuardFailure } from '../src/adapters/agent.js';
 import type { ProcessResult, ProcessRunner, ProcessRunOptions } from '../src/github/transport.js';
+import { MissionAdmissionRegistry } from '../src/mission-admission/registry.js';
 import { TARGET } from './helpers.js';
 
 class FakeRunner implements ProcessRunner {
@@ -43,6 +48,60 @@ function codexJsonl(
 }
 
 describe('CodexCliAdapter', () => {
+  it('refuses an oversized final implementation packet before any CLI or Git child process', async () => {
+    const built = buildImplementationPacket({
+      kind: 'initial',
+      identity: {
+        runId: 'packet-run', target: TARGET, workspacePath: '/tmp/packet-worktree', branch: 'codex/packet', baseSha: 'b'.repeat(40),
+        execution: { profile: 'complex', revision: 'profile-v1', executor: 'luna-isolated', model: 'gpt-5.6-luna', reasoningEffort: 'high', timeoutMs: 60_000, sandboxMode: 'workspace-write', approvalPolicy: 'never' },
+      },
+      authority: {
+        repository: { owner: TARGET.owner, repo: TARGET.repo },
+        issue: { id: 'I_packet', number: TARGET.issueNumber, updatedAt: '2026-09-30T00:00:00Z', title: 'Bounded packet', body: 'Exact task.' },
+        acceptedScope: { sourceId: 'IC_scope', sourceScope: 'issue', sourceUpdatedAt: '2026-09-30T00:00:00Z', freshness: 'current', text: 'Keep exact scope.' },
+      },
+      repair: null,
+    });
+    assert.equal(built.kind, 'packet');
+    if (built.kind !== 'packet') return;
+    const runner = new FakeRunner([]);
+    const adapter = new CodexCliAdapter({ runner });
+    const result = await adapter.run({
+      target: TARGET,
+      baseSha: 'b'.repeat(40),
+      workspacePath: '/tmp/packet-worktree',
+      branch: 'codex/packet',
+      authority: 'embedded',
+      instructions: built.packet.rendered,
+      packet: { ...built.packet, finalCliText: '☃'.repeat(IMPLEMENTATION_PACKET_LIMITS.finalCliBytes) },
+      execution: {
+        profile: 'complex', revision: 'profile-v1', executor: 'luna-isolated', model: 'gpt-5.6-luna',
+        reasoningEffort: 'high', timeoutMs: 60_000,
+      },
+      runtimeOwnership: { runId: 'packet-run', generation: 'packet-generation' },
+    });
+    assert.equal(result.exitStatus, 'failure');
+    assert.match(result.diagnostics?.join('\n') ?? '', /CODEX_PACKET_REFUSED/);
+    assert.equal(runner.calls.length, 0);
+  });
+
+  it('refuses a governed ambient invocation before any CLI or Git child process', async () => {
+    const runner = new FakeRunner([]);
+    const executor = { provider: 'codex-cli', sessionId: 'durable-thread', generation: 'run-generation' } as const;
+    const adapter = new CodexCliAdapter({ runner, cwd: '/tmp/repo' });
+
+    const result = await adapter.run({
+      target: TARGET, baseSha: 'base', executor,
+      runtimeOwnership: { runId: 'run-1', generation: 'run-generation' },
+      governedPublication: { required: true, continuation: true },
+    });
+
+    assert.equal(result.exitStatus, 'failure');
+    assert.match(result.diagnostics?.join('\n') ?? '', new RegExp(GOVERNED_PUBLICATION_CONFINEMENT_REQUIRED));
+    assert.deepEqual(result.executor, executor);
+    assert.equal(runner.calls.length, 0);
+  });
+
   it('revalidates a prepared workspace immediately before spawn and never invokes Codex after guard failure', async () => {
     const runner = new FakeRunner([]);
     const adapter = new CodexCliAdapter({ runner, cwd: '/tmp/repo' });
@@ -54,6 +113,72 @@ describe('CodexCliAdapter', () => {
       WorkspaceGuardFailure,
     );
     assert.equal(runner.calls.length, 0);
+  });
+
+  it('forwards a host execution callback after injected-runner preparation and preserves tagged refusal', async () => {
+    const events: string[] = [];
+    let entered = false;
+    const runner: ProcessRunner = { run: async (file, _args, options) => {
+      if (file === 'codex') {
+        events.push('runner-preparation');
+        await Promise.resolve();
+        options.beforeSpawn?.();
+        events.push('provider-entry');
+        entered = true;
+        return result(codexJsonl());
+      }
+      return result(HEAD);
+    } };
+    const adapter = new CodexCliAdapter({ runner, cwd: '/tmp/repo' });
+    const success = await adapter.run({ target: TARGET, baseSha: 'base', beforeExecution: () => { events.push('host-boundary'); } });
+    assert.equal(success.exitStatus, 'success');
+    assert.deepEqual(events, ['runner-preparation', 'host-boundary', 'provider-entry']);
+
+    const refusal = new ExecutionAdmissionRefusal('exact Run was superseded', true);
+    entered = false;
+    await assert.rejects(
+      () => adapter.run({ target: TARGET, baseSha: 'base', beforeExecution: () => { throw refusal; } }),
+      (error: unknown) => error === refusal,
+    );
+    assert.equal(entered, false, 'a rejected final callback cannot enter the provider');
+  });
+
+  it('rejects a revoked admission after asynchronous runner preparation and before Codex entry', async () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-cli-final-admission-'));
+    try {
+      const registry = new MissionAdmissionRegistry({
+        filePath: path.join(directory, 'registry.json'),
+        config: { schemaVersion: 1, revision: 'cli-final-boundary-v1', limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } },
+      });
+      const admitted = registry.admit({ laneId: 'cli-final-boundary', role: 'production_captain', evidence: { repository: 'acme/widgets', issue: 42 } });
+      assert.equal(admitted.outcome, 'admitted');
+      if (admitted.outcome !== 'admitted') return;
+      let runnerReady!: () => void;
+      let allowBoundary!: () => void;
+      const ready = new Promise<void>((resolve) => { runnerReady = resolve; });
+      const barrier = new Promise<void>((resolve) => { allowBoundary = resolve; });
+      let entered = false;
+      const runner: ProcessRunner = { run: async (file, _args, options) => {
+        if (file === 'codex') {
+          runnerReady();
+          await barrier;
+          options.beforeSpawn?.();
+          entered = true;
+          return result(codexJsonl());
+        }
+        return result(HEAD);
+      } };
+      const adapter = new CodexCliAdapter({ runner, cwd: '/tmp/repo' });
+      const operation = adapter.run({ target: TARGET, baseSha: 'base', beforeExecution: () => {
+        try { registry.assertCanMutate(admitted.token); }
+        catch (error) { throw new ExecutionAdmissionRefusal(error instanceof Error ? error.message : String(error), false); }
+      } });
+      await ready;
+      registry.release(admitted.token, true);
+      allowBoundary();
+      await assert.rejects(operation, /Admission generation token is stale/);
+      assert.equal(entered, false, 'revocation after runner preparation prevents provider entry');
+    } finally { rmSync(directory, { recursive: true, force: true }); }
   });
   const HEAD = '9d9cc7d210960f3c81d7d7498a36f65c67b9f4a9';
 

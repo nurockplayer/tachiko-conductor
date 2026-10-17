@@ -1,0 +1,50 @@
+name: Operational
+description: Runtime, deployment, configuration, maintenance, or operator action that is not repository implementation work.
+title: "[Ops] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Operational Issues stay outside implementation dispatch. If repository code must change, open or revise a separate implementation/repair Issue with task-shape authority.
+  - type: dropdown
+    id: kind
+    attributes:
+      label: Kind
+      options:
+        - operational
+    validations:
+      required: true
+  - type: textarea
+    id: goal
+    attributes:
+      label: Goal
+    validations:
+      required: true
+  - type: textarea
+    id: procedure
+    attributes:
+      label: Procedure / runbook
+      description: Bounded operator actions allowed by this Issue.
+    validations:
+      required: true
+  - type: textarea
+    id: preconditions
+    attributes:
+      label: Preconditions
+      description: Required state/authority before the operation may run.
+    validations:
+      required: true
+  - type: textarea
+    id: verification
+    attributes:
+      label: Verification
+      description: Evidence proving the operation reached the intended state.
+    validations:
+      required: true
+  - type: textarea
+    id: rollback
+    attributes:
+      label: Rollback / stop conditions
+      description: Reversal path and conditions requiring an immediate stop.
+    validations:
+      required: true

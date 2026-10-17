@@ -790,10 +790,12 @@ exec ${JSON.stringify(actualGit)} "$@"
     const delayedClone = path.join(wrapperDir, 'clone-delayed');
     writeFileSync(wrapper, `#!/bin/sh\nfor argument in "$@"; do\n  if [ "$argument" = clone ]; then sleep 1.1; : > ${JSON.stringify(delayedClone)}; break; fi\ndone\nexec ${JSON.stringify(realGit)} "$@"\n`);
     chmodSync(wrapper, 0o755);
+    const nativeTrue = '/usr/bin/true';
+    assert.ok(existsSync(nativeTrue), `expected local absolute native no-op at ${nativeTrue}`);
     const result = await new ConfiguredLocalValidationAdapter({
-      ...configuration(['/bin/sh', '-c', 'exit 0'], 100), gitProgram: wrapper,
+      ...configuration([nativeTrue], 100), gitProgram: wrapper,
     }).validate(owned);
-    assert.equal(result.status, 'passed');
+    assert.equal(result.status, 'passed', JSON.stringify(result.commands));
     assert.equal(existsSync(delayedClone), true);
   });
 
@@ -807,10 +809,12 @@ exec ${JSON.stringify(actualGit)} "$@"
     const delayedStatus = path.join(wrapperDir, 'status-delayed');
     writeFileSync(wrapper, `#!/bin/sh\ncase " $* " in *" status "*) sleep 1.1; : > ${JSON.stringify(delayedStatus)} ;; esac\nexec ${JSON.stringify(realGit)} "$@"\n`);
     chmodSync(wrapper, 0o755);
+    const nativeTrue = '/usr/bin/true';
+    assert.ok(existsSync(nativeTrue), `expected local absolute native no-op at ${nativeTrue}`);
     const result = await new ConfiguredLocalValidationAdapter({
-      ...configuration(['/bin/sh', '-c', 'exit 0'], 100), gitProgram: wrapper,
+      ...configuration([nativeTrue], 100), gitProgram: wrapper,
     }).validate(owned);
-    assert.equal(result.status, 'passed');
+    assert.equal(result.status, 'passed', JSON.stringify(result.commands));
     assert.equal(existsSync(delayedStatus), true);
   });
 

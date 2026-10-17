@@ -1,7 +1,13 @@
 import type { AgentResult, ExecutorIdentity, Target } from '../domain/types.js';
 import type { ResolvedExecutionConfiguration } from '../execution-profiles.js';
+import { hasGovernedPublicationConfinement } from '../agents/luna-isolated.js';
+import type { ImplementationPacket } from '../agents/implementation-packet.js';
 
 export const HUMAN_TAKEOVER_DIAGNOSTIC = 'TACHIKO_NEEDS_HUMAN:';
+export const GOVERNED_PUBLICATION_CONFINEMENT_REQUIRED = 'GOVERNED_PUBLICATION_CONFINEMENT_REQUIRED' as const;
+export const GOVERNED_PUBLICATION_REENTRY_ACTION = 'Preserve this Run’s executor/session and retry only after its exact runtime has a source-qualified host publication boundary.';
+
+export { hasGovernedPublicationConfinement } from '../agents/luna-isolated.js';
 
 export function humanTakeoverReason(result: AgentResult): string | undefined {
   const diagnostic = result.diagnostics?.find((value) => value.startsWith(HUMAN_TAKEOVER_DIAGNOSTIC));
@@ -54,6 +60,24 @@ export interface WorkspaceGuard {
 }
 
 export const WORKSPACE_GUARD_FAILURE_CODE = 'WORKSPACE_GUARD_FAILURE' as const;
+export const EXECUTION_ADMISSION_REFUSAL_CODE = 'EXECUTION_ADMISSION_REFUSED' as const;
+
+/** A host-only boundary refused entry because current execution authority could not be established. */
+export class ExecutionAdmissionRefusal extends Error {
+  readonly code = EXECUTION_ADMISSION_REFUSAL_CODE;
+  override readonly cause?: unknown;
+  readonly authorityUnknown: boolean;
+  constructor(message: string, readonly runSuperseded: boolean, options: { readonly cause?: unknown; readonly authorityUnknown?: boolean } = {}) {
+    super(message);
+    this.name = 'ExecutionAdmissionRefusal';
+    this.cause = options.cause;
+    this.authorityUnknown = options.authorityUnknown ?? false;
+  }
+}
+
+export function isExecutionAdmissionRefusal(error: unknown): error is ExecutionAdmissionRefusal {
+  return error instanceof ExecutionAdmissionRefusal && error.code === EXECUTION_ADMISSION_REFUSAL_CODE;
+}
 
 export class WorkspaceGuardFailure extends Error {
   readonly code = WORKSPACE_GUARD_FAILURE_CODE;
@@ -88,11 +112,17 @@ export interface ImplementationRequest {
   /** Prepared linked worktree; providers use this as their process cwd. */
   readonly workspacePath?: string;
   readonly branch?: string;
+  /** Synchronous final authority check for host publication; never persisted or sent into an executor. */
+  readonly beforePublish?: () => void;
+  /** Synchronous host-only check immediately before an implementation process enters execution. */
+  readonly beforeExecution?: () => void;
   /** Must be evaluated after capability resolution and directly before spawn. */
   readonly workspaceGuard?: WorkspaceGuard;
   /** Whether the executor should read target authority live instead of from copied prose. */
   readonly authority?: 'embedded' | 'live-target';
   readonly instructions?: string;
+  /** Versioned source-owned bounded task authority for isolated implementation workers. */
+  readonly packet?: ImplementationPacket;
   /** Small Conductor/review instructions that remain relevant with live authority. */
   readonly supplementalInstructions?: string;
   /** Per-invocation capabilities; never persisted in Conductor run state. */
@@ -110,6 +140,8 @@ export interface ImplementationRequest {
     readonly generation: string;
     readonly dispatchClaimId?: string;
   };
+  /** Host-only governor requirement; never persisted or serialized into worker instructions. */
+  readonly governedPublication?: { readonly required: true; readonly continuation: boolean };
   /** Immutable Steward-selected execution snapshot; adapters never select it. */
   readonly execution?: ResolvedExecutionConfiguration;
   /** Cancels the active implementation process. */
@@ -124,4 +156,40 @@ export interface ImplementationRequest {
 export interface ImplementationAgent {
   readonly kind: 'implementation-agent';
   run(request: ImplementationRequest): Promise<AgentResult>;
+  /** Resolves and pins the exact source-owned adapter before a governed invocation is counted or started. */
+  prepareGovernedInvocation?(request: ImplementationRequest): GovernedInvocationPreparation;
+}
+
+export type GovernedInvocationPreparation =
+  | { readonly status: 'qualified'; readonly agent: ImplementationAgent }
+  | { readonly status: 'held'; readonly reason: string };
+
+/** Defense in depth for adapters called directly, outside the implementation registry. */
+export function governedPublicationRefusal(adapter: object, request: ImplementationRequest): AgentResult | undefined {
+  const executionBoundaryRefusal = governedExecutionBoundaryRefusal(request);
+  if (executionBoundaryRefusal !== undefined) return executionBoundaryRefusal;
+  if (request.governedPublication === undefined || hasGovernedPublicationConfinement(adapter)) return undefined;
+  const detail = 'Governed mutation is held because this runtime has no source-qualified publication confinement; no model turn or worker process was started. ' + GOVERNED_PUBLICATION_REENTRY_ACTION;
+  return {
+    exitStatus: 'failure',
+    summary: detail,
+    diagnostics: [`${GOVERNED_PUBLICATION_CONFINEMENT_REQUIRED}: ${detail}`],
+    ...(request.executor === undefined ? {} : { executor: request.executor }),
+    ...(request.sessionId === undefined ? {} : { sessionId: request.sessionId }),
+    durationMs: 0,
+  };
+}
+
+/** Preparation may happen before handoff; governed execution may not omit its final host boundary. */
+export function governedExecutionBoundaryRefusal(request: ImplementationRequest): AgentResult | undefined {
+  if (request.governedPublication === undefined || typeof request.beforeExecution === 'function') return undefined;
+  const detail = `Governed execution is held because its final host execution-boundary callback is missing; no model turn or worker process was started. ${GOVERNED_PUBLICATION_REENTRY_ACTION}`;
+  return {
+    exitStatus: 'failure',
+    summary: detail,
+    diagnostics: [`${GOVERNED_PUBLICATION_CONFINEMENT_REQUIRED}: ${detail}`],
+    ...(request.executor === undefined ? {} : { executor: request.executor }),
+    ...(request.sessionId === undefined ? {} : { sessionId: request.sessionId }),
+    durationMs: 0,
+  };
 }

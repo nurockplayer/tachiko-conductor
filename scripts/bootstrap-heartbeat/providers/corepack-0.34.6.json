@@ -1,0 +1,400 @@
+{
+  "evidenceObservedAt": "2026-09-27T09:46:13.964214+00:00",
+  "files": [
+    {
+      "mode": 420,
+      "path": "CHANGELOG.md",
+      "sha256": "490e489e6c344e9d1b4e411f8358f50e886ee1f0ad5bfd0de1ce9df5d33f068a",
+      "size": 34007,
+      "type": "file"
+    },
+    {
+      "mode": 420,
+      "path": "LICENSE.md",
+      "sha256": "30a7b8ba5c4483d97d6123f5634da2362d578fb81f42ed6e1dfbb84fb1cd8fe4",
+      "size": 1063,
+      "type": "file"
+    },
+    {
+      "mode": 420,
+      "path": "README.md",
+      "sha256": "476464d6b3890ad0cca58d9d79c3ff4049a562d7accd7c487a9ed933328f7b18",
+      "size": 15614,
+      "type": "file"
+    },
+    {
+      "mode": 493,
+      "path": "dist/corepack.js",
+      "sha256": "3655bc798f300951f2070fee411b337d626b0c3ae80c2d24c46ccac4595d4bf9",
+      "size": 174,
+      "type": "file"
+    },
+    {
+      "mode": 420,
+      "path": "dist/lib/corepack.cjs",
+      "sha256": "4c348070c8937f4693d6ccb128f7d034a2542932b9ed7968cbb9a3fe38158d4a",
+      "size": 967004,
+      "type": "file"
+    },
+    {
+      "mode": 493,
+      "path": "dist/npm.js",
+      "sha256": "5d9704326d1ddedc5e0724c440e9052a422e616a3c21633bc955ac4a53013c06",
+      "size": 185,
+      "type": "file"
+    },
+    {
+      "mode": 493,
+      "path": "dist/npx.js",
+      "sha256": "74d56d596d3449b4d35508227bbd6f371aaa06999e53b261397d43e82655425e",
+      "size": 185,
+      "type": "file"
+    },
+    {
+      "mode": 493,
+      "path": "dist/pnpm.js",
+      "sha256": "7c2a67995976b5b592b611d8b236e3b0633bd654fb49aedd96c6eb7ce04c9cbb",
+      "size": 186,
+      "type": "file"
+    },
+    {
+      "mode": 493,
+      "path": "dist/pnpx.js",
+      "sha256": "be8a28dbc76a5f76f50b336121237e451530b517d2bde9355c44e4d519ed7f28",
+      "size": 186,
+      "type": "file"
+    },
+    {
+      "mode": 493,
+      "path": "dist/yarn.js",
+      "sha256": "9f6dcacd3a256eedf09e382b14c4fd6a9e62e8c8009e64116997621bbd6531dd",
+      "size": 186,
+      "type": "file"
+    },
+    {
+      "mode": 493,
+      "path": "dist/yarnpkg.js",
+      "sha256": "69110596f81458d8d37524b5d70c63b7658e05c954244c5f7658719ca2b7a165",
+      "size": 189,
+      "type": "file"
+    },
+    {
+      "mode": 420,
+      "path": "package.json",
+      "sha256": "ca4688703775d897ac1111c3cfec8eb9aa3801c08dfb02a59acde6225206cce9",
+      "size": 2897,
+      "type": "file"
+    },
+    {
+      "mode": 420,
+      "path": "shims/corepack",
+      "sha256": "e5020e3430810638b169bbf91b3871644ebc85063cf868065336cf57874ed4eb",
+      "size": 284,
+      "type": "file"
+    },
+    {
+      "mode": 420,
+      "path": "shims/corepack.cmd",
+      "sha256": "c50dc5168eff5c1e8dd07e179635924b344dd67bf58a69526d44f26803fa199f",
+      "size": 180,
+      "type": "file"
+    },
+    {
+      "mode": 420,
+      "path": "shims/corepack.ps1",
+      "sha256": "42e8c72cd78b14e7cd45f682d0a6eb741d5b0b9e8288ce3f6d2c8b82880c60b7",
+      "size": 789,
+      "type": "file"
+    },
+    {
+      "mode": 420,
+      "path": "shims/nodewin/corepack",
+      "sha256": "65a34c84c3820cadd8bb3f4aed2a010d2a92c9a4f72f5ea83291f1f65820f0c8",
+      "size": 322,
+      "type": "file"
+    },
+    {
+      "mode": 420,
+      "path": "shims/nodewin/corepack.cmd",
+      "sha256": "920630a1d1ec47aedea7345e3c868ecdc07e191373497bbf47fbbf5942fbad4f",
+      "size": 218,
+      "type": "file"
+    },
+    {
+      "mode": 420,
+      "path": "shims/nodewin/corepack.ps1",
+      "sha256": "f9cbe52c92c62ca73ed82fcd2d59e16ff4bbdf9c214f7c2f3ab51c9c098a77fa",
+      "size": 865,
+      "type": "file"
+    },
+    {
+      "mode": 420,
+      "path": "shims/nodewin/npm",
+      "sha256": "b805432c230b8c711f89aaaf8e9a0f52d3594a40e94f89b580217b0e3eed2bef",
+      "size": 312,
+      "type": "file"
+    },
+    {
+      "mode": 420,
+      "path": "shims/nodewin/npm.cmd",
+      "sha256": "834223f326442c96e0d2480390e2c341f01a1196e342f16fe00ef11b9431370d",
+      "size": 208,
+      "type": "file"
+    },
+    {
+      "mode": 420,
+      "path": "shims/nodewin/npm.ps1",
+      "sha256": "528701fdbb70f298e54c839bf68a3831fdd582740f4fb1231d46da18e2c9fb3f",
+      "size": 845,
+      "type": "file"
+    },
+    {
+      "mode": 420,
+      "path": "shims/nodewin/npx",
+      "sha256": "05f9721a4e7222958732c14195780cc888ba3bb3143723b2639dbd40f43fa51b",
+      "size": 312,
+      "type": "file"
+    },
+    {
+      "mode": 420,
+      "path": "shims/nodewin/npx.cmd",
+      "sha256": "8007c6ca3cb132ed22c62ab6a93975eee5fac573b6827de24e0668ad74d2cde1",
+      "size": 208,
+      "type": "file"
+    },
+    {
+      "mode": 420,
+      "path": "shims/nodewin/npx.ps1",
+      "sha256": "9b001ed22cbc0106d571895e2e7fdc7e030cecf182dab269e73cfdc321ce7466",
+      "size": 845,
+      "type": "file"
+    },
+    {
+      "mode": 420,
+      "path": "shims/nodewin/pnpm",
+      "sha256": "b2d81ac629b340fe2c7d5bc480ad9441e89a4b4d654fd45a50a4c8843ea47aa6",
+      "size": 314,
+      "type": "file"
+    },
+    {
+      "mode": 420,
+      "path": "shims/nodewin/pnpm.cmd",
+      "sha256": "045eb4580b746837ecf0091d32384dbf519fa4f33f9f1d4da9452b8cea7dc232",
+      "size": 210,
+      "type": "file"
+    },
+    {
+      "mode": 420,
+      "path": "shims/nodewin/pnpm.ps1",
+      "sha256": "20f74dc3a724cae781e4297188028c4b4512c201add63868f9a9852135adf5f5",
+      "size": 849,
+      "type": "file"
+    },
+    {
+      "mode": 420,
+      "path": "shims/nodewin/pnpx",
+      "sha256": "52d0200d77b19c890e282562382851dd37e613d236456cef63310b874ba50abf",
+      "size": 314,
+      "type": "file"
+    },
+    {
+      "mode": 420,
+      "path": "shims/nodewin/pnpx.cmd",
+      "sha256": "05ac43e3237b9a146e432c3d785a22822828acce122740c0aad3dee35221b5c4",
+      "size": 210,
+      "type": "file"
+    },
+    {
+      "mode": 420,
+      "path": "shims/nodewin/pnpx.ps1",
+      "sha256": "14b0ef6056a55bce9cfaec6454ce6a50141543eef5b7cd9feb832ac30c9ede29",
+      "size": 849,
+      "type": "file"
+    },
+    {
+      "mode": 420,
+      "path": "shims/nodewin/yarn",
+      "sha256": "a8f21107b50fec83da4e6495b51f0dad16107d00214a52f305395bcda26e5731",
+      "size": 314,
+      "type": "file"
+    },
+    {
+      "mode": 420,
+      "path": "shims/nodewin/yarn.cmd",
+      "sha256": "2daa763e70eae568ffdd7edaeb4f9edeeff5e8bad0fc773b1c3d750833629654",
+      "size": 210,
+      "type": "file"
+    },
+    {
+      "mode": 420,
+      "path": "shims/nodewin/yarn.ps1",
+      "sha256": "7975e73914107ec48224be53e0a88317cc9595a71d637ef12a7c10ccd61ec53d",
+      "size": 849,
+      "type": "file"
+    },
+    {
+      "mode": 420,
+      "path": "shims/nodewin/yarnpkg",
+      "sha256": "0b55e5de871fbaa75a270ed198268c4d9a9b9d86c847823e5ec8eafb51360b08",
+      "size": 320,
+      "type": "file"
+    },
+    {
+      "mode": 420,
+      "path": "shims/nodewin/yarnpkg.cmd",
+      "sha256": "30fed702510a977562baefa059b3179ce4456d5b9f459671ba420e63ae81743b",
+      "size": 216,
+      "type": "file"
+    },
+    {
+      "mode": 420,
+      "path": "shims/nodewin/yarnpkg.ps1",
+      "sha256": "750624e85c009d6dcc314f9aceb967c407de2a7ef11c1f67560f8ef6e3091fa0",
+      "size": 861,
+      "type": "file"
+    },
+    {
+      "mode": 493,
+      "path": "shims/npm",
+      "sha256": "14e8c15fb4da999e0a407f12be3c232b21920c8816c432631e256d2d781c64a0",
+      "size": 274,
+      "type": "file"
+    },
+    {
+      "mode": 420,
+      "path": "shims/npm.cmd",
+      "sha256": "727e18574154a52a497d81f840461ac62655d101b2514ab8a3e8eccd0a3dc991",
+      "size": 170,
+      "type": "file"
+    },
+    {
+      "mode": 493,
+      "path": "shims/npm.ps1",
+      "sha256": "d559b49acafd99e65bf27c987fb91245156c7497ba873ba03e6c39214d3cec22",
+      "size": 769,
+      "type": "file"
+    },
+    {
+      "mode": 493,
+      "path": "shims/npx",
+      "sha256": "807b9b9f523b4b91aaf59925e7bcd26b4507b3c8582623d6eb27b996f7d9b349",
+      "size": 274,
+      "type": "file"
+    },
+    {
+      "mode": 420,
+      "path": "shims/npx.cmd",
+      "sha256": "7b179468496aabf9f4a852a1da671cc7bf074fbeed88261ee7c3e2bc9b1c9e2d",
+      "size": 170,
+      "type": "file"
+    },
+    {
+      "mode": 493,
+      "path": "shims/npx.ps1",
+      "sha256": "4d3b80abc3f7573231ed1fd388b4dc2a343ca2ea8723ffda12f940ec0216d316",
+      "size": 769,
+      "type": "file"
+    },
+    {
+      "mode": 493,
+      "path": "shims/pnpm",
+      "sha256": "61086ca5dbabc2a49451e282f61954f9c844b6f5631d9246653410f07fe62b03",
+      "size": 276,
+      "type": "file"
+    },
+    {
+      "mode": 420,
+      "path": "shims/pnpm.cmd",
+      "sha256": "b70680ee9e60e9906dc52e53acda23fd997aad01eddf7fe3fbcdfe28980f88e4",
+      "size": 172,
+      "type": "file"
+    },
+    {
+      "mode": 493,
+      "path": "shims/pnpm.ps1",
+      "sha256": "265560053661f4247b1dd8c012ffce9adf6ef6b5038662d3c7162cf15736f204",
+      "size": 773,
+      "type": "file"
+    },
+    {
+      "mode": 493,
+      "path": "shims/pnpx",
+      "sha256": "10c398eda2e7a2634f74dc6088ac9f2495d4861317f20611374d5412492ddf32",
+      "size": 276,
+      "type": "file"
+    },
+    {
+      "mode": 420,
+      "path": "shims/pnpx.cmd",
+      "sha256": "cd0f0363556a75da272fa8f6a7e7021da6a7f9a4396eae1f0fc7ea318525f1b1",
+      "size": 172,
+      "type": "file"
+    },
+    {
+      "mode": 493,
+      "path": "shims/pnpx.ps1",
+      "sha256": "fca1f4de4776dd73200173db0c2b10e289bfbfdd7694070a2d1fa55abed6f2c9",
+      "size": 773,
+      "type": "file"
+    },
+    {
+      "mode": 493,
+      "path": "shims/yarn",
+      "sha256": "3df00c03dfa6070b135d138a3a16e092e9c53b0e3b4727929947cbfa1670dc26",
+      "size": 276,
+      "type": "file"
+    },
+    {
+      "mode": 420,
+      "path": "shims/yarn.cmd",
+      "sha256": "b5e2d2a4b7818ce047a39a68c9e08e7230b23f7a088e0b1677b3c47ef807fb0f",
+      "size": 172,
+      "type": "file"
+    },
+    {
+      "mode": 493,
+      "path": "shims/yarn.ps1",
+      "sha256": "92de62489a3714c5f11d9334cbc6f53ac2642d0ccb15ab67b792e296825c6b3b",
+      "size": 773,
+      "type": "file"
+    },
+    {
+      "mode": 493,
+      "path": "shims/yarnpkg",
+      "sha256": "58732b063df0c3e5636f18628efd287a2ff58594e634dfc17820897b274b3a96",
+      "size": 282,
+      "type": "file"
+    },
+    {
+      "mode": 420,
+      "path": "shims/yarnpkg.cmd",
+      "sha256": "a7f74b86cc7ac2d5b8d85dd3616fc5a87b87818ffe88681f9bf391dd589dfc1b",
+      "size": 178,
+      "type": "file"
+    },
+    {
+      "mode": 493,
+      "path": "shims/yarnpkg.ps1",
+      "sha256": "8cc95cc1ef59c81254db932455ab8334e87deca411df67ef5a6f925023717518",
+      "size": 785,
+      "type": "file"
+    }
+  ],
+  "integrity": "sha512-gvylq9kzJB09mSsiOnKOnhg0YdCWNy2aGaeGbYF4HlyGd/v4moxEonQjJPYI45/K4zP7q1hW9qCVvaYYKK5nkA==",
+  "keyId": "SHA256:DhQ8wR5APBvFHLF/+Tc+AYvPOdTpcIDqOhxsBHRwC7U",
+  "keyType": "ecdsa-sha2-nistp256",
+  "keysSha256": "faf23d8753d5bb79df250f10391ac89b63ecf7743e48487a544a99c847f9c8df",
+  "keysUrl": "https://registry.npmjs.org/-/npm/v1/keys",
+  "metadataSha256": "5dac800625ceeef3c0cd5f05aa59444b58c8e0f09ae987199da7c76113d14612",
+  "metadataUrl": "https://registry.npmjs.org/corepack/0.34.6",
+  "name": "corepack",
+  "publicKey": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEY6Ya7W++7aUPzvMTrezH6Ycx3c+HOKYCcNGybJZSCJq/fd7Qa8uuAKtdIkUQtQiEKERhAmE5lMMJhP8OkDOa2g==",
+  "schema": 1,
+  "scheme": "ecdsa-sha2-nistp256",
+  "sha256": "af29678fc25ed5ae02343e9b67b214a25bacdcffae566f8cf848936beb23a7c8",
+  "signature": "MEUCIQCBWVski63tOvPsTT+qO96mx1ChyS6urTc2Yg2iN0waIwIgSpFGk7zKIMgEdNPQXZ69Y87/Yb7fRPwBKSxX0VVJrsk=",
+  "signatureVerificationMethod": "system /usr/bin/openssl dgst -sha256 -verify",
+  "signedMessage": "corepack@0.34.6:sha512-gvylq9kzJB09mSsiOnKOnhg0YdCWNy2aGaeGbYF4HlyGd/v4moxEonQjJPYI45/K4zP7q1hW9qCVvaYYKK5nkA==",
+  "tarballUrl": "https://registry.npmjs.org/corepack/-/corepack-0.34.6.tgz",
+  "version": "0.34.6"
+}

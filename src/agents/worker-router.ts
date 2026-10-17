@@ -1,6 +1,6 @@
 import path from 'node:path';
 
-import { assertWorkspaceGuard, type ImplementationAgent, type ImplementationRequest } from '../adapters/agent.js';
+import { assertWorkspaceGuard, governedPublicationRefusal, isExecutionAdmissionRefusal, type ImplementationAgent, type ImplementationRequest } from '../adapters/agent.js';
 import type { AgentResult } from '../domain/types.js';
 import { NodeProcessRunner, type ProcessRunner, type ProcessRunOptions } from '../github/transport.js';
 import { providerTelemetry } from './provider-telemetry.js';
@@ -103,6 +103,8 @@ export class WorkerRouterAdapter implements ImplementationAgent {
   }
 
   async run(request: ImplementationRequest): Promise<AgentResult> {
+    const publicationRefusal = governedPublicationRefusal(this, request);
+    if (publicationRefusal !== undefined) return publicationRefusal;
     if (isAborted(request.signal)) return failure(WORKER_ROUTER_ERROR_CODE.CANCELLED, 'Worker router was cancelled.', 0);
     if (request.workspacePath === undefined || request.workspacePath.trim() === '' || request.branch === undefined || request.branch.trim() === '') {
       return failure(
@@ -132,7 +134,7 @@ export class WorkerRouterAdapter implements ImplementationAgent {
     }
     let spec: WorkerContainerSpec;
     try {
-      spec = this.containerSpec(this.image, cwd, task, request.signal);
+      spec = this.containerSpec(this.image, cwd, task, request.signal, request.beforeExecution);
     } catch (error) {
       return failure(
         WORKER_ROUTER_ERROR_CODE.MOUNTS_INVALID,
@@ -144,6 +146,7 @@ export class WorkerRouterAdapter implements ImplementationAgent {
     try {
       result = await this.container.run(spec);
     } catch (error) {
+      if (isExecutionAdmissionRefusal(error)) throw error;
       return this.containerFailure(error, request.signal, startedAt, spec.env);
     }
     const provenance = workerProvenance(result.stderr);
@@ -171,7 +174,7 @@ export class WorkerRouterAdapter implements ImplementationAgent {
         diagnostics: [`${WORKER_ROUTER_ERROR_CODE.BASE_ANCESTRY_FAILED}: ${ancestry.detail}`, ...diagnostics, ...ancestry.diagnostics],
       };
     }
-    const published = await this.publishHead(request.signal, cwd, head, branch);
+    const published = await this.publishHead(request.signal, cwd, head, branch, request.beforePublish);
     if (!published.ok) {
       const durationMs = elapsed(startedAt);
       if (published.cancelled) return failure(WORKER_ROUTER_ERROR_CODE.CANCELLED, 'Worker router publication was cancelled.', durationMs);
@@ -183,7 +186,7 @@ export class WorkerRouterAdapter implements ImplementationAgent {
     return { exitStatus: 'success', summary: 'Worker router completed implementation inside the container boundary and Conductor published the exact committed HEAD.', headSha: head, telemetry: providerTelemetry({ provider: WORKER_ROUTER_PROVIDER }), ...(diagnostics.length === 0 ? {} : { diagnostics }), durationMs: elapsed(startedAt) };
   }
 
-  private containerSpec(image: string, cwd: string, task: string, signal: AbortSignal | undefined): WorkerContainerSpec {
+  private containerSpec(image: string, cwd: string, task: string, signal: AbortSignal | undefined, beforeExecution: (() => void) | undefined): WorkerContainerSpec {
     return {
       image,
       entrypoint: this.executable,
@@ -195,6 +198,7 @@ export class WorkerRouterAdapter implements ImplementationAgent {
       stdin: task,
       timeoutMs: this.timeoutMs,
       ...(signal === undefined ? {} : { signal }),
+      ...(beforeExecution === undefined ? {} : { beforeExecution }),
     };
   }
 
@@ -265,12 +269,28 @@ export class WorkerRouterAdapter implements ImplementationAgent {
     cwd: string,
     head: string,
     branch: string,
+    beforePublish: (() => void) | undefined,
   ): Promise<{ readonly ok: true } | { readonly ok: false; readonly cancelled: boolean; readonly detail: string; readonly diagnostics: string[] }> {
+    if (beforePublish === undefined) {
+      return {
+        ok: false, cancelled: false,
+        detail: 'A synchronous pre-publication authority check is required.', diagnostics: [],
+      };
+    }
+    try {
+      beforePublish();
+    } catch (error) {
+      if (isExecutionAdmissionRefusal(error)) throw error;
+      return {
+        ok: false, cancelled: false,
+        detail: `Pre-publication authority check rejected: ${boundedMessage(error)}`, diagnostics: [],
+      };
+    }
     try {
       const result = await this.runner.run(
         'git',
         ['push', '--porcelain', 'origin', `${head}:refs/heads/${branch}`],
-        this.options(signal, cwd, ''),
+        { ...this.options(signal, cwd, ''), beforeSpawn: beforePublish },
       );
       if (result.exitCode === 0) return { ok: true };
       return {
@@ -280,6 +300,7 @@ export class WorkerRouterAdapter implements ImplementationAgent {
         diagnostics: boundedDiagnostics(result.stderr, result.stdout, undefined),
       };
     } catch (error) {
+      if (isExecutionAdmissionRefusal(error)) throw error;
       const code = errorCode(error);
       if (isAborted(signal) || code === 'ABORT_ERR') {
         return { ok: false, cancelled: true, detail: 'git push was cancelled.', diagnostics: [] };

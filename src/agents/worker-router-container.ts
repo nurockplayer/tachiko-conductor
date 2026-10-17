@@ -17,12 +17,21 @@
  * `.git/` repositories are rejected so the writable worktree mount cannot
  * expose an entire common Git tree.
  *
+ * Docker commands use the trusted operator's CLI executable and the selected
+ * PATH/HOME/DOCKER_CONFIG/DOCKER_CONTEXT/DOCKER_HOST/TLS controls captured at
+ * runtime construction. Worker values are isolated to create's child env and
+ * absent from argv; the container HOME remains the fixed /root. Remote daemon,
+ * SSH-agent, proxy and custom credential-helper configurations are not qualified.
+ * Docker configuration itself may contain authentication or proxy material.
+ *
  * Failure/cancel/timeout cleanup must prove the exact container is absent or
  * terminal before returning; when that proof is unavailable the boundary fails
  * closed with a containment error instead of the ordinary worker failure.
  */
 import { existsSync, lstatSync, readFileSync } from 'node:fs';
 import path from 'node:path';
+
+import { ExecutionAdmissionRefusal, isExecutionAdmissionRefusal } from '../adapters/agent.js';
 
 import { NodeProcessRunner, type ProcessRunner } from '../github/transport.js';
 
@@ -92,6 +101,8 @@ export interface WorkerContainerSpec {
   readonly stdin: string;
   readonly timeoutMs: number;
   readonly signal?: AbortSignal;
+  /** Host-only check forwarded to the actual Docker create/start spawn boundary. */
+  readonly beforeExecution?: () => void;
 }
 
 export interface WorkerContainerInspection {
@@ -263,6 +274,8 @@ export interface DockerWorkerContainerRuntimeOptions {
   readonly docker?: string;
   /** Bound for lifecycle control calls; never the worker run itself. */
   readonly controlTimeoutMs?: number;
+  /** Host environment source; selected control keys are captured once. */
+  readonly env?: NodeJS.ProcessEnv;
 }
 
 /** Docker CLI implementation. Every lifecycle call carries the exact ID. */
@@ -270,11 +283,18 @@ export class DockerWorkerContainerRuntime implements WorkerContainerRuntime {
   private readonly runner: ProcessRunner;
   private readonly docker: string;
   private readonly controlTimeoutMs: number;
+  private readonly controlEnv: NodeJS.ProcessEnv;
+  private readonly controlKeys = new Set(['PATH', 'HOME', 'DOCKER_CONFIG', 'DOCKER_CONTEXT', 'DOCKER_HOST', 'DOCKER_TLS', 'DOCKER_TLS_VERIFY', 'DOCKER_CERT_PATH']);
 
   constructor(options: DockerWorkerContainerRuntimeOptions = {}) {
     this.runner = options.runner ?? new NodeProcessRunner();
     this.docker = options.docker ?? 'docker';
     this.controlTimeoutMs = options.controlTimeoutMs ?? 30_000;
+    const source = options.env ?? process.env;
+    this.controlEnv = Object.freeze(Object.fromEntries(
+      ['PATH', 'HOME', 'DOCKER_CONFIG', 'DOCKER_CONTEXT', 'DOCKER_HOST', 'DOCKER_TLS', 'DOCKER_TLS_VERIFY', 'DOCKER_CERT_PATH']
+        .flatMap((key) => typeof source[key] === 'string' ? [[key, source[key]!]] : []),
+    ));
   }
 
   async create(spec: WorkerContainerSpec): Promise<string> {
@@ -288,14 +308,28 @@ export class DockerWorkerContainerRuntime implements WorkerContainerRuntime {
       '--workdir',
       spec.workdir,
     ];
+    const createEnv: NodeJS.ProcessEnv = { ...this.controlEnv };
     for (const [key, value] of Object.entries(spec.env).sort(([a], [b]) => a.localeCompare(b))) {
-      args.push('--env', `${key}=${value}`);
+      if (key === 'HOME') {
+        if (value !== WORKER_ROUTER_CONTAINER_HOME) throw new WorkerRouterContainerError(WORKER_ROUTER_CONTAINER_ERROR_CODE.CREATE_FAILED, 'Container HOME must remain the fixed /root value.');
+        args.push('--env', `HOME=${WORKER_ROUTER_CONTAINER_HOME}`);
+        continue;
+      }
+      if (this.controlKeys.has(key)) throw new WorkerRouterContainerError(WORKER_ROUTER_CONTAINER_ERROR_CODE.CREATE_FAILED, `Worker environment key ${key} collides with Docker host control configuration.`);
+      if (value === '') continue;
+      args.push('--env', key);
+      createEnv[key] = value;
     }
     for (const mount of spec.mounts) {
       args.push('--volume', `${mount.host}:${mount.container}${mount.mode === 'ro' ? ':ro' : ''}`);
     }
     args.push(spec.image, spec.entrypoint, ...spec.args);
-    const result = await this.control(args, spec.signal);
+    const result = await this.execute(args, {
+      timeoutMs: this.controlTimeoutMs,
+      env: createEnv,
+      ...(spec.signal === undefined ? {} : { signal: spec.signal }),
+      ...(spec.beforeExecution === undefined ? {} : { beforeSpawn: spec.beforeExecution }),
+    });
     if (result.exitCode !== 0) {
       throw new WorkerRouterContainerError(
         WORKER_ROUTER_CONTAINER_ERROR_CODE.CREATE_FAILED,
@@ -319,8 +353,10 @@ export class DockerWorkerContainerRuntime implements WorkerContainerRuntime {
     // and the transcript comes from `logs` once terminal state is proven.
     await this.execute(['start', '--attach', '--interactive', id], {
       timeoutMs: spec.timeoutMs,
+      env: this.controlEnv,
       stdin: spec.stdin,
       ...(spec.signal === undefined ? {} : { signal: spec.signal }),
+      ...(spec.beforeExecution === undefined ? {} : { beforeSpawn: spec.beforeExecution }),
     });
   }
 
@@ -413,21 +449,29 @@ export class DockerWorkerContainerRuntime implements WorkerContainerRuntime {
     );
   }
 
-  private async control(args: readonly string[], signal?: AbortSignal) {
-    return await this.execute(args, { timeoutMs: this.controlTimeoutMs, ...(signal === undefined ? {} : { signal }) });
+  private async control(args: readonly string[], signal?: AbortSignal, beforeSpawn?: () => void) {
+    return await this.execute(args, {
+      timeoutMs: this.controlTimeoutMs,
+      env: this.controlEnv,
+      ...(signal === undefined ? {} : { signal }),
+      ...(beforeSpawn === undefined ? {} : { beforeSpawn }),
+    });
   }
 
   private async execute(
     args: readonly string[],
-    options: { timeoutMs: number; stdin?: string; signal?: AbortSignal },
+    options: { timeoutMs: number; stdin?: string; signal?: AbortSignal; beforeSpawn?: () => void; env?: NodeJS.ProcessEnv },
   ) {
     try {
       return await this.runner.run(this.docker, args, {
         timeoutMs: options.timeoutMs,
+        ...(options.env === undefined ? {} : { env: options.env }),
         ...(options.stdin === undefined ? {} : { stdin: options.stdin }),
         ...(options.signal === undefined ? {} : { signal: options.signal }),
+        ...(options.beforeSpawn === undefined ? {} : { beforeSpawn: options.beforeSpawn }),
       });
     } catch (error) {
+      if (isExecutionAdmissionRefusal(error)) throw error;
       const code = errorCode(error);
       if (isAborted(options.signal) || code === 'ABORT_ERR') {
         throw new WorkerRouterContainerError(WORKER_ROUTER_CONTAINER_ERROR_CODE.CANCELLED, 'The worker container was cancelled.', error);
@@ -492,6 +536,13 @@ export class ContainerWorkerBoundary implements ContainerWorkerExecution {
     } catch (error) {
       const cleanup = await this.proveQuiescent(id);
       if (!cleanup.quiescent) {
+        if (isExecutionAdmissionRefusal(error)) {
+          throw new ExecutionAdmissionRefusal(
+            `${error.message} Exact-container cleanup remains uncertain: ${cleanup.detail}`,
+            error.runSuperseded,
+            { cause: error, authorityUnknown: error.authorityUnknown },
+          );
+        }
         // Containment takes precedence over the ordinary worker failure: never
         // return while the exact container may still be alive and mutating.
         throw new WorkerRouterContainerError(
@@ -500,6 +551,7 @@ export class ContainerWorkerBoundary implements ContainerWorkerExecution {
           error,
         );
       }
+      if (isExecutionAdmissionRefusal(error)) throw error;
       if (isAborted(spec.signal)) {
         throw new WorkerRouterContainerError(WORKER_ROUTER_CONTAINER_ERROR_CODE.CANCELLED, 'The worker container was cancelled.', error);
       }

@@ -1,0 +1,50 @@
+name: Research
+description: Read-only investigation, evidence gathering, comparison, or spike without repository writer authority.
+title: "[Research] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Research is read-only with respect to implementation dispatch. If the result authorizes code changes, open or revise a separate implementation/repair Issue afterward.
+  - type: dropdown
+    id: kind
+    attributes:
+      label: Kind
+      options:
+        - research
+    validations:
+      required: true
+  - type: textarea
+    id: question
+    attributes:
+      label: Research question
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence required
+      description: Sources, runtime observations, measurements, or artifacts required before concluding.
+    validations:
+      required: true
+  - type: textarea
+    id: deliverable
+    attributes:
+      label: Deliverable
+      description: The bounded output expected from the research.
+    validations:
+      required: true
+  - type: textarea
+    id: constraints
+    attributes:
+      label: Constraints
+      description: Read-only boundaries and explicit non-goals.
+    validations:
+      required: true
+  - type: textarea
+    id: stop_conditions
+    attributes:
+      label: Stop conditions
+      description: Conditions requiring a decision/escalation rather than unsupported inference.
+    validations:
+      required: true

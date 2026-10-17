@@ -169,9 +169,16 @@ local durable runs. A closed Issue, open PR, non-terminal Run, ambiguous claim,
 or missing/mismatched claimed Run is not eligible. On restart it resumes the
 same claimed Run; an expired lease is never permission to create a second one.
 `tachiko dispatch serve` is the Phase-1 continuous serial driver. It holds the
-same-host lock for its lifetime, reconciles a terminal/merged run immediately,
-and then moves to the next executable queue row when the authoritative queue
-and durable Run permit it. At an active, parked, or empty boundary it only
+same-host lock for its lifetime and reconciles settled workflow output immediately.
+A retained queue row permits advancement only after exact live merged PR proof,
+durable `MERGED` publication, and successful admission/receipt release. An exact
+open PR remains a model-free wait. Unresolved or parked `FAILED`, `NEEDS_HUMAN`,
+and `WAITING_DEPENDENCY` owners block advancement even if their queue row
+disappears or changes route. Before new work or a claimed workflow resumes, all
+prior dispatch owners in the repository require exact released lane/receipt
+proof plus completed delivery or explicit task disposition. Ordinary `FAILED`
+release and `--stopped` recovery alone leave the task unresolved; missing,
+malformed, foreign, or stale proof holds the queue. At an active, parked, or empty boundary it only
 sleeps and rereads authoritative state; that idle path starts zero model turns.
 `--max-cycles` is an explicit bounded operational/test mode, and
 `--idle-poll-ms` controls the deterministic model-free safety poll. A local
@@ -180,15 +187,55 @@ driver; it changes no queue, Run, or provider state. The driver immediately
 reconciles on that wake, and a missing/unchanged wake always falls back to the
 bounded model-free safety poll.
 
+Completed rows remain safe across runtime-comment replacement and restart: the
+existing durable Run binds claim, profile, task-shape revision, PR, HEAD, branch,
+and base identity, and delivery reconciliation rechecks those identities. A
+closed live Issue is required to skip the same authority; reopening requires an
+explicit new task-shape revision before fresh work can start. Historical or
+current unresolved ownership blocks later rows. Explicit cancellation records
+`workDisposition: cancelled` in the existing final released receipt, bound to
+terminal cancellation history. To retire other work intentionally, use
+`tachiko run admission recover <id> --generation <n> --stopped --retire-work`.
+This requires exact Run/lane/receipt proof and records `workDisposition: retired`;
+`--stopped` alone only attests quiescence. An already released legacy receipt
+can receive that disposition through the same explicit, exact-generation reentry
+(using the released generation minus one). Neither disposition changes a failed
+Run into delivery. Repository names compare case-insensitively for claim and
+historical replay checks. The same authority cannot respawn disposed work.
+A fresh task-shape revision may reissue terminal `FAILED` or `MERGED` work;
+released nonterminal work requires an explicit terminal decision (such as the
+existing cancellation choice) before reissue, and holds before a new claim is
+written until that decision exists.
+Automatic merged delivery additionally requires the final tokenless released
+receipt at the exact lane generation, with matching Run/claim/mission/repository/
+Issue/workspace identity and `workflow_settled` provenance. The manual legacy
+merge-retry exception for an absent receipt does not authorize automatic work.
+A receipt or registry release
+failure retains the claim for exact retry before another writer is admitted.
+This is the bounded delivery-reconciliation portion of #128. Automatic merge
+requests, independent review qualification, and end-to-end #128/#91 acceptance
+remain separate obligations; this change does not activate a production queue.
+
+Receipt compatibility is a source-only #104 consideration: `workDisposition` is
+optional in the existing version-1 record. Old records remain readable, but
+missing disposition stays unknown for failed/stopped work. Older runtimes that
+do not recognize the new field reject such records; rollback is fail-closed and
+must retain the evidence. This is not old-runtime compatibility or native
+release qualification.
+
 ## Supervised dispatch driver (macOS)
 
 `tachiko dispatch once` now takes a small local lock before reading GitHub. It
 complements (but never replaces) the GitHub claim lease: a concurrent same-host
 invocation returns `{ "outcome": "already_running" }` without changing GitHub
-or starting a second executor. The default lock lives outside the repository at
-`~/.tachiko-conductor/dispatch/once.lock`; override it only with an absolute
-`TACHIKO_DISPATCH_LOCK_PATH`. A malformed or live lock fails closed; a lock for
-a provably absent PID is retried once.
+or starting a second executor. The singleton lock and short admission lock
+both live outside the repository under the effective OS account's physical
+home at `~/.tachiko-conductor/dispatch/once.lock` and
+`~/.tachiko-conductor/dispatch/once.lock.admission`. The optional
+`TACHIKO_DISPATCH_LOCK_PATH` and `TACHIKO_DISPATCH_ADMISSION_LOCK_PATH` values
+may alias those canonical physical paths; divergent values fail closed. A
+malformed or live lock fails closed; a lock for a provably absent PID is
+retried once.
 
 For macOS, use `launchd` to supervise the continuous driver. First create a
 private, absolute-path wrapper that supplies the explicitly selected dispatch,
@@ -518,13 +565,22 @@ non-zero exit code.
 require result payloads supplied by adapters; `run transition` rejects them
 explicitly. Drive those through the domain API (`applyTransition`).
 
+`run transition <id> merged` requires a direct live read of the Run's persisted
+pull request and exact head/branch/base identity. It settles only a
+`workflow_settled` parked admission; retries reconcile the matching private
+generation receipt under the dispatch and registry locks.
+
 ## Container-owned worker-router execution
 
 `WorkerRouterAdapter` is the one executor placed behind the container boundary
 proven in issue #73. The untrusted worker runs only inside a digest-pinned
 container; the host worker path is never executed and there is no fallback.
+This adapter is not currently source-qualified for governed publication, so
+fresh and continued governed invocations are held before any worker or host
+publication operation. Its execution and host publication path remains
+available to ungoverned callers.
 
-The adapter keeps the authority split unchanged. It runs `guard(before)`, then
+For an ungoverned call, the adapter runs `guard(before)`, then
 creates and starts the container, forwards the task on stdin, waits for the
 exact container terminal state, and only then runs `guard(after)`, reads the
 exact HEAD, proves base ancestry, and publishes that exact HEAD from the host.
@@ -656,6 +712,23 @@ committed raw run bytes: a missing, stale, malformed, or digest-mismatched
 sidecar is unknown/unlinked rather than an authority to reconstruct a run.
 Use `tachiko run projections rebuild` only to backfill sidecars from runs that
 `JsonFileStore` has successfully validated.
+
+## Oracle review policy
+
+The exported Oracle reviewer applies the versioned provider-neutral R1–R5 risk
+floor before transport. It requires trusted, complete candidate evidence and a
+qualified binding whose separate transport observation verifies the model,
+effort, exact HEAD/base, associated pull request, and complete changed-path
+coverage. Missing or mismatched evidence holds the review without approval.
+Floors R1–R3 currently bind to selected Oracle semantic tier R3 at Medium;
+R4 uses High and R5 uses Extra High with a recorded critical reason. Legacy
+receipts remain readable but do not contain policy qualification.
+
+This module policy does not activate a native production Oracle factory or
+unattended browser transport. Native dispatch, durable pending receipts, and
+transport qualification remain separate work. The selected Medium/High/Extra
+High effort is an observed configuration; account quota economics are not
+established here.
 
 ## Layout
 

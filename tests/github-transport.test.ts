@@ -1,4 +1,7 @@
 import assert from 'node:assert/strict';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { describe, it } from 'node:test';
 
 import { GitHubLiveStateError } from '../src/github/errors.js';
@@ -175,6 +178,29 @@ describe('GhCliTransport', () => {
 });
 
 describe('NodeProcessRunner', () => {
+  it('runs beforeSpawn immediately before child creation and rejects without spawning when it throws', async () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-before-spawn-'));
+    try {
+      const ready = path.join(directory, 'ready');
+      const launched = path.join(directory, 'launched');
+      const runner = new NodeProcessRunner();
+      const result = await runner.run(process.execPath, ['-e', `const fs=require('node:fs'); if (!fs.existsSync(${JSON.stringify(ready)})) process.exit(31); process.stdout.write('spawned')`], {
+        timeoutMs: 1_000,
+        beforeSpawn: () => writeFileSync(ready, 'ready'),
+      });
+      assert.equal(result.stdout, 'spawned');
+      assert.equal(readFileSync(ready, 'utf8'), 'ready');
+
+      await assert.rejects(() => runner.run(process.execPath, ['-e', `require('node:fs').writeFileSync(${JSON.stringify(launched)}, 'yes')`], {
+        timeoutMs: 1_000,
+        beforeSpawn: () => { throw new Error('host check rejected'); },
+      }), /host check rejected/);
+      assert.equal(existsSync(launched), false);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   it('waits for child settlement after stdin EPIPE instead of leaving an orphan', async () => {
     const result = await new NodeProcessRunner().run(
       process.execPath,
