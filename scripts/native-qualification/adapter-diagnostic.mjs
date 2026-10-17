@@ -7,12 +7,12 @@ import { lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathS
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 
-const [candidate, evidenceRoot, fixtureRoot, git, mode] = process.argv.slice(2);
-assert.equal(process.argv.length, 7);
-assert.ok(['control', 'captured'].includes(mode));
+const [candidate, evidenceRoot, fixtureRoot, git] = process.argv.slice(2);
+assert.equal(process.argv.length, 6);
+const mode = 'captured';
 for (const value of [candidate, evidenceRoot, fixtureRoot, git]) assert.ok(path.isAbsolute(value));
 assert.equal(realpathSync(process.cwd()), realpathSync(candidate));
-if (mode === 'control') mkdirSync(evidenceRoot, { mode: 0o700 });
+mkdirSync(evidenceRoot, { mode: 0o700 });
 assert.ok(lstatSync(evidenceRoot).isDirectory() && !lstatSync(evidenceRoot).isSymbolicLink());
 const storeRoot = path.join(evidenceRoot, 'store');
 const hash = (bytes) => createHash('sha256').update(bytes).digest('hex');
@@ -41,14 +41,30 @@ function observeChild({ process: child }) {
   let matches = false;
   const record = (phase, detail = {}) => {
     if (observation.events.length >= 6) { observation.bounded = false; return; }
-    observation.events.push({ phase, monotonicMs: Number(process.hrtime.bigint() - observerStarted) / 1e6, ...detail });
+    observation.events.push({ phase, utc: new Date().toISOString(), monotonicMs: Number(process.hrtime.bigint() - observerStarted) / 1e6, ...detail });
     persistObservation();
   };
   child.once('spawn', () => {
     if (child.spawnfile !== '/usr/bin/sandbox-exec') return;
     matches = true;
     selected += 1;
-    record('spawn');
+    observation.targetPid = child.pid;
+    observation.parentPid = process.pid;
+    record('spawn', { pid: child.pid, parentPid: process.pid });
+    try {
+      assert.ok(Number.isInteger(child.pid) && child.pid > 0);
+      // Root-authorized copy of only the actual product-generated -p argument.
+      const args = child.spawnargs;
+      assert.ok(args[0] === '/usr/bin/sandbox-exec' && args[1] === '-p' && typeof args[2] === 'string');
+      const bytes = Buffer.from(args[2], 'utf8');
+      assert.ok(bytes.length > 0 && bytes.length <= 128 * 1024);
+      writeFileSync(path.join(evidenceRoot, 'actual-profile.sb'), bytes, { mode: 0o600 });
+      observation.profile = { status: 'CAPTURED', bytes: bytes.length, sha256: hash(bytes) };
+    } catch {
+      observation.profile = { status: 'UNKNOWN', limitation: 'actual_profile_capture_unavailable_or_oversize' };
+      observation.bounded = false;
+    }
+    persistObservation();
   });
   for (const phase of ['exit', 'close']) child.once(phase, (code, signal) => {
     if (matches) record(phase, { code, signal });
@@ -108,56 +124,42 @@ async function main() {
   assert.equal(process.platform, 'darwin');
   const { ConfiguredLocalValidationAdapter } = await import(pathToFileURL(path.join(candidate, 'src/validation/local-command.ts')).href);
   const { FileToolOutputStore, readToolOutput } = await import(pathToFileURL(path.join(candidate, 'src/evidence/tool-output.ts')).href);
-  if (mode === 'control') {
-    // Match the original seatbelt test's fresh request(), two commits and package bytes.
-    const workspacePath = mkdtempSync(path.join(fixtureRoot, 'tachiko-validation-'));
-    function fixtureGit(args) {
-      const argv = ['-C', workspacePath, ...args];
-      const result = spawnSync(git, argv, { timeout: 10_000, maxBuffer: 1024 * 1024 });
-      setup.push({ argv: [git, ...argv], exitCode: result.status, signal: result.signal,
-        error: result.error?.message ?? null, stdout: raw(result.stdout), stderr: raw(result.stderr) });
-      save('fixture.json', { setup, fixture });
-      assert.equal(result.status, 0, 'fixture Git command must complete');
-      return result.stdout.toString('utf8').trim();
-    }
-    for (const args of [['init'], ['config', 'user.email', 'validation@example.test'], ['config', 'user.name', 'Validation'],
-      ['add', '.'], ['commit', '-m', 'initial']]) {
-      if (args[0] === 'add') writeFileSync(path.join(workspacePath, 'README.md'), 'validation\n');
-      fixtureGit(args);
-    }
-    fixtureGit(['rev-parse', 'HEAD']);
-    fixtureGit(['remote', 'add', 'origin', 'https://github.com/acme/widgets.git']);
-    const packageBytes = JSON.stringify({ packageManager: 'pnpm@10.34.5' });
-    writeFileSync(path.join(workspacePath, 'package.json'), packageBytes);
-    fixtureGit(['add', 'package.json']);
-    fixtureGit(['commit', '-m', 'pin package manager']);
-    const headSha = fixtureGit(['rev-parse', 'HEAD']);
-    const pnpm = path.resolve(candidate, 'node_modules/.bin/pnpm');
-    const owned = { target: { kind: 'issue', owner: 'acme', repo: 'widgets', issueNumber: 42 }, headSha, workspacePath };
-    const configuration = { revision: 'darwin-real-toolchain-v1', nodeProgram: process.execPath, pnpmProgram: pnpm,
-      commands: [{ argv: [pnpm, '--version'], timeoutMs: 30_000 }] };
-    fixture = { request: owned, configuration, packageBytes, packageSha256: hash(Buffer.from(packageBytes)),
-      node: { physicalPath: realpathSync(process.execPath), sha256: hash(readFileSync(process.execPath)) },
-      pnpm: { physicalPath: realpathSync(pnpm), sha256: hash(readFileSync(pnpm)) } };
+  // Match the original seatbelt test's fresh request(), two commits and package bytes.
+  const workspacePath = mkdtempSync(path.join(fixtureRoot, 'tachiko-validation-'));
+  function fixtureGit(args) {
+    const argv = ['-C', workspacePath, ...args];
+    const result = spawnSync(git, argv, { timeout: 10_000, maxBuffer: 1024 * 1024 });
+    setup.push({ argv: [git, ...argv], exitCode: result.status, signal: result.signal,
+      error: result.error?.message ?? null, stdout: raw(result.stdout), stderr: raw(result.stderr) });
     save('fixture.json', { setup, fixture });
-
-    const startedControl = new Date().toISOString();
-    const inputProof = verifyFixture(owned, configuration, fixture);
-    const control = await new ConfiguredLocalValidationAdapter(configuration).validate(owned);
-    save('control.json', { startedAt: startedControl, endedAt: new Date().toISOString(), inputProof, evidence: control });
-    assert.equal(control.commands.length, 1);
-    assert.ok(['passed', 'failed'].includes(control.commands[0].outcome), 'stop on unavailable/timeout control');
-    assert.ok(control.commands[0].exitCode === null || Number.isFinite(control.commands[0].exitCode), 'retain numeric or null inner exit');
-    return;
+    assert.equal(result.status, 0, 'fixture Git command must complete');
+    return result.stdout.toString('utf8').trim();
   }
+  for (const args of [['init'], ['config', 'user.email', 'validation@example.test'], ['config', 'user.name', 'Validation'],
+    ['add', '.'], ['commit', '-m', 'initial']]) {
+    if (args[0] === 'add') writeFileSync(path.join(workspacePath, 'README.md'), 'validation\n');
+    fixtureGit(args);
+  }
+  fixtureGit(['rev-parse', 'HEAD']);
+  fixtureGit(['remote', 'add', 'origin', 'https://github.com/acme/widgets.git']);
+  const packageBytes = JSON.stringify({ packageManager: 'pnpm@10.34.5' });
+  writeFileSync(path.join(workspacePath, 'package.json'), packageBytes);
+  fixtureGit(['add', 'package.json']);
+  fixtureGit(['commit', '-m', 'pin package manager']);
+  const headSha = fixtureGit(['rev-parse', 'HEAD']);
+  const pnpm = path.resolve(candidate, 'node_modules/.bin/pnpm');
+  const owned = { target: { kind: 'issue', owner: 'acme', repo: 'widgets', issueNumber: 42 }, headSha, workspacePath };
+  const configuration = { revision: 'darwin-real-toolchain-v1', nodeProgram: process.execPath, pnpmProgram: pnpm,
+    commands: [{ argv: [pnpm, '--version'], timeoutMs: 30_000 }] };
+  fixture = { request: owned, configuration, packageBytes, packageSha256: hash(Buffer.from(packageBytes)),
+    node: { physicalPath: realpathSync(process.execPath), sha256: hash(readFileSync(process.execPath)) },
+    pnpm: { physicalPath: realpathSync(pnpm), sha256: hash(readFileSync(pnpm)) } };
+  save('fixture.json', { setup, fixture });
 
-  const { fixture: storedFixture } = JSON.parse(readFileSync(path.join(evidenceRoot, 'fixture.json'), 'utf8'));
-  const { configuration, request: owned } = storedFixture;
-  const { evidence: control } = JSON.parse(readFileSync(path.join(evidenceRoot, 'control.json'), 'utf8'));
   mkdirSync(storeRoot, { mode: 0o700 });
   const store = new FileToolOutputStore(storeRoot, { capacity: 1 });
   const startedCaptured = new Date().toISOString();
-  const inputProof = verifyFixture(owned, configuration, storedFixture);
+  const inputProof = verifyFixture(owned, configuration, fixture);
   const captured = await new ConfiguredLocalValidationAdapter({ ...configuration,
     commands: [{ ...configuration.commands[0], captureOutput: true }], outputStore: store,
   }).validate(owned);
@@ -173,10 +175,8 @@ async function main() {
   const ranges = ['stdout', 'stderr'].map((channel) => readToolOutput(command.output, store, { channel, offset: 0, length: 16_384 }));
   save('captured.json', { startedAt: startedCaptured, endedAt: new Date().toISOString(), inputProof, evidence: captured,
     ranges, rawByteProof: 'original store files plus store-manifest.json; ranges are decoded text only' });
-  const first = control.commands[0];
-  save('comparison.json', { complete: true, controlStatus: control.status, capturedStatus: captured.status,
-    sameStatus: control.status === captured.status, sameCommandOutcome: first.outcome === command.outcome,
-    sameExitCode: first.exitCode === command.exitCode, acceptanceCredit: false });
+  save('collection.json', { complete: true, status: captured.status, outcome: command.outcome,
+    exitCode: command.exitCode, acceptanceCredit: false });
 }
 
 try {
@@ -188,7 +188,7 @@ try {
   childChannel.unsubscribe(observeChild);
   persistObservation();
   if (observationWriteFailed || !observation.bounded) process.exitCode = 1;
-  try { if (mode === 'captured') inventoryStore(); }
+  try { inventoryStore(); }
   catch (error) {
     save('error.json', { error: String(error), stack: error.stack, complete: false });
     process.exitCode = 1;

@@ -38,7 +38,7 @@ jobs:
         with:
           node-version: 24.19.0
 
-      - name: Run bounded adapter pair diagnostics and encrypt private evidence
+      - name: Run one captured crash diagnostic and encrypt private evidence
         shell: bash
         run: |
           set -eu

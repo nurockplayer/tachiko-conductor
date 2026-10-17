@@ -13,6 +13,7 @@ import json
 import os
 import pathlib
 import platform
+import pwd
 import re
 import selectors
 import shutil
@@ -63,7 +64,7 @@ def write_summary(path, value):
         mode = value.get('mode', 'native_qualification')
         value = {'schema_version': 1, 'candidate': CANDIDATE, 'tree': TREE, 'base': BASE,
                  'mode': mode, 'native_gates': 'UNKNOWN' if mode == 'native_qualification' else 'NOT_RUN',
-                 'selection': 'adapter_pair_only' if mode == 'diagnostics_only' else None,
+                 'selection': 'captured_crash_only' if mode == 'diagnostics_only' else None,
                  'status': {'provider_preflight_only': 'PREFLIGHT_FAIL',
                             'diagnostics_only': 'DIAGNOSTIC_FAIL'}.get(mode, 'FAIL'),
                  'reason': 'summary_oversize', 'evidence_encrypted': False,
@@ -116,7 +117,7 @@ class Qualification:
         self.failure_status = 'DIAGNOSTIC_FAIL' if diagnostics_only else 'PREFLIGHT_FAIL' if preflight_only else 'FAIL'
         self.success_status = 'DIAGNOSTIC_COMPLETE' if diagnostics_only else 'PREFLIGHT_PASS' if preflight_only else 'PASS'
         self.git_capability = None
-        self.diagnostics = {'selection': 'adapter_pair_only', 'node': None, 'complete': False} if diagnostics_only else None
+        self.diagnostics = {'selection': 'captured_crash_only', 'node': None, 'crash': None, 'complete': False} if diagnostics_only else None
         self.diagnostic_files = []
         self.started = time.monotonic()
         self.runner_temp = pathlib.Path(os.environ['RUNNER_TEMP']).resolve(strict=True)
@@ -128,7 +129,7 @@ class Qualification:
         self.public.mkdir(mode=0o700, exist_ok=False)
         write_summary(self.public / 'summary.json', {'schema_version': 1, 'candidate': CANDIDATE, 'tree': TREE,
                       'base': BASE, 'mode': self.mode, 'native_gates': 'NOT_RUN',
-                      'selection': 'adapter_pair_only' if diagnostics_only else None,
+                      'selection': 'captured_crash_only' if diagnostics_only else None,
                       'status': self.failure_status, 'reason': 'collector_initializing',
                       'evidence_encrypted': False, 'production_qualification': False})
         self.logs = self.private / 'logs'
@@ -615,30 +616,199 @@ class Qualification:
             raise RuntimeError('git_required_syntax_local_object_failed')
 
     def diagnose(self):
-        # The completed Python selection remains historical; only this adapter pair runs.
+        # One captured adapter call, with no control, Python selection or retry.
         write_json(self.private / 'diagnostics.json', self.diagnostics)
         deadline = time.monotonic() + 180
-        for mode in ['control', 'captured']:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise RuntimeError('node_diagnostic_total_bound')
-            record, _output = self.run('node-adapter-diagnostic-' + mode,
-                [self.node, '--import', 'tsx', self.infra / 'adapter-diagnostic.mjs', self.candidate,
-                 self.private / 'node-diagnostic', self.fixture, self.git, mode], timeout=remaining, required=False)
-            if record['exit_code'] != 0 or not record['observed_root'] or not record['observed_family_complete'] \
-                    or not record['original_group_absent'] or not record['raw_capture_complete'] \
-                    or record['timed_out'] or time.monotonic() > deadline:
-                raise RuntimeError('node_diagnostic_infrastructure_incomplete')
-        self.diagnostics['node'] = json.loads((self.private / 'node-diagnostic/comparison.json').read_text())
+        limitations = []
+        directories = [pathlib.Path('/Library/Logs/DiagnosticReports')]
+        try:
+            home = pathlib.Path(pwd.getpwuid(os.geteuid()).pw_dir).resolve(strict=True)
+            directories.insert(0, home / 'Library/Logs/DiagnosticReports')
+        except (OSError, KeyError):
+            limitations.append('account_report_directory_unknown')
+        baseline = {directory: self.crash_entries(directory, limitations) for directory in directories}
+        started = datetime.datetime.now(datetime.timezone.utc).timestamp()
+        record, _output = self.run('node-adapter-diagnostic-captured',
+            [self.node, '--import', 'tsx', self.infra / 'adapter-diagnostic.mjs', self.candidate,
+             self.private / 'node-diagnostic', self.fixture, self.git],
+            timeout=max(1, deadline - time.monotonic()), required=False)
+        if record['exit_code'] != 0 or not record['observed_root'] or not record['observed_family_complete'] \
+                or not record['original_group_absent'] or not record['raw_capture_complete'] \
+                or record['timed_out'] or time.monotonic() > deadline:
+            raise RuntimeError('node_diagnostic_infrastructure_incomplete')
+        self.diagnostics['node'] = json.loads((self.private / 'node-diagnostic/collection.json').read_text())
         if self.diagnostics['node'].get('complete') is not True:
-            raise RuntimeError('node_diagnostic_comparison_incomplete')
+            raise RuntimeError('node_diagnostic_collection_incomplete')
+        manifest = self.collect_crash_reports(baseline, limitations, started, deadline)
+        self.diagnostics['crash'] = {'status': manifest['status'], 'matched_reports': len(manifest['reports']),
+                                     'limitations': manifest['limitations'], 'cause': 'UNKNOWN',
+                                     'log_fallback': manifest['log_fallback']}
+        if time.monotonic() > deadline:
+            raise RuntimeError('node_diagnostic_total_bound')
         self.diagnostics['complete'] = True
         write_json(self.private / 'diagnostics.json', self.diagnostics)
+
+    def crash_entries(self, directory, limitations):
+        entries = {}
+        try:
+            if directory.resolve(strict=True) != directory or not directory.is_dir():
+                raise OSError('nonphysical_report_directory')
+            with os.scandir(directory) as listing:
+                for index, entry in enumerate(listing):
+                    if index >= 128:
+                        limitations.append('directory_entry_cap')
+                        break
+                    if entry.name.endswith(('.ips', '.crash')):
+                        info = entry.stat(follow_symlinks=False)
+                        if stat.S_ISREG(info.st_mode):
+                            entries[entry.name] = (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
+        except (OSError, RuntimeError):
+            limitations.append('report_directory_unavailable_or_nonphysical')
+            return None
+        return entries
+
+    def crash_time(self, value):
+        if not isinstance(value, str) or len(value) > 80:
+            raise ValueError('unfamiliar_crash_time')
+        try:
+            parsed = datetime.datetime.fromisoformat(value.replace('Z', '+00:00'))
+        except ValueError:
+            try:
+                parsed = datetime.datetime.strptime(value, '%Y-%m-%d %H:%M:%S.%f %z')
+            except ValueError:
+                parsed = datetime.datetime.strptime(value, '%Y-%m-%d %H:%M:%S %z')
+        if parsed.utcoffset() is None:
+            raise ValueError('crash_timezone_missing')
+        return parsed.timestamp()
+
+    def crash_identity(self, raw, suffix):
+        text = raw.decode('utf-8', errors='strict')
+        if suffix == '.ips':
+            decoder = json.JSONDecoder()
+            first, end = decoder.raw_decode(text.lstrip())
+            rest = text.lstrip()[end:].strip()
+            body, tail = decoder.raw_decode(rest) if rest else (first, len(text.lstrip()))
+            if not isinstance(first, dict) or not isinstance(body, dict) or (rest and rest[tail:].strip()):
+                raise ValueError('unfamiliar_ips_tail')
+            return {'pid': body['pid'], 'parent_pid': body['parentPid'], 'image': body['procPath'],
+                    'time': self.crash_time(body.get('captureTime', first.get('timestamp')))}
+        def field(pattern):
+            values = re.findall(pattern, text, re.M)
+            if len(values) != 1:
+                raise ValueError('ambiguous_crash_field')
+            return values[0]
+        return {'pid': int(field(r'^Process:\s+[^\n]+\[(\d+)\]\s*$')),
+                'parent_pid': int(field(r'^Parent Process:\s+[^\n]+\[(\d+)\]\s*$')),
+                'image': field(r'^Path:\s+([^\n]+?)\s*$'),
+                'time': self.crash_time(field(r'^Date/Time:\s+([^\n]+?)\s*$'))}
+
+    def collect_crash_reports(self, baseline, limitations, started, deadline):
+        root = self.private / 'node-diagnostic'
+        manifest = {'status': 'UNKNOWN', 'reports': [], 'limitations': limitations,
+                    'log_fallback': {'status': 'NOT_RUN', 'collector_tool_identity': 'NOT_QUALIFIED'}}
+        observed = json.loads((root / 'captured-process.json').read_text())
+        fixture = json.loads((root / 'fixture.json').read_text())['fixture']
+        try:
+            pid, parent = observed['targetPid'], observed['parentPid']
+            if observed['status'] != 'OBSERVED' or type(pid) is not int or pid < 1 or type(parent) is not int or parent < 1:
+                raise ValueError('owned_identity_unknown')
+            spawn = self.crash_time(observed['events'][0]['utc'])
+            close = self.crash_time(observed['events'][-1]['utc'])
+            if close < spawn:
+                raise ValueError('owned_time_unknown')
+        except (KeyError, ValueError, TypeError):
+            limitations.append('owned_pid_or_time_unknown')
+            write_json(root / 'crash-collection.json', manifest)
+            return manifest
+        images = {'/usr/bin/sandbox-exec', '/usr/bin/env', '/bin/sh',
+                  fixture['node']['physicalPath'], fixture['pnpm']['physicalPath']}
+        until = min(time.monotonic() + 30, deadline)
+        examined = set()
+        read_bytes = 0
+        stop = False
+        while time.monotonic() < until and not stop:
+            for directory, before in baseline.items():
+                if before is None:
+                    continue
+                current = self.crash_entries(directory, limitations)
+                for name, identity in (current or {}).items():
+                    if time.monotonic() >= until:
+                        limitations.append('report_collection_window_expired')
+                        stop = True
+                        break
+                    key = (directory, name, identity)
+                    if before.get(name) == identity or key in examined or identity[3] / 1e9 < started - 1 \
+                            or not re.match(r'^(sandbox-exec|node|env|sh|pnpm)[_-]', name, re.I):
+                        continue
+                    if len(examined) >= 8 or identity[2] > 4 * 1024 ** 2 - read_bytes:
+                        limitations.append('candidate_read_count_or_byte_cap')
+                        stop = True
+                        break
+                    examined.add(key)
+                    try:
+                        descriptor = os.open(directory / name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+                        with os.fdopen(descriptor, 'rb') as stream:
+                            info = os.fstat(stream.fileno())
+                            if not stat.S_ISREG(info.st_mode) or (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns) != identity:
+                                raise ValueError('candidate_changed')
+                            raw = stream.read(info.st_size + 1)
+                            after = os.fstat(stream.fileno())
+                        read_bytes += len(raw)
+                        if len(raw) != info.st_size or (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns) != identity:
+                            raise ValueError('candidate_changed')
+                        proof = self.crash_identity(raw, pathlib.Path(name).suffix)
+                        if type(proof['pid']) is not int or type(proof['parent_pid']) is not int or proof['pid'] != pid:
+                            continue
+                        if not spawn - 1 <= proof['time'] <= close + 10:
+                            limitations.append('pid_matched_outside_invocation_window')
+                            continue
+                        if proof['parent_pid'] != parent or proof['image'] not in images:
+                            limitations.append('pid_time_matched_parent_or_image_incompatible')
+                            continue
+                        target = root / ('crash-report-' + str(len(manifest['reports']) + 1) + pathlib.Path(name).suffix)
+                        target.write_bytes(raw)
+                        manifest['reports'].append({'source': str(directory / name), 'file': target.name,
+                                                    'bytes': len(raw), 'sha256': digest(target), 'identity': proof})
+                        if len(manifest['reports']) >= 2:
+                            stop = True
+                            break
+                    except (OSError, ValueError, KeyError, TypeError, UnicodeError, RecursionError):
+                        limitations.append('candidate_unavailable_changed_or_unfamiliar')
+                if stop:
+                    break
+            if manifest['reports']:
+                break
+            remaining = until - time.monotonic()
+            if remaining > 0 and not stop:
+                time.sleep(min(1, remaining))
+        if not manifest['reports']:
+            limitations.append('no_owned_report_observed_in_bounded_window')
+            # Observe identity only; this does not qualify or execute /usr/bin/log.
+            try:
+                if deadline - time.monotonic() < 10:
+                    raise RuntimeError('identity_observation_budget_unavailable')
+                proof = self.system_file_identity('/usr/bin/log')
+                record, _output = self.run('log-collector-identity-observation',
+                    ['/usr/bin/codesign', '-dv', '--verbose=4', '/usr/bin/log'], timeout=10, required=False)
+                manifest['log_identity_observation'] = {'filesystem': proof,
+                    'status': 'OBSERVED' if record['exit_code'] == 0 else 'UNKNOWN',
+                    'receipt_label': 'log-collector-identity-observation'}
+                if record['exit_code'] != 0:
+                    limitations.append('collector_identity_observation_failed')
+            except (OSError, RuntimeError):
+                limitations.append('collector_identity_observation_unavailable')
+        manifest['limitations'] = sorted(set(limitations))
+        manifest['candidate_reads'] = len(examined)
+        manifest['candidate_bytes_read'] = read_bytes
+        manifest['status'] = 'MATCHED' if manifest['reports'] and not limitations else 'UNKNOWN'
+        write_json(root / 'crash-collection.json', manifest)
+        return manifest
 
     def diagnostic_archive_files(self):
         # Evidence only: never traverse fixtures, dependencies, child homes or caches.
         root = self.private / 'node-diagnostic'
-        patterns = [r'(?:fixture|control|captured|comparison|error|store-manifest|control-process|captured-process)\.json',
+        patterns = [r'(?:fixture|captured|collection|error|store-manifest|captured-process|crash-collection)\.json',
+                    r'actual-profile\.sb', r'crash-report-[12]\.(?:ips|crash)',
                     r'store/[0-9a-f-]{36}\.(?:stdout|stderr)',
                     r'store/operations/(?:[0-9a-f-]{36}\.json|slot-[0-9]{4}\.json|index\.json)']
         files = []
@@ -762,7 +932,7 @@ class Qualification:
         summary = {'schema_version': 1, 'candidate': CANDIDATE, 'tree': TREE, 'base': BASE,
                    'provenance': self.provenance,
                    'mode': self.mode, 'native_gates': native_gates,
-                   'selection': 'adapter_pair_only' if self.diagnostics_only else None,
+                   'selection': 'captured_crash_only' if self.diagnostics_only else None,
                    'diagnostics': self.diagnostics,
                    'status': self.success_status if passed else self.failure_status, 'source_unchanged': unchanged,
                    'python': public_python, 'node': public_node, 'versions': self.versions,
@@ -832,7 +1002,7 @@ def main():
                        'tree': TREE, 'base': BASE,
                        'mode': 'diagnostics_only' if diagnostics_only else 'provider_preflight_only' if preflight_only else 'native_qualification',
                        'native_gates': 'NOT_RUN' if preflight_only or diagnostics_only else 'UNKNOWN',
-                       'selection': 'adapter_pair_only' if diagnostics_only else None,
+                       'selection': 'captured_crash_only' if diagnostics_only else None,
                        'status': 'DIAGNOSTIC_FAIL' if diagnostics_only else 'PREFLIGHT_FAIL' if preflight_only else 'FAIL', 'reason': 'collector_failed',
                        'evidence_encrypted': False, 'production_qualification': False})
         print('Diagnostic collector failed; native gates NOT_RUN.' if diagnostics_only else
