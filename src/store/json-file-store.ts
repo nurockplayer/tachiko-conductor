@@ -1,3 +1,4 @@
+import { nativeMergeCoherent, nativeMergeProgresses } from '../workflow/merge.js';
 import { closeSync, existsSync, fchmodSync, fsyncSync, openSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import path from 'node:path';
@@ -323,6 +324,7 @@ function isRun(value: unknown): value is Run {
     (v.reviewResult === undefined || isReviewResult(v.reviewResult)) &&
     (v.validationResult === undefined || isValidationResultCoherent(v.validationResult)) &&
     (v.telemetry === undefined || isRunTelemetry(v.telemetry)) &&
+    nativeMergeCoherent(v as unknown as Run) &&
     nativeReviewCoherent(v as unknown as Run) &&
     isRepairHistoryCoherent(v) &&
     (v.validationResult === undefined || v.headSha === undefined || (v.validationResult as { headSha: unknown }).headSha === v.headSha) &&
@@ -553,6 +555,7 @@ export class JsonFileStore implements RunStore {
   }
 
   create(run: Run): void {
+    if (!nativeMergeCoherent(run)) throw new Error('Invalid native merge Run attempt.');
     if (!nativeReviewCoherent(run)) throw new Error('Invalid native review Run ledger.');
     this.withMutationLock(run.id, () => {
       const filePath = this.filePathFor(run.id);
@@ -577,6 +580,7 @@ export class JsonFileStore implements RunStore {
       const filePath = this.filePathFor(run.id);
       this.assertSafeRunFile(filePath);
       const current = existsSync(filePath) ? readRun(filePath, run.id) : null;
+      if (!nativeMergeCoherent(run) || current !== null && !nativeMergeProgresses(current, run)) throw new Error('Native merge attempt must remain coherent and monotonic.');
       if (!nativeReviewCoherent(run) || current !== null && !nativeReviewProgresses(current, run)) throw new Error('Native review ledger must remain coherent and monotonic.');
       assertRepairAdmissionsAppendOnly(current, run);
       assertHistoryAppendOnly(current, run);
@@ -592,6 +596,7 @@ export class JsonFileStore implements RunStore {
       this.assertSafeRunFile(filePath);
       const current = readRun(filePath, expected.id);
       if (runFingerprint(current) !== runFingerprint(expected)) return false;
+      if (!nativeMergeCoherent(next) || !nativeMergeProgresses(current, next)) throw new Error('Native merge attempt must remain coherent and monotonic.');
       if (!nativeReviewCoherent(next) || !nativeReviewProgresses(current, next)) throw new Error('Native review ledger must remain coherent and monotonic.');
       assertRepairAdmissionsAppendOnly(current, next);
       assertHistoryAppendOnly(current, next);

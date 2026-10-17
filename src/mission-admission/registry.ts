@@ -469,7 +469,7 @@ export class MissionAdmissionRegistry {
     return state;
   }
 
-  admit(request: AdmissionRequest, options: { readonly beforePublish?: (result: Extract<AdmissionResult, { readonly outcome: 'admitted' }>) => void } = {}): AdmissionResult {
+  admit(request: AdmissionRequest, options: { readonly beforePublish?: (result: Extract<AdmissionResult, { readonly outcome: 'admitted' }>, previousLane?: Readonly<AdmissionLaneView> | null) => void } = {}): AdmissionResult {
     if (!nonEmpty(request.laneId) || !(MISSION_ADMISSION_ROLES as readonly string[]).includes(request.role)) throw new AdmissionStateError('Admission request has an invalid lane identifier or role.');
     const evidence = canonicalizeMissionEvidence(request.evidence);
     if (request.role === 'delegated_mutation_writer' && (!nonEmpty(request.delegatedFromLaneId) || request.delegatedFromToken === undefined)) throw new AdmissionStateError('Delegated writers require an explicit captain lane and its exact active generation token.');
@@ -478,8 +478,10 @@ export class MissionAdmissionRegistry {
     if ((request.role === 'read_only_review' || request.role === 'read_only_consultation') && (request.delegatedFromLaneId || request.delegatedFromToken || request.highAutonomy)) throw new AdmissionStateError('Read-only lanes cannot request delegated mutation or high-autonomy authority.');
     if (request.role !== 'delegated_mutation_writer' && request.delegatedFromToken !== undefined) throw new AdmissionStateError('Only delegated mutation writers can present a parent capability.');
     const now = this.now();
+    let previousLane: Readonly<AdmissionLaneView> | null = null;
     return this.transact((state) => {
       const prior = state.lanes.find((lane) => lane.laneId === request.laneId);
+      previousLane = prior === undefined ? null : detachedLaneView(prior);
       if (prior?.status === 'active') throw new AdmissionStateError('Lane already has active ownership; reconcile its generation instead of admitting it twice.');
       if (prior?.status === 'parked' && prior.parkedReason === 'manual_checkpoint') throw new AdmissionStateError('Manual checkpoint reservations must be retired with their exact parked generation before this lane can be admitted again.');
       if (prior && prior.role !== request.role) throw new AdmissionStateError('A lane identifier cannot change roles across generations.');
@@ -532,7 +534,7 @@ export class MissionAdmissionRegistry {
       replaceLane(state, candidate); state.revision += 1; state.lastTransition = { kind: 'admitted', laneId: request.laneId, at: now };
       return { outcome: 'admitted', missionId, token: tokenRecord(candidate), revision: state.revision };
     }, (result) => {
-      if (result.outcome === 'admitted') options.beforePublish?.(result);
+      if (result.outcome === 'admitted') options.beforePublish?.(result, previousLane);
     });
   }
 

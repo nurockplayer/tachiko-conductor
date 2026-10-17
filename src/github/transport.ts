@@ -13,7 +13,7 @@ export interface GitHubApiTransport {
 
 /** Explicit mutation surface used only by machine-owned GitHub comments. */
 export interface GitHubWriteTransport extends GitHubApiTransport {
-  write(path: string, method: 'POST' | 'PATCH', body: Readonly<Record<string, unknown>>): Promise<unknown>;
+  write(path: string, method: 'POST' | 'PATCH' | 'PUT', body: Readonly<Record<string, unknown>>): Promise<unknown>;
 }
 
 export interface ProcessResult {
@@ -269,7 +269,7 @@ export class GhCliTransport implements GitHubApiTransport {
     return await this.execute(path, this.args(path, {}, accept));
   }
 
-  async write(path: string, method: 'POST' | 'PATCH', body: Readonly<Record<string, unknown>>): Promise<unknown> {
+  async write(path: string, method: 'POST' | 'PATCH' | 'PUT', body: Readonly<Record<string, unknown>>): Promise<unknown> {
     const args = this.args(path).map((arg) => arg === 'GET' ? method : arg);
     for (const [key, value] of Object.entries(body).sort(([a], [b]) => a.localeCompare(b))) {
       args.push('-f', `${key}=${typeof value === 'string' ? value : JSON.stringify(value)}`);

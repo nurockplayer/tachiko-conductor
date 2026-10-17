@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { describe, it } from 'node:test';
 import type { GitHubAdapter, GitHubLiveSnapshot } from '../src/adapters/github.js';
-import { buildWorkflowDeps, recoverRunAdmission, runIssueCommand, runMergedTransitionCommand } from '../src/cli.js';
+import { buildWorkflowDeps, recoverRunAdmission, resumeCommand, runIssueCommand, runMergedTransitionCommand, reconcileDispatchMergedRunCommand, isDispatchRunOwnerRetiredCommand } from '../src/cli.js';
 import { createRun } from '../src/domain/run.js';
 import { applyTransition } from '../src/domain/state-machine.js';
 import type { Run } from '../src/domain/types.js';
@@ -13,8 +13,10 @@ import { dispatchOnceCommand } from '../src/dispatch/command.js';
 import { dispatchContinuously } from '../src/dispatch/continuous.js';
 import { DISPATCH_QUEUE_MARKER, renderDispatchRuntime, selectDispatchRuntime, type DispatchRuntimeClaim, type DispatchRuntimeComment } from '../src/dispatch/queue.js';
 import type { ResolvedExecutionConfiguration } from '../src/execution-profiles.js';
+import { resolveRunOwnerReceiptPath } from '../src/mission-admission/host-registry.js';
+import { issuedMergeRecoveryConfiguration, readMergeCandidate, type NativeMergeHost, type NativeMergePolicy } from '../src/workflow/merge.js';
 import { MissionAdmissionRegistry, type AdmissionConfig } from '../src/mission-admission/registry.js';
-import { readRunOwnerReceipt } from '../src/mission-admission/run-owner-receipt.js';
+import { readRunOwnerReceipt, writeRunOwnerReceipt } from '../src/mission-admission/run-owner-receipt.js';
 import { activeNativeReview, nativeReviewCoherent, nativeReviewReentry, resolveNativeReviewer } from '../src/oracle/native-reviewer.js';
 import { JsonFileOracleReceiptStore } from '../src/oracle/receipt-store.js';
 import { oracleDigest, readNativeSourceManifest, validNativeSourceManifest } from '../src/oracle/source-evidence.js';
@@ -40,8 +42,10 @@ class Runtime {
   async updateRuntimeComment(id: string, body: string) { this.comments = [{ id, body }]; return { id, body }; }
 }
 
-function fixture() {
+function fixture(mergeComposition = false) {
   const directory = mkdtempSync(path.join(os.tmpdir(), 'native-review-'));
+  const originalUserInfo = os.userInfo;
+  if (mergeComposition) os.userInfo = (() => ({ ...originalUserInfo(), homedir: directory })) as typeof os.userInfo;
   const repository = path.join(directory, 'objects');
   mkdirSync(repository);
   const git = (...args: string[]) => execFileSync('git', ['-c', 'user.name=Controlled fixture', '-c', 'user.email=fixture@example.invalid', ...args], { cwd: repository, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
@@ -59,30 +63,52 @@ function fixture() {
   let snapshotReads = 0;
   let onSnapshot: (() => void) | undefined;
   let liveBase = base;
+  let liveHead = head;
+  let negativeReview = false;
+  let validationCalls = 0;
   let lastRequest: RequestEvidence | undefined;
   let submit: (r: RequestEvidence) => Promise<NativeReviewObservation> = async () => ({ outcome: 'pending', conversationUrl: 'https://review.example.invalid/exact?conversation=returned' });
   let observe: NonNullable<NativeReviewerHost['observe']> = async () => ({ outcome: 'pending' });
   const now = () => new Date(clock).toISOString();
   const store = () => new JsonFileStore({ dir: path.join(directory, 'runs') });
-  const registry = () => new MissionAdmissionRegistry({ filePath: path.join(directory, 'host', 'admission.json'), config: admissionConfig, now });
+  let onRegistryPublish = () => {};
+  const registry = () => new MissionAdmissionRegistry({ beforePublish: () => onRegistryPublish(), filePath: path.join(directory, 'host', 'admission.json'), config: admissionConfig, now });
   const receipts = () => new JsonFileOracleReceiptStore(path.join(directory, 'oracle'));
-  const receiptPath = path.join(directory, 'owner.json');
+  const receiptPath = mergeComposition ? resolveRunOwnerReceiptPath('acme/widgets', 'run-native') : path.join(directory, 'owner.json');
+  let mergeHost: NativeMergeHost | undefined;
+  let configuredMerge: NativeMergePolicy | undefined;
+  let hold = false;
+  let recoveryOnly = false;
+  let squashes = 0;
+  let mergeState: 'open' | 'merged' | 'closed' = 'open';
+  let mainHead = base;
+  const tree = git('rev-parse', `${head}^{tree}`);
+  const squash = git('commit-tree', tree, '-p', base, '-m', 'actual squash');
+  let proofCommit = { sha: squash, treeSha: tree, parents: [base] };
+  let proofAncestry = true;
+  let mergeOperation = async () => { mergeState = 'merged' as const; mainHead = squash; };
+  const mergePolicy: NativeMergePolicy = { enabled: true, revision: 'merge-v1', releaseId: 'accepted-fixture-release', campaign: 'bounded-v1', dispatchRevision: config.revision, owner: config.owner, repo: config.repo, controlIssue: config.controlIssue, queueCommentId: config.queueCommentId, baseBranch: 'main', method: 'squash', integrationPolicy: 'bootstrap-base-tree-v1', reviewPolicyRevision: 'independent-unpromoted-v1', localValidationRevision: 'test-config-v1', hostedValidationRevision: 'test-hosted-policy-v1' };
+
   const runtime = new Runtime();
   const github: GitHubAdapter = {
     kind: 'github',
-    async readIssue(target) { return { target, title: 'native slice', body: 'controlled source', state: 'open' }; },
+    async readIssue(target) { return { target, title: 'native slice', body: 'controlled source', state: target.issueNumber === 42 && mergeComposition && mergeState === 'merged' ? 'closed' : 'open' }; },
     async readBranch() { throw new Error('unused'); },
     async listPullRequests() { return []; },
-    async readPullRequest() { const snapshot = await github.readLiveSnapshot(TARGET); return { ...snapshot.pullRequest!, state: 'merged' }; },
+    async readPullRequest() { const snapshot = await github.readLiveSnapshot(TARGET); return { ...snapshot.pullRequest!, state: mergeComposition ? mergeState : 'merged', ...(mergeComposition && mergeState === 'merged' ? { mergeCommitSha: squash } : {}) }; },
+    async squashPullRequest(owner, repo, number, expectedHead) { assert.equal(owner, TARGET.owner); assert.equal(repo, TARGET.repo); assert.equal(number, 7); assert.equal(expectedHead, head); squashes += 1; await mergeOperation(); },
+    async readDefaultBranch() { return { branch: 'main', headSha: mainHead }; },
+    async readCommit() { return proofCommit; },
+    async isAncestor() { return proofAncestry; },
     async readLiveSnapshot(): Promise<GitHubLiveSnapshot> {
       snapshotReads += 1; onSnapshot?.();
       return {
         repository: { owner: TARGET.owner, repo: TARGET.repo, defaultBranch: 'main', defaultBranchHeadSha: liveBase },
         issue: { id: 'I_42', number: 42, title: 'native slice', body: 'controlled source', state: 'open', url: '', createdAt: T0, updatedAt: T0 },
         pullRequest: { id: 'PR_7', number: 7, title: 'native candidate', url: '', state: 'open', isDraft: false, mergeable: true, mergeStateStatus: 'CLEAN', updatedAt: T0,
-          headSha: head, baseSha: liveBase, headRef: 'candidate', headRepository: { owner: TARGET.owner, repo: TARGET.repo }, baseRef: 'main', baseRepository: { owner: TARGET.owner, repo: TARGET.repo } },
-        headSha: head, checks: { availability: 'available', overall: 'passing', checks: [{ id: 'test', name: 'test', state: 'passing', url: null, updatedAt: T0 }] },
-        reviews: { decision: 'none', latestByAuthor: [], unresolvedThreads: 0 }, conversations: [], handoff: null, problems: [], observedAt: now(),
+          headSha: liveHead, baseSha: liveBase, headRef: 'candidate', headRepository: { owner: TARGET.owner, repo: TARGET.repo }, baseRef: 'main', baseRepository: { owner: TARGET.owner, repo: TARGET.repo } },
+        headSha: liveHead, checks: { availability: 'available', overall: 'passing', checks: [{ id: 'test', name: 'test', state: 'passing', url: null, updatedAt: T0 }] },
+        reviews: { decision: negativeReview ? 'changes_requested' : 'none', latestByAuthor: negativeReview ? [{ id: 'negative-no-thread', author: 'independent', state: 'changes_requested', commitSha: liveHead, submittedAt: now(), url: '', fresh: true }] : [], unresolvedThreads: 0 }, conversations: [], handoff: null, problems: [], observedAt: now(),
       };
     },
   };
@@ -99,18 +125,18 @@ function fixture() {
       authentication: { actorId: actor, model: r.identity.requestedModel, effort: r.identity.requestedEffort, transportReceipt: oracleDigest({ identity: r.identity, result, actor }) } };
   };
   const workflow = (binding: NativeReviewerHost | undefined = host, durableStore = store()): WorkflowDependencies => ({
-    ...buildWorkflowDeps(durableStore, undefined, {}, undefined, binding), github,
+    ...buildWorkflowDeps(durableStore, undefined, {}, undefined, binding, mergeHost), github,
     implementation: { kind: 'implementation-agent', async run() { modelCalls += 1; throw new Error('No implementation/repair model may run.'); } },
-    validation: { kind: 'validation', configRevision: 'test-config-v1', async validate() { throw new Error('Fresh validation must be reused.'); } },
+    validation: { kind: 'validation', configRevision: 'test-config-v1', async validate(request) { if (!mergeComposition) throw new Error('Fresh validation must be reused.'); validationCalls += 1; return validationPassed(request.headSha).local; } },
     hostedCheckPolicy: { revision: 'test-hosted-policy-v1', policy: { mode: 'required' } },
   });
-  const seed = (state: 'REVIEWING' | 'FINAL_GATE' | 'MERGE_READY' | 'READY' = 'REVIEWING') => {
+  const seed = (state: 'REVIEWING' | 'FINAL_GATE' | 'MERGE_READY' | 'READY' | 'VALIDATING' = 'REVIEWING') => {
     let run = createRun(TARGET, T0, 'run-native', execution, 'claim-native', authority);
     if (state !== 'READY') {
       run = applyTransition(run, { type: 'start' }, T0);
       run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult(head), headSha: head, pullRequest: { number: 7, headSha: head } }, T0);
-      run = applyTransition(run, { type: 'validation_passed', validationResult: validationPassed(head) }, T0);
-      if (state !== 'REVIEWING') run = applyTransition(run, { type: 'review_approved', reviewResult: approval('generic green', head) }, T0, TEST_VALIDATION_AUTHORITY);
+      if (state !== 'VALIDATING') run = applyTransition(run, { type: 'validation_passed', validationResult: validationPassed(head) }, T0);
+      if (state !== 'REVIEWING' && state !== 'VALIDATING') run = applyTransition(run, { type: 'review_approved', reviewResult: approval('generic green', head) }, T0, TEST_VALIDATION_AUTHORITY);
       if (state === 'MERGE_READY') run = { ...run, state: 'MERGE_READY', history: [...run.history, { type: 'final_gate_verified', from: 'FINAL_GATE', to: 'MERGE_READY', at: T0 }] };
     }
     store().create(run);
@@ -122,21 +148,67 @@ function fixture() {
   const poll = async (binding: NativeReviewerHost | undefined = host, durableStore = store()) => {
     const wf = workflow(binding, durableStore);
     const admission = registry();
-    return await dispatchOnceCommand(config, {
-      workflow: wf, runtime, admission, now, resolveExecutionProfile: () => execution,
-      async runIssue(ref, selected, claimId, a, registry, _release, _lock, assertReviewClaim) { return await runIssueCommand(wf, ref, { execution: selected, dispatchClaimId: claimId, repairTaskShapeAuthority: a, admission: registry, runOwnerReceiptPath: receiptPath, admissionWorkspace: repository, now, assertReviewClaim }); },
-      async resumeClaimedRun(run, claimId, registry, _release, _lock, assertReviewClaim) { return await runIssueCommand(wf, 'acme/widgets#42', { execution: run.execution, dispatchClaimId: claimId, repairTaskShapeAuthority: run.repairTaskShapeAuthority, admission: registry, runOwnerReceiptPath: receiptPath, admissionWorkspace: repository, now, assertReviewClaim }); },
+    return await dispatchOnceCommand(recoveryOnly ? issuedMergeRecoveryConfiguration(durableStore.read('run-native')!) : { ...config, ...(configuredMerge ? { merge: configuredMerge } : {}) }, {
+      workflow: wf, runtime, admission, now, maintenanceHold: hold, issuedMergeRecoveryOnly: recoveryOnly,
+      ...(mergeComposition ? { reconcileMergedRun: async (run: Run) => await reconcileDispatchMergedRunCommand(durableStore, run, github, admission, async (op) => op()), isRunOwnerRetired: (run: Run) => isDispatchRunOwnerRetiredCommand(durableStore, run, admission) } : {}),
+      resolveExecutionProfile: () => execution,
+      async runIssue(ref, selected, claimId, a, registry, _release, _lock, assertReviewClaim, assertMergeInitiation) { return await runIssueCommand(wf, ref, { execution: selected, dispatchClaimId: claimId, repairTaskShapeAuthority: a, admission: registry, runOwnerReceiptPath: mergeComposition && ref.endsWith('#43') ? undefined : receiptPath, admissionWorkspace: repository, now, assertReviewClaim, assertMergeInitiation, withDispatchAdmissionLock: async (op) => op() }); },
+      async resumeClaimedRun(run, claimId, registry, _release, _lock, assertReviewClaim, assertMergeInitiation) { return await runIssueCommand(wf, 'acme/widgets#42', { execution: run.execution, dispatchClaimId: claimId, repairTaskShapeAuthority: run.repairTaskShapeAuthority, admission: registry, runOwnerReceiptPath: receiptPath, admissionWorkspace: repository, now, assertReviewClaim, assertMergeInitiation, withDispatchAdmissionLock: async (op) => op() }); },
     });
   };
   return { directory, repository, base, head, host, store, registry, receipts, runtime, receiptPath, workflow, seed, poll, terminal, github, now, git,
     tick: () => { clock += 31_000; }, counts: () => ({ modelCalls, submissions, observations, snapshotReads }), request: () => { assert.ok(lastRequest); return lastRequest; },
     setSubmit: (fn: typeof submit) => { submit = fn; }, setObserve: (fn: typeof observe) => { observe = fn; },
-    setLiveBase: (b: string) => { liveBase = b; }, setSnapshotHook: (fn: () => void) => { onSnapshot = fn; },
-    cleanup: () => rmSync(directory, { recursive: true, force: true }),
+    setLiveHead: (h: string) => { liveHead = h; }, setLiveBase: (b: string) => { liveBase = b; }, setSnapshotHook: (fn: () => void) => { onSnapshot = fn; },
+    armMerge: () => {
+      const ready = store().read('run-native')!;
+      store().update({ ...ready, bootstrap: { bootstrapKind: 'linked-worktree', owner: TARGET.owner, repo: TARGET.repo, issueNumber: 42, baseBranch: 'main', baseSha: base, branch: 'candidate', workspacePath: repository } });
+      mergeHost = { policy: mergePolicy, candidate: (b, h) => readMergeCandidate(repository, b, h) }; configuredMerge = mergePolicy;
+    },
+    mergeCounts: () => ({ squashes }), validationCalls: () => validationCalls,
+    setNegativeReview: () => { negativeReview = true; }, squash, tree,
+    setMergeOperation: (fn: typeof mergeOperation) => { mergeOperation = fn; },
+    setMergeState: (state: typeof mergeState) => { mergeState = state; },
+    setMain: (sha: string) => { mainHead = sha; },
+    setCommit: (commit: typeof proofCommit) => { proofCommit = commit; },
+    setAncestry: (value: boolean) => { proofAncestry = value; },
+    setRegistryPublish: (fn: () => void) => { onRegistryPublish = fn; },
+    setRecoveryOnly: () => { recoveryOnly = true; },
+    setHold: (value: boolean) => { hold = value; },
+    setMergeHost: (value: NativeMergeHost | undefined) => { mergeHost = value; configuredMerge = value?.policy; },
+    cleanup: () => { if (mergeComposition) os.userInfo = originalUserInfo; rmSync(directory, { recursive: true, force: true }); },
   };
 }
 
 describe('native review through the real factory / durable dispatcher', () => {
+  it('reconciles live HEAD movement before final-gate native receipt qualification', async () => {
+    const f = fixture();
+    try {
+      f.seed(); f.setSubmit(async (r) => ({ outcome: 'complete', evidence: f.terminal(r) }));
+      f.setSnapshotHook(() => { if (f.counts().snapshotReads === 3) f.setLiveHead('e'.repeat(40)); });
+      await f.poll();
+      const run = f.store().read('run-native')!;
+      assert.equal(run.state, 'NEEDS_HUMAN');
+      assert.match(run.interrupt!.reason, /live GitHub HEAD/);
+      assert.ok(run.interrupt!.choices!.includes('Sync the run to the live HEAD and continue'));
+      assert.equal(f.counts().submissions, 1); assert.equal(f.counts().modelCalls, 0);
+    } finally { f.cleanup(); }
+  });
+
+  it('revalidates retained native MERGE_READY through real dispatch before reporting cached readiness', async () => {
+    const f = fixture();
+    try {
+      f.seed(); f.setSubmit(async (r) => ({ outcome: 'complete', evidence: f.terminal(r) })); await f.poll();
+      assert.equal(f.store().read('run-native')!.state, 'MERGE_READY');
+      const result = await f.poll({ ...f.host, binding: { ...f.host.binding, policyRevision: 'revoked' } });
+      assert.equal(result.outcome, 'dispatched');
+      const run = f.store().read('run-native')!;
+      assert.equal(run.state, 'WAITING_DEPENDENCY');
+      assert.equal(run.nativeReview!.wait!.kind, 'qualification');
+      assert.equal(f.counts().submissions, 1); assert.equal(f.counts().observations, 0); assert.equal(f.counts().modelCalls, 0);
+    } finally { f.cleanup(); }
+  });
+
   it('waits before any implementation or reviewer spawn when default, malformed, disabled or unqualified binding is supplied', async () => {
     for (const bad of [undefined, {}, { binding: { available: false } }, { binding: { verified: true, model: 'oracle' } }, 'medium-only', 'high-only', 'contradictory-disabled', 'unknown-field']) {
       const f = fixture();
@@ -801,4 +873,663 @@ describe('native review through the real factory / durable dispatcher', () => {
       f.cleanup();
     }
   });
+});
+
+describe('disabled native squash bridge through actual factory / Run / dispatch / owner settlement', () => {
+  async function ready(f: ReturnType<typeof fixture>) {
+    f.seed('VALIDATING'); f.setSubmit(async (r) => ({ outcome: 'complete', evidence: f.terminal(r) }));
+    await f.poll(); assert.equal(f.store().read('run-native')!.state, 'MERGE_READY'); f.armMerge();
+  }
+
+  it('issues one expected-HEAD squash, proves actual integration, settles A and admits B with A retained', async () => {
+    const f = fixture(true);
+    try {
+      await ready(f);
+      await f.poll();
+      const issued = f.store().read('run-native')!;
+      assert.equal(f.validationCalls(), 1, 'actual validation workflow consumed fresh controlled validation');
+      assert.equal(issued.mergeAttempt!.submissionPossible, true);
+      assert.equal(issued.mergeAttempt!.qualification!.mergeCommitSha, f.squash);
+      assert.equal(issued.mergeAttempt!.qualification!.treeSha, f.tree);
+      assert.equal(f.registry().readLane('run:run-native')!.parkedReason, 'workflow_settled');
+      // Disabled reviewer for B is the actual default factory wait, not a
+      // stubbed dispatcher or fabricated MERGED/ready successor.
+      const result = await f.poll({} as NativeReviewerHost);
+      assert.equal(result.outcome, 'dispatched');
+      if (result.outcome !== 'dispatched') throw new Error('Expected successor admission.');
+      assert.equal(result.entry.issue, 43);
+      assert.equal(result.execution.state, 'WAITING_DEPENDENCY');
+      const settled = f.store().read('run-native')!;
+      assert.equal(settled.state, 'MERGED');
+      assert.equal(f.registry().readLane('run:run-native')!.status, 'released');
+      assert.equal(readRunOwnerReceipt(f.receiptPath)!.phase, 'released');
+      assert.equal(f.store().list().length, 2);
+      assert.deepEqual(f.mergeCounts(), { squashes: 1 });
+      assert.equal(f.counts().submissions, 1); assert.equal(f.counts().modelCalls, 0);
+      assert.match(await f.runtime.readQueueComment(), /issue: 42[\s\S]*issue: 43/);
+    } finally { f.cleanup(); }
+  });
+
+  it('keeps disabled native cached readiness model-free and sleeps on every unchanged continuous poll', async () => {
+    const f = fixture(true);
+    try {
+      f.seed(); f.setSubmit(async (r) => ({ outcome: 'complete', evidence: f.terminal(r) })); await f.poll();
+      let waits = 0;
+      const result = await dispatchContinuously({ dispatchOnce: () => f.poll(), sleep: async () => { waits += 1; f.tick(); }, idlePollMs: 30_000, maxCycles: 4 });
+      assert.equal(result.idleWaits, 3); assert.equal(waits, 3);
+      assert.equal(f.store().read('run-native')!.state, 'MERGE_READY');
+      assert.equal(f.store().read('run-native')!.mergeAttempt, undefined);
+      assert.equal(f.counts().submissions, 1); assert.equal(f.counts().modelCalls, 0); assert.equal(f.mergeCounts().squashes, 0);
+    } finally { f.cleanup(); }
+  });
+
+  it('retains lost acknowledgement/open PR with a finite durable budget across restart and config churn', async () => {
+    const f = fixture(true);
+    try {
+      await ready(f);
+      f.setMergeOperation(async () => { throw new Error('remote acknowledgement lost'); });
+      await f.poll();
+      const original = f.store().read('run-native')!.mergeAttempt!;
+      assert.equal(original.observations, 1);
+      f.setMergeHost(undefined);
+      for (let i = 0; i < 5; i++) { f.tick(); await f.poll({} as NativeReviewerHost); }
+      const parked = f.store().read('run-native')!;
+      assert.equal(parked.mergeAttempt!.observations, 3);
+      assert.deepEqual(parked.mergeAttempt!.identity, original.identity);
+      assert.equal(parked.mergeAttempt!.qualification, undefined);
+      assert.equal(f.registry().readLane('run:run-native')!.parkedReason, 'workflow_wait');
+      assert.equal(f.store().list().length, 1);
+      assert.equal(f.mergeCounts().squashes, 1); assert.equal(f.counts().submissions, 1); assert.equal(f.counts().modelCalls, 0);
+      await assert.rejects(runMergedTransitionCommand(f.store(), parked.id, f.github, f.registry(), async (op) => op()), /merged|unqualified|proof/i);
+      assert.throws(() => recoverRunAdmission(f.store(), f.registry(), parked.id, readRunOwnerReceipt(f.receiptPath)!.generation, true, f.receiptPath, { retireWork: true }), /cannot retire/);
+    } finally { f.cleanup(); }
+  });
+
+  it('allows HOLD only to observe/settle the issued exact attempt, preserving HOLD and stopping B', async () => {
+    const f = fixture(true);
+    try {
+      await ready(f); f.setHold(true);
+      assert.equal((await f.poll()).outcome, 'maintenance_hold'); assert.equal(f.mergeCounts().squashes, 0);
+      f.setHold(false); f.setMergeOperation(async () => { throw new Error('lost ack'); }); await f.poll();
+      f.setMergeHost(undefined); f.setHold(true); f.setMergeState('merged'); f.setMain(f.squash); f.tick();
+      await f.poll({} as NativeReviewerHost);
+      assert.ok(f.store().read('run-native')!.mergeAttempt!.qualification);
+      assert.equal((await f.poll({} as NativeReviewerHost)).outcome, 'maintenance_hold');
+      assert.equal(f.store().read('run-native')!.state, 'MERGED');
+      assert.equal(f.store().list().length, 1); assert.equal(f.mergeCounts().squashes, 1); assert.equal(f.counts().modelCalls, 0);
+      assert.equal((await f.poll({} as NativeReviewerHost)).outcome, 'maintenance_hold');
+      assert.equal(f.store().list().length, 1);
+    } finally { f.cleanup(); }
+  });
+
+  it('records truthful merged-but-unsettled facts for wrong parent/tree/ancestry and fences every settlement retry', async () => {
+    for (const bad of ['parent', 'multiple-parents', 'tree', 'ancestry', 'closed-unmerged'] as const) {
+      const f = fixture(true);
+      try {
+        await ready(f);
+        if (bad === 'parent') f.setCommit({ sha: f.squash, treeSha: f.tree, parents: ['f'.repeat(40)] });
+        if (bad === 'multiple-parents') f.setCommit({ sha: f.squash, treeSha: f.tree, parents: [f.base, f.head] });
+        if (bad === 'tree') f.setCommit({ sha: f.squash, treeSha: 'e'.repeat(40), parents: [f.base] });
+        if (bad === 'ancestry') f.setAncestry(false);
+        if (bad === 'closed-unmerged') f.setMergeOperation(async () => { f.setMergeState('closed'); });
+        await f.poll();
+        const unresolved = f.store().read('run-native')!;
+        assert.equal(unresolved.mergeAttempt!.qualification, undefined, bad);
+        assert.equal(unresolved.mergeAttempt!.observedMerged !== undefined, bad !== 'closed-unmerged', bad);
+        assert.equal(f.registry().readLane('run:run-native')!.parkedReason, 'workflow_wait');
+        await assert.rejects(runMergedTransitionCommand(f.store(), unresolved.id, f.github, f.registry(), async (op) => op()), /unqualified|merged|proof|parent|tree|history/i);
+        assert.equal(f.registry().readLane('run:run-native')!.status, 'parked');
+        assert.equal(f.mergeCounts().squashes, 1); assert.equal(f.store().list().length, 1);
+      } finally { f.cleanup(); }
+    }
+  });
+});
+
+describe('native merge crash and authority fences', () => {
+  async function armed(f: ReturnType<typeof fixture>) {
+    f.seed('VALIDATING'); f.setSubmit(async (r) => ({ outcome: 'complete', evidence: f.terminal(r) })); await f.poll(); f.armMerge();
+  }
+  it('preserves prepared / possible / accepted / proof CAS crash cuts without reissuing', async () => {
+    for (const cut of ['before-marker', 'after-marker', 'lost-ack', 'before-proof-cas', 'after-proof-cas'] as const) {
+      const f = fixture(true);
+      try {
+        await armed(f);
+        if (cut === 'lost-ack') f.setMergeOperation(async () => { f.setMergeState('merged'); f.setMain(f.squash); throw new Error('remote accepted, acknowledgement lost'); });
+        const store = f.store(); const cas = store.updateIfUnchanged.bind(store); let tripped = false;
+        store.updateIfUnchanged = (expected, next) => {
+          const a = expected.mergeAttempt; const b = next.mergeAttempt;
+          const trigger = !tripped && (cut === 'before-marker' && a?.submissionPossible === false && b?.submissionPossible === true ||
+            cut === 'after-marker' && a?.submissionPossible === false && b?.submissionPossible === true ||
+            cut.includes('proof-cas') && a?.qualification === undefined && b?.qualification !== undefined);
+          if (trigger) { tripped = true; if (cut === 'after-marker' || cut === 'after-proof-cas') cas(expected, next); throw new Error(`controlled merge crash ${cut}`); }
+          return cas(expected, next);
+        };
+        if (cut === 'lost-ack') await f.poll(f.host, store);
+        else await assert.rejects(f.poll(f.host, store), /controlled merge crash|Run changed during native merge observation/);
+        const crashed = f.store().read('run-native')!;
+        assert.equal(crashed.mergeAttempt!.submissionPossible, cut !== 'before-marker');
+        assert.equal(f.mergeCounts().squashes, cut === 'before-marker' || cut === 'after-marker' ? 0 : 1);
+        const lane = f.registry().readLane('run:run-native')!;
+        if (lane.status === 'active') recoverRunAdmission(f.store(), f.registry(), crashed.id, lane.generation, true, f.receiptPath);
+        if (cut === 'before-marker') {
+          await f.poll();
+          assert.equal(f.store().read(crashed.id)!.mergeAttempt!.submissionPossible, true, 'proven-unsubmitted preparation requires fresh complete admission before first issuance');
+          assert.ok(f.store().read(crashed.id)!.mergeAttempt!.issuanceGeneration! > crashed.mergeAttempt!.identity.generation);
+        } else if (!crashed.mergeAttempt!.qualification) {
+          f.setMergeHost(undefined); f.tick(); await f.poll({} as NativeReviewerHost);
+        }
+        if (cut !== 'after-marker') {
+          const successor = await f.poll({} as NativeReviewerHost);
+          assert.equal(f.store().read(crashed.id)!.state, 'MERGED', 'crash recovery must complete durable settlement, not stop at proof');
+          assert.equal(successor.outcome, 'dispatched');
+          if (successor.outcome !== 'dispatched') throw new Error('Expected safe successor admission.');
+          assert.equal(successor.entry.issue, 43); assert.equal(f.store().list().length, 2);
+        } else assert.equal(f.store().list().length, 1, 'possible-but-unproven submission still stops B');
+        assert.equal(f.mergeCounts().squashes, cut === 'after-marker' ? 0 : 1, 'restart never resends possible submission');
+        assert.equal(f.counts().submissions, 1); assert.equal(f.counts().modelCalls, 0);
+      } finally { f.cleanup(); }
+    }
+  });
+
+  it('rejects stale HEAD/base/policy, negative review without a thread, missing qualification and malformed receipt before issuance', async () => {
+    for (const bad of ['head', 'base', 'fresh-main', 'policy', 'negative', 'receipt', 'generic-review'] as const) {
+      const f = fixture(true);
+      try {
+        if (bad === 'generic-review') { f.seed('MERGE_READY'); f.armMerge(); }
+        else await armed(f);
+        if (bad === 'fresh-main') f.setMain('b'.repeat(40));
+        if (bad === 'head') f.setLiveHead('c'.repeat(40));
+        if (bad === 'base') { f.setLiveBase('b'.repeat(40)); f.setMain('b'.repeat(40)); }
+        if (bad === 'policy') (f.host.binding as { policyRevision: string }).policyRevision = 'changed';
+        if (bad === 'negative') f.setNegativeReview();
+        if (bad === 'receipt') { const accepted = f.store().read('run-native')!.nativeReview!.accepted!; writeFileSync(path.join(f.directory, 'oracle', 'native', `${accepted.receiptId}.json`), '{"invalid":true}'); }
+        await f.poll();
+        assert.equal(f.mergeCounts().squashes, 0, bad); assert.equal(f.store().read('run-native')!.mergeAttempt, undefined, bad);
+        assert.equal(f.counts().modelCalls, 0, bad); assert.equal(f.store().list().length, 1);
+      } finally { f.cleanup(); }
+    }
+  });
+
+  it('checks current claim and owner generation after preparation and immediately before the API', async () => {
+    for (const race of ['claim', 'generation'] as const) {
+      const f = fixture(true);
+      try {
+        await armed(f);
+        const store = f.store(); const cas = store.updateIfUnchanged.bind(store); let tripped = false;
+        store.updateIfUnchanged = (expected, next) => {
+          const result = cas(expected, next);
+          if (result && !tripped && !expected.mergeAttempt && next.mergeAttempt) {
+            tripped = true;
+            if (race === 'claim') { const selected = selectDispatchRuntime(f.runtime.comments)!; f.runtime.comments = [{ id: selected.id, body: renderDispatchRuntime({ ...selected.claim, claimId: 'foreign-claim' }) }]; }
+            else f.registry().park(readRunOwnerReceipt(f.receiptPath)!.token!, 'workflow_wait');
+          }
+          return result;
+        };
+        await assert.rejects(f.poll(f.host, store), /claim|generation|capability|owner|stale/i);
+        assert.equal(tripped, true); assert.equal(f.mergeCounts().squashes, 0); assert.equal(f.store().list().length, 1);
+      } finally { f.cleanup(); }
+    }
+  });
+
+  it('rejects monotonic ledger rollback and native/attempt-bearing MERGED bypasses, including released receipt-less retries', async () => {
+    const f = fixture(true);
+    try {
+      await armed(f); f.setMergeOperation(async () => { throw new Error('unknown'); }); await f.poll();
+      const run = f.store().read('run-native')!; const attempt = run.mergeAttempt!;
+      assert.throws(() => f.store().update({ ...run, mergeAttempt: undefined }), /monotonic/);
+      assert.throws(() => f.store().update({ ...run, mergeAttempt: { ...attempt, submissionPossible: false } }), /monotonic/);
+      assert.throws(() => f.store().update({ ...run, mergeAttempt: { ...attempt, observations: 0 } }), /monotonic/);
+      assert.throws(() => f.store().update({ ...run, state: 'MERGED' }), /monotonic/);
+      const history = new JsonFileStore({ dir: path.join(f.directory, 'historical-merge') });
+      history.create({ ...run, state: 'MERGED' });
+      f.setMergeState('merged'); f.setMain(f.squash); f.setCommit({ sha: f.squash, treeSha: 'f'.repeat(40), parents: [f.base] });
+      await assert.rejects(runMergedTransitionCommand(history, run.id, f.github, new MissionAdmissionRegistry({ filePath: path.join(f.directory, 'absent-registry.json'), config: admissionConfig }), async (op) => op()), /parent|tree|quali/i);
+      assert.equal(history.read(run.id)!.state, 'MERGED');
+      assert.equal(f.registry().readLane('run:run-native')!.status, 'parked');
+      assert.equal(f.mergeCounts().squashes, 1);
+    } finally { f.cleanup(); }
+  });
+
+  it('recovers explicit exact merged evidence after budget exhaustion without resubmitting', async () => {
+    const f = fixture(true);
+    try {
+      await armed(f); f.setMergeOperation(async () => { throw new Error('unknown'); }); await f.poll();
+      for (let i = 0; i < 3; i++) { f.tick(); await f.poll(); }
+      assert.equal(f.store().read('run-native')!.mergeAttempt!.observations, 3);
+      f.setMergeState('merged'); f.setMain(f.squash);
+      const settled = await runMergedTransitionCommand(f.store(), 'run-native', f.github, f.registry(), async (op) => op());
+      assert.equal(settled.state, 'MERGED'); assert.ok(settled.mergeAttempt!.qualification);
+      assert.equal(f.registry().readLane('run:run-native')!.status, 'released'); assert.equal(f.mergeCounts().squashes, 1);
+    } finally { f.cleanup(); }
+  });
+});
+
+describe('native merge existing settlement crash recovery', () => {
+  it('recovers Run-CAS-before-registry and registry-before-final-receipt without another merge or premature B', async () => {
+    for (const cut of ['registry', 'receipt'] as const) {
+      const f = fixture(true);
+      try {
+        f.seed('VALIDATING'); f.setSubmit(async (r) => ({ outcome: 'complete', evidence: f.terminal(r) })); await f.poll(); f.armMerge(); await f.poll();
+        assert.ok(f.store().read('run-native')!.mergeAttempt!.qualification);
+        let tripped = false; let saved: ReturnType<typeof readRunOwnerReceipt> = null;
+        f.setRegistryPublish(() => {
+          if (tripped || f.store().read('run-native')!.state !== 'MERGED') return;
+          tripped = true;
+          if (cut === 'registry') throw new Error('controlled native registry release crash');
+          saved = readRunOwnerReceipt(f.receiptPath); writeFileSync(f.receiptPath, '{broken receipt after registry publication');
+        });
+        await assert.rejects(runMergedTransitionCommand(f.store(), 'run-native', f.github, f.registry(), async (op) => op()), /controlled native registry|receipt|JSON/i);
+        assert.equal(tripped, true); assert.equal(f.store().read('run-native')!.state, 'MERGED'); assert.equal(f.store().list().length, 1);
+        assert.equal(f.registry().readLane('run:run-native')!.status, cut === 'registry' ? 'parked' : 'released');
+        f.setRegistryPublish(() => {});
+        if (saved) writeRunOwnerReceipt(f.receiptPath, saved);
+        const settled = await runMergedTransitionCommand(f.store(), 'run-native', f.github, f.registry(), async (op) => op());
+        assert.equal(settled.state, 'MERGED'); assert.equal(f.registry().readLane('run:run-native')!.status, 'released'); assert.equal(readRunOwnerReceipt(f.receiptPath)!.phase, 'released');
+        assert.equal(f.mergeCounts().squashes, 1); assert.equal(f.counts().submissions, 1); assert.equal(f.counts().modelCalls, 0);
+      } finally { f.cleanup(); }
+    }
+  });
+});
+
+it('recovers by the original control scope when host/config is absent and stops before B without manufacturing HOLD', async () => {
+  const f = fixture(true);
+  try {
+    f.seed('VALIDATING'); f.setSubmit(async (r) => ({ outcome: 'complete', evidence: f.terminal(r) })); await f.poll(); f.armMerge();
+    f.setMergeOperation(async () => { throw new Error('lost ack'); }); await f.poll();
+    f.setMergeHost(undefined); f.setRecoveryOnly();
+    const descriptor = issuedMergeRecoveryConfiguration(f.store().read('run-native')!);
+    assert.equal(descriptor.controlIssue, config.controlIssue); assert.equal(descriptor.revision, config.revision); assert.equal(descriptor.merge, undefined);
+    f.setMergeState('merged'); f.setMain(f.squash); f.tick();
+    // Neither queue access nor a new configured host is needed for recovery.
+    f.runtime.readQueueComment = async () => { throw new Error('recovery must not read the queue'); };
+    await f.poll({} as NativeReviewerHost); await f.poll({} as NativeReviewerHost);
+    assert.equal(f.store().read('run-native')!.state, 'MERGED'); assert.equal(f.store().list().length, 1);
+    assert.equal(f.registry().readLane('run:run-native')!.status, 'released'); assert.equal(f.mergeCounts().squashes, 1); assert.equal(f.counts().modelCalls, 0);
+  } finally { f.cleanup(); }
+});
+
+it('refuses absent-lane and receipt-less released native settlement even with qualified integration', async () => {
+  const f = fixture(true);
+  try {
+    f.seed('VALIDATING'); f.setSubmit(async (r) => ({ outcome: 'complete', evidence: f.terminal(r) })); await f.poll(); f.armMerge(); await f.poll();
+    const ready = f.store().read('run-native')!;
+    await assert.rejects(runMergedTransitionCommand(f.store(), ready.id, f.github, new MissionAdmissionRegistry({ filePath: path.join(f.directory, 'missing-lane.json'), config: admissionConfig }), async (op) => op()), /retained admission lane|owner receipt/);
+    assert.equal(f.store().read(ready.id)!.state, 'MERGE_READY');
+    await runMergedTransitionCommand(f.store(), ready.id, f.github, f.registry(), async (op) => op());
+    const receipt = readRunOwnerReceipt(f.receiptPath)!; rmSync(f.receiptPath);
+    await assert.rejects(runMergedTransitionCommand(f.store(), ready.id, f.github, f.registry(), async (op) => op()), /owner receipt|lane identity/);
+    assert.throws(() => isDispatchRunOwnerRetiredCommand(f.store(), f.store().read(ready.id)!, f.registry()), /receipt/);
+    writeRunOwnerReceipt(f.receiptPath, receipt);
+    assert.equal(isDispatchRunOwnerRetiredCommand(f.store(), f.store().read(ready.id)!, f.registry()), true);
+    assert.equal(f.mergeCounts().squashes, 1);
+  } finally { f.cleanup(); }
+});
+
+it('waits behind a foreign active captain and rejects overlapping ownership before merge initiation', async () => {
+  const f = fixture(true);
+  try {
+    f.seed('VALIDATING'); f.setSubmit(async (r) => ({ outcome: 'complete', evidence: f.terminal(r) })); await f.poll(); f.armMerge();
+    const foreign = f.registry().admit({ laneId: 'foreign-active', role: 'production_captain', highAutonomy: true, evidence: { repository: 'foreign/repo', issue: 99 } });
+    assert.equal(foreign.outcome, 'admitted');
+    const result = await f.poll(); assert.equal(result.outcome, 'admission_wait');
+    assert.equal(f.mergeCounts().squashes, 0); assert.equal(f.store().read('run-native')!.mergeAttempt, undefined); assert.equal(f.counts().modelCalls, 0);
+    assert.equal(f.store().list().length, 1);
+  } finally { f.cleanup(); }
+});
+
+describe('review repairs: exact owner normalization, fresh progression, stopped proof recovery and complete capabilities', () => {
+  async function armed(f: ReturnType<typeof fixture>) {
+    f.seed('VALIDATING'); f.setSubmit(async (r) => ({ outcome: 'complete', evidence: f.terminal(r) })); await f.poll(); f.armMerge();
+  }
+  async function uncertain(f: ReturnType<typeof fixture>) {
+    await armed(f); f.setMergeOperation(async () => { throw new Error('controlled lost ack'); }); await f.poll();
+    for (let i = 0; i < 3; i++) { f.tick(); await f.poll(); }
+    assert.equal(f.store().read('run-native')!.mergeAttempt!.observations, 3);
+    f.setMergeState('merged'); f.setMain(f.squash);
+  }
+  const bQueue = `${DISPATCH_QUEUE_MARKER}\nready:\n  - issue: 43\n    route: codex\n    profile: complex\n    task-shape-revision: task-v1\n    task-shape: interacting`;
+
+  it('rejects stale, foreign, invalid-phase/token parked receipts without overwriting bytes or ownership', async () => {
+    for (const bad of ['stale', 'future', 'foreign-mission', 'foreign-claim', 'foreign-workspace', 'foreign-run', 'execution-phase', 'wrong-pre-execution-generation', 'parked-token'] as const) {
+      const f = fixture(true);
+      try {
+        await uncertain(f);
+        const lane = f.registry().readLane('run:run-native')!;
+        const receipt = readRunOwnerReceipt(f.receiptPath)!;
+        const token = { laneId: lane.laneId, generation: lane.generation, token: 'unrelated-token' };
+        const corrupt = { ...receipt,
+          ...(bad === 'stale' ? { generation: receipt.generation - 2 } : {}),
+          ...(bad === 'future' ? { generation: receipt.generation + 2 } : {}),
+          ...(bad === 'foreign-mission' ? { missionId: 'foreign-mission' } : {}),
+          ...(bad === 'foreign-claim' ? { claimId: 'foreign-claim' } : {}),
+          ...(bad === 'foreign-workspace' ? { workspace: f.directory } : {}),
+          ...(bad === 'foreign-run' ? { runId: 'foreign-run' } : {}),
+          ...(bad === 'execution-phase' ? { phase: 'execution_possible', token } : {}),
+          ...(bad === 'wrong-pre-execution-generation' ? { phase: 'pre_execution', token } : {}),
+          ...(bad === 'parked-token' ? { token } : {}),
+        };
+        writeFileSync(f.receiptPath, JSON.stringify(corrupt));
+        const bytes = readFileSync(f.receiptPath);
+        const run = f.store().read('run-native')!;
+        await assert.rejects(runMergedTransitionCommand(f.store(), run.id, f.github, f.registry(), async (op) => op()), /receipt|generation|phase|owner|identity|schema/i, bad);
+        assert.deepEqual(readFileSync(f.receiptPath), bytes, bad);
+        assert.deepEqual(f.registry().readLane(lane.laneId), lane, bad);
+        assert.deepEqual(f.store().read(run.id), run, bad);
+        assert.equal(f.mergeCounts().squashes, 1); assert.equal(f.store().list().length, 1);
+      } finally { f.cleanup(); }
+    }
+  });
+
+  it('checks the receipt again inside the admission transaction and accepts only exact interrupted parking/readmission transitions', async () => {
+    for (const phase of ['transaction-race', 'park_transition', 'pre_execution'] as const) {
+      const f = fixture(true);
+      try {
+        await uncertain(f);
+        const lane = f.registry().readLane('run:run-native')!;
+        const receipt = readRunOwnerReceipt(f.receiptPath)!;
+        const admission = f.registry();
+        let raced: Buffer | undefined;
+        if (phase === 'transaction-race') {
+          const admit = admission.admit.bind(admission);
+          admission.admit = (request, options) => {
+            writeRunOwnerReceipt(f.receiptPath, { ...receipt, generation: receipt.generation - 2 });
+            raced = readFileSync(f.receiptPath);
+            return admit(request, options);
+          };
+          await assert.rejects(runMergedTransitionCommand(f.store(), 'run-native', f.github, admission, async (op) => op()), /receipt.*generation/i);
+          assert.deepEqual(readFileSync(f.receiptPath), raced);
+          assert.deepEqual(f.registry().readLane(lane.laneId), lane);
+        } else {
+          const generation = phase === 'park_transition' ? lane.generation - 1 : lane.generation + 1;
+          writeRunOwnerReceipt(f.receiptPath, { ...receipt, phase, generation, token: { laneId: lane.laneId, generation, token: 'interrupted-exact-generation' } });
+          const settled = await runMergedTransitionCommand(f.store(), 'run-native', f.github, admission, async (op) => op());
+          assert.equal(settled.state, 'MERGED'); assert.equal(readRunOwnerReceipt(f.receiptPath)!.phase, 'released');
+          assert.equal(f.registry().readLane(lane.laneId)!.status, 'released');
+        }
+        assert.equal(f.mergeCounts().squashes, 1); assert.equal(f.counts().modelCalls, 0);
+      } finally { f.cleanup(); }
+    }
+  });
+
+  it('requires fresh integration for missing/changed claims and absent/rerouted historical rows, then accepts a proven later main', async () => {
+    for (const claim of ['missing', 'changed'] as const) for (const row of ['absent', 'rerouted'] as const) for (const proof of ['bad-ancestry', 'unavailable'] as const) {
+      const f = fixture(true);
+      try {
+        await armed(f); await f.poll();
+        await runMergedTransitionCommand(f.store(), 'run-native', f.github, f.registry(), async (op) => op());
+        const settled = f.store().read('run-native')!;
+        const receipt = readFileSync(f.receiptPath);
+        if (claim === 'missing') f.runtime.comments = [];
+        else f.runtime.comments = [{ id: 'runtime', body: renderDispatchRuntime({ issue: 43, claimId: 'new-b-claim', runId: null, profile: 'complex', repairTaskShapeAuthority: authority, state: 'claimed', claimedAt: T0, heartbeatAt: T0, leaseUntil: T0 }) }];
+        f.runtime.readQueueComment = async () => row === 'absent' ? bQueue : `${DISPATCH_QUEUE_MARKER}\nready:\n  - issue: 42\n    route: human\n    profile: complex\n    task-shape-revision: task-v1\n    task-shape: interacting\n${bQueue.split('ready:\n')[1]}`;
+        const readDefault = f.github.readDefaultBranch!;
+        let defaultReads = 0;
+        f.github.readDefaultBranch = async (...args) => { defaultReads += 1; if (proof === 'unavailable') throw new Error('fresh proof unavailable'); return readDefault(...args); };
+        f.setAncestry(false); f.setMain(f.base);
+        const held = await f.poll({} as NativeReviewerHost);
+        assert.notEqual(held.outcome, 'dispatched', `${claim}/${row}/${proof}`);
+        assert.ok(defaultReads > 0, 'historical retirement must read current default branch');
+        assert.equal(f.store().list().length, 1); assert.deepEqual(f.store().read(settled.id), settled); assert.deepEqual(readFileSync(f.receiptPath), receipt);
+        const later = f.git('commit-tree', f.tree, '-p', f.squash, '-m', 'later main');
+        f.github.readDefaultBranch = async (...args) => { defaultReads += 1; return readDefault(...args); };
+        f.github.isAncestor = async (_o, _r, ancestor, descendant) => f.git('merge-base', ancestor, descendant) === ancestor;
+        f.setMain(later);
+        const next = await f.poll({} as NativeReviewerHost);
+        assert.equal(next.outcome, 'dispatched'); if (next.outcome !== 'dispatched') throw new Error('Expected actual successor admission.');
+        assert.equal(next.entry.issue, 43); assert.equal(f.store().list().length, 2); assert.equal(f.mergeCounts().squashes, 1); assert.equal(f.counts().modelCalls, 0);
+        assert.deepEqual(f.store().read(settled.id), settled, 'freshness cannot rewrite historical qualification');
+      } finally { f.cleanup(); }
+    }
+  });
+
+  it('completes proof-CAS-before-park stopped recovery through MERGED and B, while HOLD/revocation settles only A', async () => {
+    for (const held of [false, true]) {
+      const f = fixture(true);
+      try {
+        await armed(f);
+        const store = f.store(); const cas = store.updateIfUnchanged.bind(store); let tripped = false;
+        store.updateIfUnchanged = (expected, next) => {
+          const won = cas(expected, next);
+          if (won && !tripped && !expected.mergeAttempt?.qualification && next.mergeAttempt?.qualification) { tripped = true; throw new Error('controlled crash after qualification CAS before park'); }
+          return won;
+        };
+        await assert.rejects(f.poll(f.host, store), /controlled crash|Run changed/);
+        const run = f.store().read('run-native')!; const lane = f.registry().readLane('run:run-native')!;
+        assert.ok(run.mergeAttempt!.qualification); assert.equal(lane.status, 'active');
+        await assert.rejects(runMergedTransitionCommand(f.store(), run.id, f.github, f.registry(), async (op) => op()), /active|fenced/);
+        assert.throws(() => recoverRunAdmission(f.store(), f.registry(), run.id, lane.generation, false, f.receiptPath), /stopped/i);
+        f.setHold(held); f.setMergeHost(undefined);
+        recoverRunAdmission(f.store(), f.registry(), run.id, lane.generation, true, f.receiptPath);
+        assert.equal(f.registry().readLane(lane.laneId)!.status, 'released');
+        const released = readRunOwnerReceipt(f.receiptPath)!;
+        assert.equal(released.phase, 'released'); assert.equal(released.settlementReason, 'workflow_settled');
+        const result = await f.poll({} as NativeReviewerHost);
+        assert.equal(f.store().read(run.id)!.state, 'MERGED'); assert.equal(f.mergeCounts().squashes, 1); assert.equal(f.counts().submissions, 1); assert.equal(f.counts().modelCalls, 0);
+        assert.equal(f.registry().readLane(lane.laneId)!.status, 'released');
+        assert.equal(f.store().list().length, held ? 1 : 2);
+        assert.equal(result.outcome, held ? 'maintenance_hold' : 'dispatched');
+        if (held) { await f.poll({} as NativeReviewerHost); assert.equal(f.store().list().length, 1); }
+      } finally { f.cleanup(); }
+    }
+  });
+
+  it('rejects missing and noncallable complete capability sets before preparation, then settles with a complete set', async () => {
+    for (const method of ['squashPullRequest', 'readPullRequest', 'readDefaultBranch', 'readCommit', 'isAncestor'] as const) for (const value of [undefined, null, 'non-callable']) {
+      const f = fixture(true);
+      try {
+        await armed(f);
+        const original = f.github[method];
+        (f.github as unknown as Record<string, unknown>)[method] = value;
+        await f.poll();
+        assert.equal(f.mergeCounts().squashes, 0, `${method}/${value}`); assert.equal(f.store().read('run-native')!.mergeAttempt, undefined);
+        assert.equal(f.registry().readLane('run:run-native')!.status, 'parked'); assert.equal(f.counts().modelCalls, 0);
+        (f.github as unknown as Record<string, unknown>)[method] = original;
+        await f.poll();
+        const settled = await runMergedTransitionCommand(f.store(), 'run-native', f.github, f.registry(), async (op) => op());
+        assert.equal(settled.state, 'MERGED'); assert.equal(f.mergeCounts().squashes, 1); assert.equal(readRunOwnerReceipt(f.receiptPath)!.phase, 'released');
+      } finally { f.cleanup(); }
+    }
+  });
+});
+
+it('rechecks complete callable capabilities after asynchronous preparation and at the final submission fence', async () => {
+  for (const cut of ['before-preparation', 'before-marker', 'before-api'] as const) {
+    const f = fixture(true);
+    try {
+      f.seed('VALIDATING'); f.setSubmit(async (r) => ({ outcome: 'complete', evidence: f.terminal(r) })); await f.poll(); f.armMerge();
+      const original = f.github.readCommit; let capabilityRemoved = false;
+      if (cut === 'before-preparation') {
+        const read = f.github.readDefaultBranch!;
+        f.github.readDefaultBranch = async (...args) => { const result = await read(...args); capabilityRemoved = true; (f.github as unknown as Record<string, unknown>).readCommit = null; return result; };
+      }
+      const store = f.store(); const cas = store.updateIfUnchanged.bind(store);
+      if (cut !== 'before-preparation') store.updateIfUnchanged = (expected, next) => {
+        const won = cas(expected, next);
+        const trigger = cut === 'before-marker' ? !expected.mergeAttempt && next.mergeAttempt !== undefined : expected.mergeAttempt?.submissionPossible === false && next.mergeAttempt?.submissionPossible;
+        if (won && trigger) { capabilityRemoved = true; (f.github as unknown as Record<string, unknown>).readCommit = null; }
+        return won;
+      };
+      await f.poll(f.host, store);
+      const attempt = f.store().read('run-native')!.mergeAttempt;
+      assert.equal(capabilityRemoved, true, 'capability cut must actually execute');
+      assert.equal(f.mergeCounts().squashes, 0, cut);
+      if (cut === 'before-preparation') assert.equal(attempt, undefined);
+      else assert.equal(attempt!.submissionPossible, cut === 'before-api');
+      assert.equal(f.store().list().length, 1); assert.equal(f.counts().modelCalls, 0);
+      (f.github as unknown as Record<string, unknown>).readCommit = original;
+    } finally { f.cleanup(); }
+  }
+});
+
+it('recovers every interrupted stopped-parking/release publication through MERGED and safe B admission', async () => {
+  for (const cut of ['before-park-registry', 'after-park-registry', 'before-release-registry', 'after-release-registry'] as const) {
+    const f = fixture(true);
+    try {
+      f.seed('VALIDATING'); f.setSubmit(async (r) => ({ outcome: 'complete', evidence: f.terminal(r) })); await f.poll(); f.armMerge();
+      const store = f.store(); const cas = store.updateIfUnchanged.bind(store); let crashed = false;
+      store.updateIfUnchanged = (expected, next) => {
+        const won = cas(expected, next);
+        if (won && !crashed && !expected.mergeAttempt?.qualification && next.mergeAttempt?.qualification) { crashed = true; throw new Error('controlled qualified-before-park crash'); }
+        return won;
+      };
+      await assert.rejects(f.poll(f.host, store), /controlled qualified|Run changed/);
+      let tripped = false; let saved: ReturnType<typeof readRunOwnerReceipt> = null;
+      f.setRegistryPublish(() => {
+        if (tripped) return;
+        const receipt = readRunOwnerReceipt(f.receiptPath)!;
+        const phase = cut.includes('park-') ? 'park_transition' : 'parked_release_transition';
+        if (receipt.phase !== phase) return;
+        tripped = true;
+        if (cut.startsWith('before')) throw new Error(`controlled ${cut}`);
+        saved = receipt; writeFileSync(f.receiptPath, '{controlled interrupted receipt finalization');
+      });
+      const firstLane = f.registry().readLane('run:run-native')!;
+      assert.throws(() => recoverRunAdmission(f.store(), f.registry(), 'run-native', firstLane.generation, true, f.receiptPath), /controlled|corrupt/);
+      assert.equal(tripped, true, cut); assert.equal(f.store().list().length, 1); assert.equal(f.store().read('run-native')!.state, 'MERGE_READY');
+      f.setRegistryPublish(() => {}); if (saved) writeRunOwnerReceipt(f.receiptPath, saved);
+      const lane = f.registry().readLane('run:run-native')!;
+      recoverRunAdmission(f.store(), f.registry(), 'run-native', lane.status === 'released' ? lane.generation - 1 : lane.generation, true, f.receiptPath);
+      const released = readRunOwnerReceipt(f.receiptPath)!;
+      assert.equal(released.phase, 'released'); assert.equal(released.settlementReason, 'workflow_settled');
+      const successor = await f.poll({} as NativeReviewerHost);
+      assert.equal(f.store().read('run-native')!.state, 'MERGED'); assert.equal(successor.outcome, 'dispatched');
+      if (successor.outcome !== 'dispatched') throw new Error('Expected safe successor.');
+      assert.equal(successor.entry.issue, 43); assert.equal(f.store().list().length, 2); assert.equal(f.mergeCounts().squashes, 1); assert.equal(f.counts().modelCalls, 0);
+    } finally { f.cleanup(); }
+  }
+});
+
+describe('non-delivery native retirement classification', () => {
+  const bQueue = `${DISPATCH_QUEUE_MARKER}\nready:\n  - issue: 43\n    route: codex\n    profile: complex\n    task-shape-revision: task-v1\n    task-shape: interacting`;
+  function claimAndRows(f: ReturnType<typeof fixture>, claim: 'retained' | 'missing' | 'changed', row: 'retained' | 'absent' | 'rerouted') {
+    if (claim === 'missing') f.runtime.comments = [];
+    if (claim === 'changed') f.runtime.comments = [{ id: 'runtime', body: renderDispatchRuntime({ issue: 43, claimId: 'new-b-claim', runId: null, profile: 'complex', repairTaskShapeAuthority: authority, state: 'claimed', claimedAt: T0, heartbeatAt: T0, leaseUntil: T0 }) }];
+    if (row !== 'retained') f.runtime.readQueueComment = async () => row === 'absent' ? bQueue : `${DISPATCH_QUEUE_MARKER}\nready:\n  - issue: 42\n    route: human\n    profile: complex\n    task-shape-revision: task-v1\n    task-shape: interacting\n${bQueue.split('ready:\n')[1]}`;
+  }
+  async function retiredBindingWait(f: ReturnType<typeof fixture>) {
+    f.seed('READY'); await f.poll({} as NativeReviewerHost);
+    const run = f.store().read('run-native')!;
+    assert.equal(run.nativeReview!.wait!.kind, 'binding'); assert.deepEqual(run.nativeReview!.requests, []); assert.equal(run.mergeAttempt, undefined);
+    const receipt = readRunOwnerReceipt(f.receiptPath)!;
+    recoverRunAdmission(f.store(), f.registry(), run.id, receipt.generation, true, f.receiptPath, { retireWork: true });
+    assert.equal(isDispatchRunOwnerRetiredCommand(f.store(), run, f.registry()), true);
+    assert.equal(readRunOwnerReceipt(f.receiptPath)!.workDisposition, 'retired');
+    return { run, receipt: readFileSync(f.receiptPath), lane: f.registry().readLane('run:run-native')! };
+  }
+
+  it('preserves legal explicit unissued retirement immediately and when due across retained/missing/changed claims and retained/absent/rerouted rows', async () => {
+    for (const due of [false, true]) for (const claim of ['retained', 'missing', 'changed'] as const) for (const row of ['retained', 'absent', 'rerouted'] as const) {
+      const f = fixture(true);
+      try {
+        const retired = await retiredBindingWait(f);
+        if (due) f.tick(); claimAndRows(f, claim, row);
+        // Non-delivery retirement must not demand a GitHub integration proof.
+        f.github.readDefaultBranch = async () => { throw new Error('retired unissued work has no merge integration'); };
+        const result = await f.poll({} as NativeReviewerHost);
+        assert.equal(result.outcome, 'dispatched', `${due}/${claim}/${row}`);
+        if (result.outcome !== 'dispatched') throw new Error('Expected actual successor admission.');
+        assert.equal(result.entry.issue, 43); assert.equal(result.execution.state, 'WAITING_DEPENDENCY');
+        assert.deepEqual(readFileSync(f.receiptPath), retired.receipt, 'A receipt cannot be overwritten by due wait reentry');
+        assert.deepEqual(f.store().read(retired.run.id), retired.run); assert.deepEqual(f.registry().readLane('run:run-native'), retired.lane);
+        assert.equal(f.store().list().length, 2); assert.equal(f.counts().submissions, 0); assert.equal(f.counts().modelCalls, 0); assert.equal(f.mergeCounts().squashes, 0);
+      } finally { f.cleanup(); }
+    }
+  });
+
+  it('preserves a legally offered unissued cancellation as non-delivery and admits B without claiming A merged', async () => {
+    for (const claim of ['retained', 'missing', 'changed'] as const) {
+      const f = fixture(true);
+      try {
+        f.seed(); f.setSubmit(async (r) => ({ outcome: 'complete', evidence: f.terminal(r) }));
+        f.setSnapshotHook(() => { if (f.counts().snapshotReads === 3) f.setLiveHead('e'.repeat(40)); });
+        await f.poll();
+        const offered = f.store().read('run-native')!;
+        assert.equal(offered.state, 'NEEDS_HUMAN'); assert.ok(offered.interrupt!.choices!.includes('Cancel the run'));
+        assert.equal(offered.mergeAttempt, undefined); assert.ok(activeNativeReview(offered), 'control must complete native review before the final-gate HEAD drift'); assert.equal(activeNativeReview(offered)!.status, 'qualified_complete');
+        const cancelled = await resumeCommand(f.workflow(), offered.id, 'Cancel the run', { dispatchClaimId: offered.dispatchClaimId, admission: f.registry(), runOwnerReceiptPath: f.receiptPath, admissionWorkspace: f.repository, now: f.now, withDispatchAdmissionLock: async (op) => op() });
+        assert.equal(cancelled.run.state, 'FAILED'); assert.equal(cancelled.run.history.at(-1)!.reason, 'Cancel the run');
+        assert.equal(readRunOwnerReceipt(f.receiptPath)!.workDisposition, 'cancelled');
+        const receipt = readFileSync(f.receiptPath); const lane = f.registry().readLane('run:run-native');
+        const cancelledDurable = f.store().read(offered.id)!; const cancelledBytes = readFileSync(path.join(f.directory, 'runs', `${offered.id}.json`));
+        f.tick(); claimAndRows(f, claim, claim === 'retained' ? 'retained' : 'absent');
+        f.github.readDefaultBranch = async () => { throw new Error('cancelled unissued work has no merge integration'); };
+        const result = await f.poll({} as NativeReviewerHost);
+        assert.equal(result.outcome, 'dispatched'); if (result.outcome !== 'dispatched') throw new Error('Expected successor.');
+        assert.equal(result.entry.issue, 43); assert.equal(f.store().list().length, 2);
+        assert.deepEqual(readFileSync(f.receiptPath), receipt); assert.deepEqual(f.registry().readLane('run:run-native'), lane); assert.deepEqual(f.store().read(offered.id), cancelledDurable); assert.deepEqual(readFileSync(path.join(f.directory, 'runs', `${offered.id}.json`)), cancelledBytes);
+        assert.equal(f.counts().submissions, 1, 'completed review is retained; no subsequent review or implementation runs'); assert.equal(f.counts().modelCalls, 0); assert.equal(f.mergeCounts().squashes, 0);
+      } finally { f.cleanup(); }
+    }
+  });
+
+  it('keeps bare stopped release distinct from explicit work disposition and retains unresolved review/merge fences', async () => {
+    for (const kind of ['release-only', 'pending-review', 'possible-merge'] as const) {
+      const f = fixture(true);
+      try {
+        if (kind === 'release-only') { f.seed('READY'); await f.poll({} as NativeReviewerHost); }
+        else if (kind === 'pending-review') { f.seed(); await f.poll(); }
+        else {
+          f.seed('VALIDATING'); f.setSubmit(async (r) => ({ outcome: 'complete', evidence: f.terminal(r) })); await f.poll(); f.armMerge();
+          f.setMergeOperation(async () => { throw new Error('possible merge unknown'); }); await f.poll();
+        }
+        const run = f.store().read('run-native')!; const receipt = readRunOwnerReceipt(f.receiptPath)!; const bytes = readFileSync(f.receiptPath);
+        if (kind === 'release-only') {
+          recoverRunAdmission(f.store(), f.registry(), run.id, receipt.generation, true, f.receiptPath);
+          assert.equal(readRunOwnerReceipt(f.receiptPath)!.workDisposition, undefined);
+          assert.equal(isDispatchRunOwnerRetiredCommand(f.store(), run, f.registry()), false);
+          const held = await f.poll({} as NativeReviewerHost); assert.notEqual(held.outcome, 'dispatched');
+          f.tick(); const resumed = await f.poll({} as NativeReviewerHost);
+          assert.equal(resumed.outcome, 'dispatched'); if (resumed.outcome !== 'dispatched') throw new Error('Expected unretired A to resume.');
+          assert.equal(resumed.entry.issue, 42, 'capability release without disposition cannot authorize successor B');
+          assert.equal(readRunOwnerReceipt(f.receiptPath)!.workDisposition, undefined);
+        } else {
+          assert.throws(() => recoverRunAdmission(f.store(), f.registry(), run.id, receipt.generation, true, f.receiptPath, { retireWork: true }), /cannot retire/);
+          assert.deepEqual(readFileSync(f.receiptPath), bytes);
+          assert.equal((await f.poll()).outcome, 'existing_claim');
+        }
+        assert.equal(f.store().list().length, 1); assert.equal(f.counts().modelCalls, 0); assert.equal(f.mergeCounts().squashes, kind === 'possible-merge' ? 1 : 0);
+      } finally { f.cleanup(); }
+    }
+  });
+
+  it('continues to require fresh native delivered ancestry even when historical claim/row are absent', async () => {
+    const f = fixture(true);
+    try {
+      f.seed('VALIDATING'); f.setSubmit(async (r) => ({ outcome: 'complete', evidence: f.terminal(r) })); await f.poll(); f.armMerge(); await f.poll();
+      await runMergedTransitionCommand(f.store(), 'run-native', f.github, f.registry(), async (op) => op());
+      const run = f.store().read('run-native')!; const receipt = readFileSync(f.receiptPath);
+      claimAndRows(f, 'missing', 'absent'); f.setMain(f.base); f.setAncestry(false);
+      const held = await f.poll({} as NativeReviewerHost);
+      assert.notEqual(held.outcome, 'dispatched'); assert.equal(f.store().list().length, 1);
+      assert.deepEqual(f.store().read(run.id), run); assert.deepEqual(readFileSync(f.receiptPath), receipt); assert.equal(f.mergeCounts().squashes, 1);
+    } finally { f.cleanup(); }
+  });
+  it('does not respawn same-authority retired A or treat a revised nonterminal row as a new incarnation', async () => {
+    for (const variant of ['same-authority', 'revised-nonterminal'] as const) {
+      const f = fixture(true);
+      try {
+        const retired = await retiredBindingWait(f); f.tick();
+        f.runtime.readQueueComment = async () => variant === 'same-authority'
+          ? queue.replace(/  - issue: 43[\s\S]*$/, '')
+          : queue.replace('task-shape-revision: task-v1', 'task-shape-revision: task-v2');
+        const result = await f.poll({} as NativeReviewerHost);
+        assert.equal(result.outcome, 'no_eligible_work'); assert.equal(f.store().list().length, 1);
+        assert.deepEqual(readFileSync(f.receiptPath), retired.receipt); assert.deepEqual(f.store().read(retired.run.id), retired.run);
+        assert.equal(f.counts().submissions, 0); assert.equal(f.counts().modelCalls, 0); assert.equal(f.mergeCounts().squashes, 0);
+        if (result.outcome === 'no_eligible_work') assert.match(result.reasons.join(' '), variant === 'same-authority' ? /retirement prevents.*respawn/ : /terminal disposition/);
+      } finally { f.cleanup(); }
+    }
+  });
+
+  it('keeps retired unissued work behind maintenance HOLD without reopening A or admitting B', async () => {
+    const f = fixture(true);
+    try {
+      const retired = await retiredBindingWait(f); f.tick(); f.setHold(true);
+      assert.equal((await f.poll({} as NativeReviewerHost)).outcome, 'maintenance_hold');
+      assert.deepEqual(readFileSync(f.receiptPath), retired.receipt); assert.deepEqual(f.store().read(retired.run.id), retired.run);
+      assert.deepEqual(f.registry().readLane('run:run-native'), retired.lane); assert.equal(f.store().list().length, 1);
+      assert.equal(f.counts().modelCalls, 0); assert.equal(f.counts().submissions, 0); assert.equal(f.mergeCounts().squashes, 0);
+    } finally { f.cleanup(); }
+  });
+
 });

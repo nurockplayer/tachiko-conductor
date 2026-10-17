@@ -194,6 +194,40 @@ export class LiveGitHubAdapter implements GitHubAdapter {
     this.now = options.now ?? (() => new Date().toISOString());
   }
 
+  async squashPullRequest(owner: string, repo: string, number: number, expectedHead: string): Promise<void> {
+    if (!/^[0-9a-f]{40}$/.test(expectedHead) || !Number.isSafeInteger(number) || number < 1) throw new Error('Squash requires exact PR and expected HEAD.');
+    const write = this.transport as Partial<GitHubWriteTransport>;
+    if (!write.write) throw new Error('Expected-HEAD squash transport unavailable.');
+    const result = asRecord(await write.write(`repos/${owner}/${repo}/pulls/${number}/merge`, 'PUT', { sha: expectedHead, merge_method: 'squash' }));
+    if (result?.merged !== true) throw new Error('Squash acknowledgement is absent or negative; observe the original attempt.');
+  }
+
+  async readDefaultBranch(owner: string, repo: string): Promise<{ branch: string; headSha: string }> {
+    const repositoryPath = `repos/${owner}/${repo}`;
+    const repository = asRecordOrThrow(await this.transport.get(repositoryPath), repositoryPath);
+    const branch = requireString(repository, 'default_branch', repositoryPath);
+    const commitPath = `${repositoryPath}/commits/${encodeURIComponent(branch)}`;
+    const commit = asRecordOrThrow(await this.transport.get(commitPath), commitPath);
+    return { branch, headSha: requireString(commit, 'sha', commitPath) };
+  }
+
+  async readCommit(owner: string, repo: string, sha: string): Promise<{ sha: string; treeSha: string; parents: readonly string[] }> {
+    if (!/^[0-9a-f]{40}$/.test(sha)) throw new Error('Commit proof requires exact SHA.');
+    const path = `repos/${owner}/${repo}/git/commits/${sha}`;
+    const commit = asRecordOrThrow(await this.transport.get(path), path);
+    const tree = asRecordOrThrow(commit.tree, path);
+    if (!Array.isArray(commit.parents)) throw invalid(path, 'commit parents unavailable');
+    return { sha: requireString(commit, 'sha', path), treeSha: requireString(tree, 'sha', path), parents: commit.parents.map((parent) => requireString(asRecordOrThrow(parent, path), 'sha', path)) };
+  }
+
+  async isAncestor(owner: string, repo: string, ancestor: string, descendant: string): Promise<boolean> {
+    if (![ancestor, descendant].every((sha) => /^[0-9a-f]{40}$/.test(sha))) throw new Error('Ancestry requires exact commits.');
+    const path = `repos/${owner}/${repo}/compare/${ancestor}...${descendant}`;
+    const result = asRecordOrThrow(await this.transport.get(path), path);
+    const base = asRecord(result.merge_base_commit);
+    return ['ahead', 'identical'].includes(String(result.status)) && base?.sha === ancestor;
+  }
+
   async createImplementationPullRequest(request: CreateImplementationPullRequestRequest): Promise<{ readonly number: number }> {
     const transport = this.transport as Partial<GitHubWriteTransport>;
     if (typeof transport.write !== 'function') {
@@ -474,6 +508,7 @@ export class LiveGitHubAdapter implements GitHubAdapter {
       headSha: requireString(head, 'sha', path),
       baseSha: requireString(base, 'sha', path),
       state: normalizePullState(record, path),
+      ...(record.merged === true && typeof record.merge_commit_sha === 'string' ? { mergeCommitSha: record.merge_commit_sha } : {}),
     };
   }
 
@@ -579,6 +614,7 @@ export class LiveGitHubAdapter implements GitHubAdapter {
       title: requireString(record, 'title', path),
       url: requireString(record, 'html_url', path),
       state: normalizePullState(record, path),
+      ...(record.merged === true && typeof record.merge_commit_sha === 'string' ? { mergeCommitSha: record.merge_commit_sha } : {}),
       isDraft: record.draft,
       mergeable: typeof record.mergeable === 'boolean' ? record.mergeable : null,
       mergeStateStatus:

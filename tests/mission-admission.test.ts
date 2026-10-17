@@ -1707,3 +1707,35 @@ describe('provider-neutral durable mission admission', () => {
     } finally { rmSync(directory, { recursive: true, force: true }); }
   });
 });
+
+it('keeps one-argument admission callers compatible and validates a detached predecessor under the ownership transaction', () => {
+  const f = fixture();
+  try {
+    const request = { laneId: 'callback-compatibility', role: 'production_captain' as const, evidence: evidence(791) };
+    let legacyCalls = 0;
+    const first = f.registry.admit(request, { beforePublish: (candidate) => { assert.equal(candidate.outcome, 'admitted'); legacyCalls += 1; } });
+    assert.equal(first.outcome, 'admitted'); if (first.outcome !== 'admitted') throw new Error('Expected initial admission.');
+    assert.equal(legacyCalls, 1);
+    f.registry.park(first.token, 'workflow_wait');
+    const parked = f.registry.readLane(request.laneId)!;
+    const rival = new MissionAdmissionRegistry({ filePath: f.filePath, config, lockTimeoutMs: 20, lockRetryMs: 1 });
+    const admitted = f.registry.admit(request, { beforePublish: (candidate, previous) => {
+      assert.deepEqual(previous, parked);
+      assert.equal(previous!.missionId, candidate.missionId); assert.equal(candidate.token.generation, previous!.generation + 1);
+      assert.equal('token' in previous!, false);
+      assert.throws(() => rival.admit({ ...request, laneId: 'rival-in-transaction' }), /lock|timed out/i);
+      // Mutating the detached view cannot rewrite persisted candidate evidence.
+      (previous!.evidence as { issue?: number }).issue = 999;
+    } });
+    assert.equal(admitted.outcome, 'admitted');
+    const current = f.registry.readLane(request.laneId)!;
+    assert.equal(current.evidence.issue, 791); assert.equal(current.generation, parked.generation + 1);
+    if (admitted.outcome !== 'admitted') throw new Error('Expected re-admission.');
+    f.registry.park(admitted.token, 'workflow_wait');
+    const before = readFileSync(f.filePath);
+    assert.throws(() => f.registry.admit(request, { beforePublish: (_candidate, previous) => {
+      assert.equal(previous!.status, 'parked'); throw new Error('exact predecessor receipt rejected');
+    } }), /exact predecessor receipt rejected/);
+    assert.deepEqual(readFileSync(f.filePath), before, 'callback rejection publishes no successor generation');
+  } finally { rmSync(f.directory, { recursive: true, force: true }); }
+});

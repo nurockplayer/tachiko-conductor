@@ -63,6 +63,7 @@ export const TRANSITION_TYPES = [
   'repair_executor_handoff',
   'repair_executor_continued',
   'revalidate',
+  'recheck_readiness',
   'gate_blocked',
   'merged',
   'wait_dependency',
@@ -286,6 +287,8 @@ export interface Run {
     readonly accepted?: import('../oracle/types.js').NativeReviewAcceptance;
     readonly wait?: { readonly kind: 'binding' | 'request' | 'lead' | 'qualification'; readonly nextAttemptAt: string };
   };
+  /** Single durable native merge attempt; existing Run CAS is its only lifecycle authority. */
+  readonly mergeAttempt?: import('../workflow/merge.js').NativeMergeAttempt;
   /** Latest validation result, bound to an exact HEAD SHA. */
   readonly validationResult?: ValidationResult;
   /** Current HEAD SHA of the implementation, when known. */

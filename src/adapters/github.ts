@@ -102,6 +102,8 @@ export interface GitHubLivePullRequestSnapshot extends PullRequestSnapshot {
   readonly mergeable: boolean | null;
   readonly mergeStateStatus: string | null;
   readonly updatedAt: string;
+  /** Actual commit only when direct PR read reports merged; synthetic values are never proof. */
+  readonly mergeCommitSha?: string;
   readonly headRef?: string;
   readonly headRepository?: { readonly owner: string; readonly repo: string } | null;
   readonly baseRef?: string;
@@ -145,6 +147,10 @@ export interface GitHubLiveSnapshot {
  */
 export interface GitHubAdapter {
   readonly kind: 'github';
+  squashPullRequest?(owner: string, repo: string, number: number, expectedHead: string): Promise<void>;
+  readDefaultBranch?(owner: string, repo: string): Promise<{ readonly branch: string; readonly headSha: string }>;
+  readCommit?(owner: string, repo: string, sha: string): Promise<{ readonly sha: string; readonly treeSha: string; readonly parents: readonly string[] }>;
+  isAncestor?(owner: string, repo: string, ancestor: string, descendant: string): Promise<boolean>;
   /** Issue-scoped read; inherently issue-specific. */
   readIssue(target: IssueTarget): Promise<IssueSnapshot>;
   /** Branch-scoped read (HEAD + PRs) for repository-target runs. */

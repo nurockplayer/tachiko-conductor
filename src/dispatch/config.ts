@@ -1,8 +1,11 @@
+import { validMergePolicy, type NativeMergePolicy } from '../workflow/merge.js';
 import type { DispatchControlLocation } from './github-runtime.js';
 
 export interface DispatchConfiguration extends DispatchControlLocation {
   readonly revision: string;
   readonly leaseDurationMs: number;
+  /** A descriptor alone cannot enable issuance; the accepted host must supply the identical binding. */
+  readonly merge?: NativeMergePolicy;
 }
 
 function record(value: unknown): Record<string, unknown> | null {
@@ -26,10 +29,12 @@ export function parseDispatchConfiguration(raw: string): DispatchConfiguration {
   const parsed = record(value);
   if (parsed === null) throw new Error('TACHIKO_DISPATCH_CONFIG must be an object.');
   const expected = ['controlIssue', 'leaseDurationMs', 'owner', 'queueCommentId', 'repo', 'revision'];
-  if (Object.keys(parsed).sort().join(',') !== expected.join(',')) {
-    throw new Error('TACHIKO_DISPATCH_CONFIG must contain exactly revision, owner, repo, controlIssue, queueCommentId, and leaseDurationMs.');
+  if (Object.keys(parsed).filter((key) => key !== 'merge').sort().join(',') !== expected.join(',')) {
+    throw new Error('TACHIKO_DISPATCH_CONFIG must contain exactly revision, owner, repo, controlIssue, queueCommentId, and leaseDurationMs, with optional merge.');
   }
+  if (parsed.merge !== undefined && (!validMergePolicy(parsed.merge) || parsed.merge.dispatchRevision !== parsed.revision || parsed.merge.owner !== parsed.owner || parsed.merge.repo !== parsed.repo || parsed.merge.controlIssue !== parsed.controlIssue || parsed.merge.queueCommentId !== parsed.queueCommentId)) throw new Error('TACHIKO_DISPATCH_CONFIG.merge must exactly bind the accepted release policy and dispatch scope.');
   return {
+    ...(parsed.merge === undefined ? {} : { merge: Object.freeze(structuredClone(parsed.merge as NativeMergePolicy)) }),
     revision: string(parsed.revision, 'revision'), owner: string(parsed.owner, 'owner'), repo: string(parsed.repo, 'repo'),
     controlIssue: integer(parsed.controlIssue, 'controlIssue'), queueCommentId: integer(parsed.queueCommentId, 'queueCommentId'),
     leaseDurationMs: integer(parsed.leaseDurationMs, 'leaseDurationMs'),
