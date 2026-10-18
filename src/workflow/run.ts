@@ -1668,6 +1668,7 @@ export async function runWorkflow(
               strengthenAdmissionEvidence(options, reviewRun, executionWorkspace === undefined ? {} : { workspace: executionWorkspace });
               assertCurrentMutationAdmission(options);
             },
+            assertCurrentPlanning: () => options.admissionFence?.registry.assertCurrentOwner(options.admissionFence.token),
             assertCurrentMutation: () => assertCurrentMutationAdmission(options),
             assertCanPublish: () => assertPublicationAdmission(options),
           },

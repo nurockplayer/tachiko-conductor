@@ -63,6 +63,8 @@ export interface ReviewLoopDependencies {
   readonly resolveImplementationCapabilities?: ImplementationCapabilityResolver;
   /** Provider-neutral mutation fence rechecked immediately before a repair worker starts. */
   readonly assertCanMutate?: (workspacePath?: string) => void;
+  /** Current lane ownership before workspace identity exists; never grants mutation rights. */
+  readonly assertCurrentPlanning?: () => void;
   /** Generation-only recheck after uncertainty is marked; must not strengthen evidence. */
   readonly assertCurrentMutation?: () => void;
   /** Rechecks publication authority immediately before standalone host push. */
@@ -269,13 +271,16 @@ function assertFinalRepairAdmission(run: Run, store: RunStore, assertCurrentMuta
 function establishRepairPlanningAdmission(run: Run, store: RunStore, deps: ReviewLoopDependencies): void {
   // Planning is read-only, but its eventual identity remains bound to this
   // exact Run. Production mutation admission is established after persistence.
-  assertFinalRepairAdmission(run, store);
-  if (deps.governedPublicationRequired === true &&
-      (deps.assertCanMutate === undefined || deps.assertCurrentMutation === undefined)) {
-    throw new ExecutionAdmissionRefusal('Governed repair planning is missing a host admission callback.', false, {
-      cause: new Error('Current repair planning admission callback is unavailable.'),
-    });
-  }
+  assertFinalRepairAdmission(run, store, () => {
+    if (deps.governedPublicationRequired === true &&
+        (deps.assertCanMutate === undefined || deps.assertCurrentMutation === undefined)) {
+      throw new ExecutionAdmissionRefusal('Governed repair planning is missing a host admission callback.', false, {
+        cause: new Error('Current repair planning admission callback is unavailable.'),
+      });
+    }
+    (deps.assertCurrentPlanning ?? deps.assertCurrentMutation)?.();
+    deps.assertNormalInitiation?.(run);
+  });
 }
 
 function assertRepairPlanIdentity(
@@ -781,9 +786,7 @@ export async function runReviewLoop(
           assertFinalRepairAdmission(expected, store);
           assertRepairPlanIdentity(bootstrap, repairBootstrap, target, baseBranch, baseSha, publicationBranch);
           const prepared = applyTransition(run, { type: 'bootstrap_prepared', bootstrap }, now());
-          assertFinalRepairAdmission(expected, store, deps.assertCurrentMutation,
-            deps.governedPublicationRequired === true);
-          deps.assertNormalInitiation?.(expected);
+          establishRepairPlanningAdmission(expected, store, deps);
           persistRepairBootstrap(store, expected, prepared);
           run = prepared;
           deps.assertCanMutate?.(bootstrap.workspacePath);

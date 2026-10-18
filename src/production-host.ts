@@ -16,6 +16,27 @@ import { bindNativeMergeFence, readMergeCandidate, validMergePolicy, type Native
 
 export const ACCEPTED_STATE_COMPATIBILITY = 'conductor-native-state-v1';
 export const PRODUCTION_ENTRY = 'dist/production-entry.js';
+export const WORKER_PNPM_ALIAS = 'worker-bin/pnpm';
+function assertWorkerInterpreter(node: string): void {
+  // The kernel splits a shebang on whitespace; no shell or env fallback is supported.
+  if (!path.isAbsolute(node) || path.normalize(node) !== node || /[\s\u0000-\u001f\u007f]/u.test(node) || Buffer.byteLength(`#!${node} --no-global-search-paths\n`, 'utf8') > 127) {
+    throw new Error('Unsupported worker Node shebang interpreter representation.');
+  }
+}
+/** Only canonical, delimiter-free segments may establish ordinary worker lookup. */
+export function workerCommandPath(node: string, git: string, workerBin: string): string {
+  assertWorkerInterpreter(node);
+  const directories = [workerBin, path.dirname(node), path.dirname(git)];
+  if (directories.some(directory => !path.isAbsolute(directory) || path.normalize(directory) !== directory || /[:\u0000-\u001f\u007f]/u.test(directory))) {
+    throw new Error('Unsupported worker PATH segment representation.');
+  }
+  return [...directories, '/usr/bin', '/bin'].join(':');
+}
+/** Fixed accepted artifact, not a runtime-generated or configurable loader. */
+export function workerPnpmAlias(node: string, pnpm: string): string {
+  assertWorkerInterpreter(node);
+  return `#!${node} --no-global-search-paths\nimport { spawnSync } from 'node:child_process';\nconst result = spawnSync(${JSON.stringify(pnpm)}, process.argv.slice(2), { stdio: 'inherit', env: process.env });\nprocess.exit(result.error ? 127 : result.status ?? 1);\n`;
+}
 const SHA = /^[a-f0-9]{64}$/;
 const COMMIT = /^[a-f0-9]{40}$/;
 const COMPONENT = /^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/;
@@ -237,7 +258,13 @@ export function resolveProductionHost(entryUrl: string, runner: ProcessRunner = 
     const recordRaw = readProtected(home, recordPath); const r = validateRelease(home, root, entry, recordRaw);
     const inventory=installationInventory(home,root,r);
     let policyReason: string | undefined;
-    try { assertProductionPolicyConfiguration(r.environment); if(r.environment.TACHIKO_IMPLEMENTATION_AGENT!=='luna-isolated'||r.mergePolicy.localValidationRevision!==PRODUCTION_POLICY_REVISION||r.mergePolicy.hostedValidationRevision!==PRODUCTION_POLICY_REVISION)throw new Error('Accepted initiation policy contradicts the unchanged routine-only v7 Luna contract.'); }
+    let workerPath = '/usr/bin:/bin';
+    try {
+      const acceptedWorkerPath = workerCommandPath(r.node.path, r.git.path, path.join(root, path.dirname(WORKER_PNPM_ALIAS)));
+      // A missing/unsupported worker launcher removes initiation only. The
+      // compatible immutable installation can still observe an issued attempt.
+      program(home, { path: path.join(root, WORKER_PNPM_ALIAS), sha256: digest(workerPnpmAlias(r.node.path, r.pnpm.path)) });
+      assertProductionPolicyConfiguration(r.environment); if(r.environment.TACHIKO_IMPLEMENTATION_AGENT!=='luna-isolated'||r.mergePolicy.localValidationRevision!==PRODUCTION_POLICY_REVISION||r.mergePolicy.hostedValidationRevision!==PRODUCTION_POLICY_REVISION)throw new Error('Accepted initiation policy contradicts the unchanged routine-only v7 Luna contract.'); workerPath = acceptedWorkerPath; }
     catch(error){policyReason=error instanceof Error?error.message:String(error);}
     const initiationPolicy=Object.freeze({available:policyReason===undefined,reason:policyReason??'Exact routine-only v7 production configuration; held runtime/host qualification remains separate.'});
     const configFile = path.join(accountRoot, 'production/host.json'); const dispatchFile = path.join(accountRoot, 'production/dispatch.json');
@@ -263,7 +290,7 @@ export function resolveProductionHost(entryUrl: string, runner: ProcessRunner = 
         reason = 'Accepted merge constructor configured; actual host/service qualification remains external.';
       }
     } catch (e) { reason = `Merge unavailable: ${e instanceof Error ? e.message : String(e)}`; }
-    const hostEnv: NodeJS.ProcessEnv = Object.freeze({ HOME: home, PATH: `${path.dirname(r.node.path)}:${path.dirname(r.git.path)}:/usr/bin:/bin`, LANG:'C', LC_ALL:'C', GH_CONFIG_DIR:r.github.configDirectory, GH_HOST:'github.com', GH_PROMPT_DISABLED:'1', GIT_CONFIG_NOSYSTEM:'1', GIT_CONFIG_GLOBAL:'/dev/null', GIT_CONFIG_COUNT:'0', GIT_TERMINAL_PROMPT:'0', GIT_NO_REPLACE_OBJECTS:'1' });
+    const hostEnv: NodeJS.ProcessEnv = Object.freeze({ HOME: home, PATH: workerPath, LANG:'C', LC_ALL:'C', GH_CONFIG_DIR:r.github.configDirectory, GH_HOST:'github.com', GH_PROMPT_DISABLED:'1', GIT_CONFIG_NOSYSTEM:'1', GIT_CONFIG_GLOBAL:'/dev/null', GIT_CONFIG_COUNT:'0', GIT_TERMINAL_PROMPT:'0', GIT_NO_REPLACE_OBJECTS:'1' });
     const environment = Object.freeze({ ...hostEnv, ...r.environment, ...(dispatchRaw === undefined ? {} : { TACHIKO_DISPATCH_CONFIG: dispatchRaw }) });
     // Validate dispatch only on the ordinary CLI route. Malformed/absent current config must not suppress issued readback.
     const gitRunner: ProcessRunner = Object.freeze({ run: async (_file: string, args: readonly string[], options: ProcessRunOptions) => { assertInstallation(); return runner.run(r.git.path, ['-c','core.hooksPath=/dev/null','-c','core.fsmonitor=false','-c','core.attributesFile=/dev/null','-c','core.useReplaceRefs=false',...args], { ...options, env:hostEnv, beforeSpawn: () => { assertInstallation(); options.beforeSpawn?.(); } }); } });

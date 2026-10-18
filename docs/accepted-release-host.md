@@ -11,6 +11,13 @@ GitHub actor qualification, Oracle/Sol service contract, launchd/reboot proof,
 runtime activation, or native delivery. V1 remains unaccepted, with 0/3 native
 deliveries. #101 remains empty/HOLD and #115 unloaded/HOLD. Held PR93 remains held.
 
+The temporary H1/H2 author-validation checkpoint uses the retained diagnostic
+script on existing Ubuntu CI with fixed affected files/titles, builtin immediate
+TAP, child timeout 880 seconds and outer 890-second timeout plus 5-second kill
+grace. It is not normal acceptance. Remove only that temporary workflow step
+after affected proof; all ordinary test/browser/type/build commands and the
+30-minute job budget remain unchanged.
+
 ## Fixed local layout
 
 The resolver uses the physical OS-account home from `resolveAccountHomeDirectory`,
@@ -23,6 +30,7 @@ never HOME, cwd, package configuration, PATH discovery, or a data-root override:
     package.json
     dist/production-entry.js
     dist/production-host.js
+    worker-bin/pnpm                  # fixed regular accepted command launcher
     ...complete compiled distribution and flattened runtime dependencies...
     node_modules/...
     scripts/dispatch-driver.sh
@@ -79,6 +87,32 @@ and workers cannot promote their own manifests. Its closed schema contains:
   control location, base branch, campaign, release and all policy revisions;
 - `environment`: only the nonsecret #104 implementation/profile/local-validation/
   hosted-policy and pinned runtime/artifact/Luna-home values allowed by the resolver.
+
+Before sealing the distribution manifest, the separately authorized held acceptance
+procedure must create the regular executable `worker-bin/pnpm` with the exact bytes
+returned by exported `workerPnpmAlias(record.node.path, record.pnpm.path)` in the
+compiled production-host module. This is a fixed single-purpose artifact: its
+shebang selects accepted Node with `--no-global-search-paths`, and its only child
+is the JSON-quoted accepted pnpm path with the original arguments, cwd and minimal
+worker environment. It imports only Node's builtin child-process module. Include
+the file in the complete manifest before calculating the content-derived release
+ID; builds do not accept or install it. No mutable alias directory is created at
+runtime. The resolver validates its exact bytes/executable identity before enabling
+new work and puts its protected directory first in the worker PATH, ahead of Node,
+Git and system directories. Supported Node shebang paths must be canonical
+absolute paths without whitespace or control characters, and the complete header
+must fit a conservative 127 UTF-8 bytes including newline: the kernel must select
+that exact interpreter, with no shell/env fallback. Worker PATH components must
+be canonical absolute directories without colons or control characters; spaces
+in those directory segments remain literal. These representation checks affect
+initiation only; unavailable initiation uses a safe system PATH for compatible
+issued observation. The pnpm target is JSON-quoted and may contain spaces/colons.
+Arbitrary selected pnpm basenames are supported without
+exposing tool/config/credential variables to the isolated child. The independent
+validator's existing protected aliases and seatbelt write-deny remain unchanged.
+A valid compatible installation without a supported launcher retains original
+issued observation but has unavailable initiation. Subsequent changes to manifested
+artifacts still fail the existing immutable installation fence.
 
 Program/ancestry checks reject aliases, unsafe ownership/modes and changed bytes.
 Account-contained programs use the existing physical account-root guard, including its

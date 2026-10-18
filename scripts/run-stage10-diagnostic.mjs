@@ -5,17 +5,21 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { tsxInvocation } from './test-tier.mjs';
 const root=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'..');
-// Cause-directed E1-E4 checkpoint after the previous full selection timed out.
+// Cause-directed H1/H2 checkpoint; no unchanged broad diagnostic rerun.
 // Ordinary tier discovery and commands remain untouched.
-const selected=['production-entry.test.ts'];
+const selected=['production-host.test.ts','review-loop.test.ts'];
 const patterns=[
-  'preserves the original bounded issue and accepted scope through real adapter',
-  'fences captured production drift after final lead claim reads and at repair worker/publication effects',
-  'keeps dual dispatch authority, actor attribution and current base gates before zero new merges',
-  'rejects foreign transport targets with the typed ordinary scope refusal',
-  'parks unclaimed manual execution independently',
-  'rejects runtime fake-host injection independently',
-  'recovers post-repair lead and inactive review history through the accepted entry',
+  'validates supported worker shebang and PATH representations',
+  'keeps issued observation available when a valid installation lacks the supported worker launcher',
+  'executes exact accepted bare pnpm in the isolated worker ahead of candidate and ambient shadows',
+  'strengthens a workspace-less repair lane from the read-only plan before the real preparation fetch',
+  'rechecks captured Run and current admission before the immutable-base preparation fetch at',
+  'requires the captured Run and both governed callbacks before existing-identity repair preparation at',
+  'holds real repair preparation when host workspace admission is',
+  'preserves a concurrent durable Run change while the live GitHub snapshot is pending',
+  'preserves a concurrent durable Run change while the reviewer is pending',
+  'does not persist stale reviewer failure telemetry over a concurrent Run change',
+  'rechecks the exact repair handoff after final asynchronous worker preparation',
 ];
 const tsx=tsxInvocation(root);
 console.error('STAGE10_DIAGNOSTIC additional focused run; NOT a normal-tier PASS; builtin TAP emits completed failure assertions.');
