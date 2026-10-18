@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
-import { spawn } from 'node:child_process';
+import childProcess, { spawn } from 'node:child_process';
+import { syncBuiltinESMExports } from 'node:module';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
@@ -171,6 +172,39 @@ describe('ManagedPlaywrightMcpRuntime', () => {
     assert.equal(stopped.state, 'stopped');
     assert.equal(stopped.health, 'stopped');
     assert.ok(stopped.stoppedAt);
+  });
+
+  it('rechecks installation after acquiring the browser startup lock and before any new child', async () => {
+    const { runtime, profileRoot } = tempRuntime();
+    const originalSpawn = childProcess.spawn;
+    let starts = 0, lateCut = false;
+    childProcess.spawn = ((...args: Parameters<typeof originalSpawn>) => { starts += 1; return originalSpawn(...args); }) as typeof originalSpawn;
+    syncBuiltinESMExports();
+    let owned: BrowserRuntimeHandle | undefined;
+    const lock = path.join(profileRoot, 'refused', '.tachiko-runtime-lock.json');
+    const beforeStart = () => {
+      if (existsSync(lock)) { lateCut = true; throw new Error('Controlled installation revoked after startup lock.'); }
+    };
+    try {
+      owned = await runtime.start({ profile: 'owned', port: await freePort(), beforeStart });
+      assert.equal(owned.snapshot.state, 'ready');
+      assert.equal(starts, 1, 'accepted baseline starts the actual controlled MCP child');
+      await assert.rejects(runtime.start({ profile: 'refused', port: await freePort(), beforeStart }), error => {
+        assert.ok(error instanceof BrowserRuntimeError);
+        assert.equal(error.code, BROWSER_RUNTIME_ERROR_CODE.SPAWN_FAILED);
+        assert.equal(error.details.cause, 'Controlled installation revoked after startup lock.');
+        return true;
+      });
+      assert.equal(lateCut, true, 'authority is revoked only after the exact new lock exists');
+      assert.equal(starts, 1, 'the refused child is never spawned');
+      assert.equal(existsSync(lock), false, 'the exact newly acquired lock is released');
+      assert.equal((await runtime.status('owned'))?.runtimeId, owned.snapshot.runtimeId);
+      assert.equal((await owned.stop()).state, 'stopped', 'original exact-owned cleanup remains available');
+      process.stderr.write('STAGE10_BROWSER_FINAL_AUTHORITY ' + JSON.stringify({ lateCut, acceptedChildren: 1, refusedChildren: starts - 1, newLockReleased: !existsSync(lock), originalStopped: true }) + '\n');
+    } finally {
+      await owned?.stop().catch(() => undefined);
+      childProcess.spawn = originalSpawn; syncBuiltinESMExports();
+    }
   });
 
   it('rejects unsafe profiles, in-repository profile roots, and invalid ports before spawning', async () => {

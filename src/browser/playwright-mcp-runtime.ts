@@ -257,6 +257,7 @@ export class ManagedPlaywrightMcpRuntime implements BrowserRuntime {
 
     let child: ChildProcess;
     try {
+      options.beforeStart?.();
       child = spawn(
         process.execPath,
         [

@@ -93,6 +93,8 @@ export interface MissionAdmissionOptions {
   readonly lockRetryMs?: number;
   readonly now?: () => string;
   readonly beforePublish?: () => void;
+  /** Source-composed authority at acquired ordinary transaction effects; exact-token cleanup is separate. */
+  readonly assertOrdinaryMutation?: () => void;
   /** Best-effort notification after a meaningful revision has been atomically published. */
   readonly onPublishedTransition?: (projection: AdmissionProjection) => void;
   /** Deterministic same-process interleaving seam for stale-lock race tests. */
@@ -374,6 +376,7 @@ export class MissionAdmissionRegistry {
   private readonly lockRetryMs: number;
   private readonly now: () => string;
   private readonly beforePublish?: () => void;
+  private readonly assertOrdinaryMutation?: () => void;
   private readonly onPublishedTransition?: (projection: AdmissionProjection) => void;
   private readonly beforeStaleTakeover?: () => void;
   private readonly validatePath: () => void;
@@ -390,6 +393,7 @@ export class MissionAdmissionRegistry {
     this.lockRetryMs = options.lockRetryMs ?? 10;
     this.now = options.now ?? (() => new Date().toISOString());
     this.beforePublish = options.beforePublish;
+    this.assertOrdinaryMutation = options.assertOrdinaryMutation;
     this.onPublishedTransition = options.onPublishedTransition;
     this.beforeStaleTakeover = options.beforeStaleTakeover;
     this.validatePath = () => {
@@ -404,12 +408,14 @@ export class MissionAdmissionRegistry {
     this.validatePath();
   }
 
-  private transact<T>(operation: (state: RegistryState) => T, beforeStatePublish?: (result: T) => void, afterPublish?: (result: T) => void, validateBeforePublish?: (result: T) => void, beforeStatePublishOnNoop = false): T {
+  private transact<T>(operation: (state: RegistryState) => T, beforeStatePublish?: (result: T) => void, afterPublish?: (result: T) => void, validateBeforePublish?: (result: T) => void, beforeStatePublishOnNoop = false, ownedCleanup = false): T {
     this.validatePath?.();
     ensureDurableDirectory(path.dirname(this.filePath), { mode: 0o700, syncDirectoryHierarchy: this.syncDirectoryHierarchy });
     this.validatePath?.();
     const unlock = acquireLock(`${this.filePath}.lock`, this.lockTimeoutMs, this.lockRetryMs, this.beforeStaleTakeover);
     try {
+      const assertAuthority = () => { if (!ownedCleanup) this.assertOrdinaryMutation?.(); };
+      assertAuthority();
       this.validatePath?.();
       let state: RegistryState;
       if (!existsSync(this.filePath)) state = initialState(this.config);
@@ -424,16 +430,19 @@ export class MissionAdmissionRegistry {
       }
       const before = JSON.stringify(state);
       const beforeRevision = state.revision;
+      assertAuthority();
       const result = operation(state);
       if (JSON.stringify(state) !== before) {
         // Validate the complete candidate while still under the transaction
         // lock. This catches invalid transitions (including isolation and
         // capacity invariants) before any receipt callback or atomic publish.
         validateState(state);
+        assertAuthority();
         beforeStatePublish?.(result);
         this.beforePublish?.();
         this.validatePath?.();
         validateBeforePublish?.(result);
+        assertAuthority();
         writeAtomic(this.filePath, state, this.syncForDurability, this.validatePath);
         if (state.revision !== beforeRevision) {
           try { this.onPublishedTransition?.(project(state)); } catch { /* wake is a best-effort hint; publication remains authoritative */ }
@@ -443,12 +452,13 @@ export class MissionAdmissionRegistry {
         // the timestamp is unchanged (for example, two operations in one ms).
         // Other transaction callbacks retain their state-change-only behavior.
         validateState(state);
+        assertAuthority();
         beforeStatePublish?.(result);
       }
       // Receipt finalization belongs to the same host-global transaction as
       // the registry publication. Same-lane admission cannot publish its
       // successor receipt until this callback has finished and the lock exits.
-      afterPublish?.(result);
+      if (afterPublish !== undefined) { assertAuthority(); afterPublish(result); }
       return result;
     } finally { unlock(); }
   }
@@ -667,7 +677,7 @@ export class MissionAdmissionRegistry {
       lane.status = 'parked'; lane.token = null; lane.generation += 1; lane.parkedReason = reason; lane.updatedAt = this.now();
       state.revision += 1; state.lastTransition = { kind: reason, laneId: lane.laneId, at: lane.updatedAt };
       return state.revision;
-    }, () => beforePublish?.(), () => afterPublish?.());
+    }, () => beforePublish?.(), () => afterPublish?.(), undefined, false, true);
   }
 
   parkManual(token: AdmissionToken, proof: { readonly worktree: string; readonly branch: string; readonly checkpointSha: string; readonly clean: boolean; readonly stopped: boolean }): number {
@@ -724,7 +734,7 @@ export class MissionAdmissionRegistry {
       return { revision: state.revision, activeLane, releasedLane: detachedLaneView(lane) };
     }, (result) => beforePublish?.(structuredClone(result.activeLane)),
     (result) => afterPublish?.(structuredClone(result.releasedLane)),
-    (result) => validateBeforePublish?.(structuredClone(result.activeLane))).revision;
+    (result) => validateBeforePublish?.(structuredClone(result.activeLane)), false, true).revision;
   }
 
   /** Exact-generation operator settlement for a parked production Run lane. */

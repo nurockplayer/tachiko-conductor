@@ -81,6 +81,7 @@ export function createHostAdmissionRegistry(options: HostAdmissionResolverOption
     filePath,
     config: resolveHostAdmissionConfig(env),
     validatePath: validateRegistryPath,
+    assertOrdinaryMutation: options.assertInstallation,
     onPublishedTransition: () => {
       try { options.assertInstallation?.(); signalDispatchWake(dispatchWakePath(env, homeDirectory)); } catch { /* registry publication is authoritative; the safety poll recovers lost hints */ }
     },

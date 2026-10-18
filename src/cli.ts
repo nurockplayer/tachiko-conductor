@@ -2932,6 +2932,7 @@ export async function main(argv: string[], native: CliNativeDependencies = {}): 
         const current = registry.readLane(laneId);
         if (current?.status !== 'active' || current.missionId !== parsed.missionId || current.generation !== parsed.generation || current.role !== 'production_captain' || current.evidence.repositoryScope !== true || current.evidence.workspace !== identity.workspace) throw new Error('Recovery receipt is stale or does not match current registry ownership.');
         registry.assertCurrentOwner(parsed.token);
+        assertInstallation();
         writeManualOwnerReceipt(receiptPath, parsed);
         const projection = manualProjection('active');
         console.log(JSON.stringify({ projection, laneId, missionId: parsed.missionId, ownerReceiptPath: receiptPath }));

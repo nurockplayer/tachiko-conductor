@@ -16,7 +16,7 @@ import { createRun } from '../src/domain/run.js';
 import { applyTransition } from '../src/domain/state-machine.js';
 import { DISPATCH_QUEUE_MARKER, renderDispatchRuntime, selectDispatchRuntime } from '../src/dispatch/queue.js';
 import { readRunOwnerReceipt } from '../src/mission-admission/run-owner-receipt.js';
-import { createHostAdmissionRegistry, resolveRunOwnerReceiptPath } from '../src/mission-admission/host-registry.js';
+import { createHostAdmissionRegistry, resolveRunOwnerReceiptPath, resolveManualOwnerReceiptPath, resolveHostAdmissionPath } from '../src/mission-admission/host-registry.js';
 import { operationalRuntimeProjectionPath, readOperationalRuntimeProjection, setMaintenanceHold } from '../src/operational/runtime-projection.js';
 import { pathToFileURL } from 'node:url';
 import { acquireDispatchInvocationLock } from '../src/dispatch/invocation-lock.js';
@@ -35,8 +35,8 @@ import { originalImplementationMatches } from '../src/domain/implementation-auth
 import { acceptedScopeFromHandoff, buildImplementationPacket } from '../src/agents/implementation-packet.js';
 
 interface ImportedHistory { run: Run; objectRepository: string; receiptRoot: string; reviewer: NativeReviewerHost; lead: NonNullable<NativeCompletionHosts['lead']>; registry: object; ownerReceipt: Buffer; claimBody: string }
-async function commandFixture(imported?: ImportedHistory) {
-  const f=await installedFixture(true);f.enable(false);
+async function commandFixture(imported?: ImportedHistory, profileLabel?: 'merge-settlement') {
+  const f=await installedFixture(true, false, {}, { profileLabel });f.enable(false);
   const RealDate=Date; let clock=RealDate.parse(T0);
   try {
   globalThis.Date = class extends RealDate { constructor(value?: string | number) { super(value ?? clock); } static override now() { return clock; } } as DateConstructor;
@@ -144,8 +144,8 @@ async function directExecutionFixture(options:{productionWorker?:boolean;commitW
 }
 
 
-async function commandAuthorityFixture() {
-  const f = await installedFixture(true, false, {}, { lunaHome: true });
+async function commandAuthorityFixture(profileLabel?: 'command-authority') {
+  const f = await installedFixture(true, false, {}, { lunaHome: true, profileLabel });
   let calls = 0;
   const runner: ProcessRunner = { async run() { calls += 1; throw new Error('Command authority proof cannot call a provider or tool runner.'); } };
   const invoke = async (argv: string[]) => {
@@ -185,6 +185,36 @@ async function commandAuthorityFixture() {
   } catch (error) { f.cleanup(); throw error; }
 }
 
+async function manualAuthorityFixture(profileLabel: 'manual-registry'|'manual-recovery') {
+  const f = await installedFixture(true, false, {}, { profileLabel });
+  let calls = 0;
+  const runner: ProcessRunner = { async run() { calls += 1; throw new Error('Manual authority proof cannot call a provider.'); } };
+  const invoke = async (argv: string[]) => {
+    const log = console.log; console.log = () => {};
+    try { return await f.invoke(argv, { runner }); } finally { console.log = log; }
+  };
+  try {
+    const git = (...args: string[]) => execFileSync(f.record.git.path, ['-c','user.name=Controlled manual','-c','user.email=manual@example.invalid',...args], { cwd: f.objectRoot, encoding: 'utf8', stdio: ['ignore','pipe','pipe'] }).trim();
+    git('init','--quiet','--initial-branch=main');
+    git('remote','add','origin','https://github.com/acme/widgets.git');
+    git('commit','--quiet','--allow-empty','-m','controlled manual base');
+    process.chdir(f.objectRoot);
+    const receipt = resolveManualOwnerReceiptPath('acme/widgets', f.objectRoot);
+    const registry = resolveHostAdmissionPath();
+    const authority = () => {
+      const values: Record<string,string> = Object.create(null) as Record<string,string>;
+      const walk = (file: string) => {
+        if (!existsSync(file)) { values[file] = 'absent'; return; }
+        if (lstatSync(file).isDirectory()) { values[file] = 'directory'; for (const name of readdirSync(file).sort()) walk(path.join(file,name)); }
+        else values[file] = createHash('sha256').update(readFileSync(file)).digest('hex');
+      };
+      for (const name of ['runs','mission-admission','dispatch']) walk(path.join(f.accountRoot,name));
+      return JSON.stringify(values);
+    };
+    return { ...f, invoke, receipt, registry, authority, calls: () => calls };
+  } catch (error) { f.cleanup(); throw error; }
+}
+
 describe('fixed production entry through real parser and canonical dispatcher',()=>{
   beforeEach(t=>traceCut(t.name,'case','entered'));
   afterEach(t=>traceCut(t.name,'case','finished'));
@@ -206,7 +236,7 @@ describe('fixed production entry through real parser and canonical dispatcher',(
   });
   it('requires current compatible installation for canonical command authority and preserves safe emergency HOLD', async t => {
     for (const cut of ['checkout', 'missing-record', 'corrupt-record', 'artifact', 'cached-artifact'] as const) await t.test(cut, async () => {
-      const f = await commandAuthorityFixture();
+      const f = await commandAuthorityFixture(cut === 'checkout' ? 'command-authority' : undefined);
       const originalWrite = fs.writeFileSync, originalSpawn = childProcess.spawn;
       const log = console.log; console.log = () => {};
       let wakeWrites = 0, childStarts = 0;
@@ -284,6 +314,75 @@ describe('fixed production entry through real parser and canonical dispatcher',(
     });
   });
 
+  it('rechecks compatible installation after a contested registry lock before manual receipts or authority publish', async () => {
+    const f = await manualAuthorityFixture('manual-registry');
+    const wait = Atomics.wait;
+    let held: ReturnType<typeof acquireDispatchInvocationLock> | undefined;
+    let waited = false;
+    try {
+      assert.equal(await f.invoke(['dispatch','manual','register']), 0);
+      const active = JSON.parse(readFileSync(f.receipt,'utf8')) as { generation: number; status: string };
+      assert.equal(active.status, 'active');
+      assert.equal(await f.invoke(['dispatch','manual','park','--stopped']), 0);
+      const parked = JSON.parse(readFileSync(f.receipt,'utf8')) as { generation: number; status: string };
+      assert.equal(parked.status, 'parked');
+      assert.equal(await f.invoke(['dispatch','manual','retire','--stopped','--expected-generation',String(parked.generation)]), 0);
+      const before = f.authority(), calls = f.calls();
+      held = acquireDispatchInvocationLock({ lockPath: f.registry + '.lock' });
+      Atomics.wait = ((...args: Parameters<typeof wait>) => {
+        if (!waited) {
+          waited = true;
+          assert.equal(existsSync(f.registry + '.lock'), true);
+          writeFileSync(path.join(f.record.codex.runtimeDirectory,'runtime.cjs'),'// revoked during actual contested registry wait\n');
+          held!.release();
+          return 'ok';
+        }
+        return wait(...args);
+      }) as typeof wait;
+      await assert.rejects(f.invoke(['dispatch','manual','register']), /Accepted artifact\/program filesystem identity changed/);
+      assert.equal(waited, true, 'the real registry transaction reaches its lock wait before revocation');
+      assert.equal(existsSync(f.registry + '.lock'), false, 'the refusing transaction releases only its acquired lock');
+      assert.equal(f.authority() === before, true, 'no receipt, generation, registry, projection or wake publishes');
+      assert.equal(f.calls(), calls);
+      process.stderr.write('STAGE10_LATE_COMMAND_AUTHORITY ' + JSON.stringify({ cut: 'registry-acquired-lock', waited, authorityPreserved: true, providerCalls: f.calls()-calls, lockReleased: true }) + '\n');
+    } finally { Atomics.wait = wait; held?.release(); f.cleanup(); }
+  });
+
+  it('rechecks compatible installation after manual recovery input before its authenticated receipt write', async () => {
+    const f = await manualAuthorityFixture('manual-recovery');
+    const originalRead = fs.readFileSync;
+    let input: string | undefined;
+    let revoke = false, supplied = 0;
+    fs.readFileSync = ((file: fs.PathOrFileDescriptor, ...args: unknown[]) => {
+      if (file === 0) {
+        supplied += 1;
+        assert.ok(input !== undefined, 'only the valid privately captured recovery receipt is supplied');
+        if (revoke) writeFileSync(path.join(f.record.codex.runtimeDirectory,'runtime.cjs'),'// revoked while manual recovery awaits stdin\n');
+        return input;
+      }
+      return Reflect.apply(originalRead, fs, [file,...args]);
+    }) as typeof fs.readFileSync;
+    syncBuiltinESMExports();
+    try {
+      assert.equal(await f.invoke(['dispatch','manual','register']), 0);
+      input = readFileSync(f.receipt,'utf8');
+      f.enable(false);
+      unlinkSync(f.receipt);
+      assert.equal(await f.invoke(['dispatch','manual','recover','--receipt-stdin']), 0, 'compatible DISABLED installation recovers the exact valid active receipt');
+      assert.equal(readFileSync(f.receipt,'utf8') === input, true);
+      assert.equal(supplied, 1);
+      unlinkSync(f.receipt);
+      const before = f.authority(), calls = f.calls();
+      revoke = true;
+      await assert.rejects(f.invoke(['dispatch','manual','recover','--receipt-stdin']), /Accepted artifact\/program filesystem identity changed/);
+      assert.equal(supplied, 2, 'revocation occurs inside the real blocking-input boundary');
+      assert.equal(existsSync(f.receipt), false, 'the recovered receipt is not published after authority revocation');
+      assert.equal(f.authority() === before, true, 'registry, Run, projection, receipt and wake bytes are retained');
+      assert.equal(f.calls(), calls);
+      process.stderr.write('STAGE10_LATE_COMMAND_AUTHORITY ' + JSON.stringify({ cut: 'manual-input', validBaseline: true, suppliedInputs: supplied, authorityPreserved: true, providerCalls: f.calls()-calls, receiptAbsent: true }) + '\n');
+    } finally { fs.readFileSync = originalRead; syncBuiltinESMExports(); f.cleanup(); }
+  });
+
   it('refuses wait ledger and telemetry writes after an awaited observation loses accepted installation', async () => {
     const f = await commandAuthorityFixture();
     const originalRead = fs.readFileSync, log = console.log, originalStackLimit = Error.stackTraceLimit;
@@ -310,7 +409,7 @@ describe('fixed production entry through real parser and canonical dispatcher',(
   });
 
   it('uses the actual accepted entry for model-free held once/serve and local diagnostics',async()=>{
-    const f=await installedFixture(true);const log=console.log;const output:string[]=[];console.log=(v?:unknown)=>output.push(String(v));try{let calls=0;const runner:ProcessRunner={async run(){calls++;throw new Error('Held entry must not spawn a process');}};process.env.TACHIKO_DATA_DIR='/candidate/empty';assert.equal(await f.invoke(['dispatch','maintenance','hold'],{runner}),0);writeFileSync(f.hostPath,'{malformed');writeFileSync(f.dispatchPath,'{malformed');assert.equal(await f.invoke(['dispatch','once'],{runner}),0);assert.equal(await f.invoke(['dispatch','serve','--max-cycles','1','--idle-poll-ms','1'],{runner}),0);assert.equal(calls,0);assert.equal(await f.invoke(['production','preflight'],{runner}),78);assert.ok(output.some(v=>v.includes('maintenance_hold')));assert.equal(readOperationalRuntimeProjection(path.join(f.accountRoot,'runs'))!.maintenanceHold.active,true);assert.equal(process.env.TACHIKO_DATA_DIR,undefined);}finally{console.log=log;f.cleanup();}
+    const f=await installedFixture(true, false, {}, { profileLabel: 'held-control' });const log=console.log;const output:string[]=[];console.log=(v?:unknown)=>output.push(String(v));try{let calls=0;const runner:ProcessRunner={async run(){calls++;throw new Error('Held entry must not spawn a process');}};process.env.TACHIKO_DATA_DIR='/candidate/empty';assert.equal(await f.invoke(['dispatch','maintenance','hold'],{runner}),0);writeFileSync(f.hostPath,'{malformed');writeFileSync(f.dispatchPath,'{malformed');assert.equal(await f.invoke(['dispatch','once'],{runner}),0);assert.equal(await f.invoke(['dispatch','serve','--max-cycles','1','--idle-poll-ms','1'],{runner}),0);assert.equal(calls,0);assert.equal(await f.invoke(['production','preflight'],{runner}),78);assert.ok(output.some(v=>v.includes('maintenance_hold')));assert.equal(readOperationalRuntimeProjection(path.join(f.accountRoot,'runs'))!.maintenanceHold.active,true);assert.equal(process.env.TACHIKO_DATA_DIR,undefined);}finally{console.log=log;f.cleanup();}
   });
 
 
@@ -704,7 +803,7 @@ describe('fixed production entry through real parser and canonical dispatcher',(
     }finally{f.cleanup();traceCut('production-entry',cut,'finished');}}
   });
   it('constructs the resolver host in once/serve, issues one expected-HEAD squash and qualifies/settles the original Run',async()=>{
-    const f=await commandFixture();try{await f.review();f.afterActor(()=>f.setActor('999'));const s=f.resolve(f.runner);assert.equal(s.repositoryRoot,f.objectRoot);assert.deepEqual(s.nativeMergeHost!.candidate(f.base,f.head),{treeSha:f.tree,baseIsAncestor:true});await f.invoke(['dispatch','serve','--max-cycles','1','--idle-poll-ms','1']);let run=f.store().read('run-native')!;assert.ok(run.mergeAttempt?.qualification);assert.equal(run.mergeAttempt.identity.treeSha,f.tree);assert.equal(f.stats().squashes,1);assert.equal(f.stats().captures,1);assert.equal(f.stats().boundActorGets,1);assert.equal(f.stats().boundPuts,1);await f.invoke(['dispatch','maintenance','hold']);await f.invoke(['dispatch','once']);run=f.store().read('run-native')!;assert.equal(run.state,'MERGED');assert.equal(f.store().list().length,1);assert.equal(f.stats().squashes,1);assert.equal(readRunOwnerReceipt(resolveRunOwnerReceiptPath('acme/widgets','run-native'))!.phase,'released');assert.equal(readOperationalRuntimeProjection(path.join(f.accountRoot,'runs'))!.maintenanceHold.active,true);}finally{f.cleanup();}
+    const f=await commandFixture(undefined, 'merge-settlement');try{await f.review();f.afterActor(()=>f.setActor('999'));const s=f.resolve(f.runner);assert.equal(s.repositoryRoot,f.objectRoot);assert.deepEqual(s.nativeMergeHost!.candidate(f.base,f.head),{treeSha:f.tree,baseIsAncestor:true});await f.invoke(['dispatch','serve','--max-cycles','1','--idle-poll-ms','1']);let run=f.store().read('run-native')!;assert.ok(run.mergeAttempt?.qualification);assert.equal(run.mergeAttempt.identity.treeSha,f.tree);assert.equal(f.stats().squashes,1);assert.equal(f.stats().captures,1);assert.equal(f.stats().boundActorGets,1);assert.equal(f.stats().boundPuts,1);await f.invoke(['dispatch','maintenance','hold']);await f.invoke(['dispatch','once']);run=f.store().read('run-native')!;assert.equal(run.state,'MERGED');assert.equal(f.store().list().length,1);assert.equal(f.stats().squashes,1);assert.equal(readRunOwnerReceipt(resolveRunOwnerReceiptPath('acme/widgets','run-native'))!.phase,'released');assert.equal(readOperationalRuntimeProjection(path.join(f.accountRoot,'runs'))!.maintenanceHold.active,true);}finally{f.cleanup();}
   });
   for(const descriptor of ['absent','malformed','disabled','replaced','dispatch-malformed'] as const)it(`recovers only the issued attempt under HOLD with ${descriptor} current configuration and unavailable reasoning`,async()=>{
     traceCut('issued-recovery',descriptor,'entered');const f=await commandFixture();try{await f.review();f.setLostAck();await f.invoke(['dispatch','once']);const issued=f.store().read('run-native')!;assert.equal(issued.mergeAttempt?.submissionPossible,true);assert.equal(f.stats().squashes,1);await f.invoke(['dispatch','maintenance','hold']);if(descriptor==='absent')unlinkSync(f.hostPath);else if(descriptor==='malformed')writeFileSync(f.hostPath,'{broken');else if(descriptor==='disabled')f.enable(false);else if(descriptor==='replaced')writeFileSync(f.hostPath,'{"schemaVersion":1,"enabled":false,"releaseId":"other","revision":"h2","manifestDigest":"other"}');else writeFileSync(f.dispatchPath,'{broken');

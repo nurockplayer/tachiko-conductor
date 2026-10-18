@@ -47,12 +47,38 @@ function privateFixtureTree(root: string): void {
   if(info.isDirectory()) { chmodSync(root,0o700);for(const name of readdirSync(root))privateFixtureTree(path.join(root,name)); }
   else { assert.equal(info.isFile(),true);chmodSync(root,(info.mode&0o111)!==0?0o700:0o600); }
 }
-export async function installedFixture(fullCli = false, compiled = false, environmentPatch: Readonly<Record<string,string>> = {}, options:{githubActorId?:string;lunaHome?:boolean;nodeBasename?:string;gitBasename?:string;gitNamespace?:string;controlledGitIdentity?:boolean;pathDelimiterInHome?:boolean;githubNamespace?:string;objectNamespace?:string;toolNamespaces?:Partial<Record<'codex'|'pnpm',string>>;toolInterpreter?:'ambient-node';codexRuntime?:string|((programs:{node:string;git:string})=>string);workerAlias?:'missing'|'unsupported';workerCommandAlias?:{name:'node'|'git';state:'missing'|'unsupported'};githubFixtureFile?:boolean;expectedRejection?:RegExp}={}) {
+export async function installedFixture(fullCli = false, compiled = false, environmentPatch: Readonly<Record<string,string>> = {}, options:{profileLabel?:'held-control'|'command-authority'|'manual-registry'|'manual-recovery'|'merge-settlement';githubActorId?:string;lunaHome?:boolean;nodeBasename?:string;gitBasename?:string;gitNamespace?:string;controlledGitIdentity?:boolean;pathDelimiterInHome?:boolean;githubNamespace?:string;objectNamespace?:string;toolNamespaces?:Partial<Record<'codex'|'pnpm',string>>;toolInterpreter?:'ambient-node';codexRuntime?:string|((programs:{node:string;git:string})=>string);workerAlias?:'missing'|'unsupported';workerCommandAlias?:{name:'node'|'git';state:'missing'|'unsupported'};githubFixtureFile?:boolean;expectedRejection?:RegExp}={}) {
+  const timingStart = performance.now();
+  let fenceTiming: { calls: number; durationMs: number } | undefined;
+  let timingReports = 0;
+  const reportTiming = (phase: 'fixture-start'|'fixture-prepared'|'manifest-sealed'|'fixture-ready'|'command-start'|'command-completed'|'cleanup', sampleMs: number, command = 'none') => {
+    if (options.profileLabel === undefined || (timingReports >= 12 && phase !== 'cleanup')) return;
+    timingReports += 1;
+    const record = { caseLabel: options.profileLabel, phase, command, elapsedMs: performance.now() - timingStart, sampleMs, fenceCalls: fenceTiming?.calls ?? 0, fenceMs: fenceTiming?.durationMs ?? 0 };
+    assert.ok([record.elapsedMs, record.sampleMs, record.fenceCalls, record.fenceMs].every(value => Number.isFinite(value) && value >= 0));
+    process.stderr.write('STAGE10_AUTHORITY_TIMING ' + JSON.stringify(record) + '\n');
+  };
+  reportTiming('fixture-start', 0);
   const home=mkdtempSync(path.join(os.tmpdir(),options.pathDelimiterInHome?'tachiko-accepted-path:':'tachiko-accepted-'));
   const accountRoot=path.join(home,'.tachiko-conductor'); let release=path.join(accountRoot,'releases/accepted-fixture');
   mkdirSync(release,{recursive:true});
   if(compiled){const config=ts.readConfigFile(path.resolve('tsconfig.json'),ts.sys.readFile);const parsed=ts.parseJsonConfigFileContent(config.config,ts.sys,process.cwd(),{outDir:path.join(release,'dist')});const program=ts.createProgram(parsed.fileNames,parsed.options);const result=program.emit();if(result.emitSkipped || ts.getPreEmitDiagnostics(program).length)throw new Error('Actual production TypeScript compilation failed.');}
   else emitSources(path.resolve('src'),path.join(release,'dist'));
+  if (options.profileLabel !== undefined) {
+    // Test-only measurement of the actual accepted fence. This exact wrapper
+    // is sealed into this private fixture's manifest; it never skips authority.
+    const file = path.join(release, 'dist/production-host.js');
+    const source = readFileSync(file, 'utf8');
+    const marker = 'const assertInstallation = () => {';
+    assert.equal(source.split(marker).length, 2);
+    const start = source.indexOf(marker), end = source.indexOf('const assertInitiation =', start);
+    assert.ok(end > start);
+    const declaration = source.slice(start, end), close = declaration.lastIndexOf('};');
+    assert.ok(close > marker.length);
+    const body = declaration.slice(marker.length, close);
+    const measured = 'const assertInstallation = () => { const started = performance.now(); try {' + body + '} finally { controlledInstallationTiming.calls += 1; controlledInstallationTiming.durationMs += performance.now() - started; } };\n    ';
+    writeFileSync(file, 'export const controlledInstallationTiming = { calls: 0, durationMs: 0 };\n' + source.slice(0, start) + measured + source.slice(end));
+  }
   mkdirSync(path.join(release,'scripts'));
   for(const script of ['dispatch-driver.sh','issue-104-deploy.sh'])copyFileSync(path.resolve('scripts',script),path.join(release,'scripts',script));
   writeFileSync(path.join(release,'package.json'),JSON.stringify({type:'module',bin:{tachiko:'dist/production-entry.js'}}));
@@ -74,26 +100,32 @@ export async function installedFixture(fullCli = false, compiled = false, enviro
   const record:AcceptedRelease={schemaVersion:1,releaseId:'accepted-fixture',sourceCommit:'a'.repeat(40),sourceTree:'b'.repeat(40),stateCompatibility:'conductor-native-state-v1',runtimePolicyRevision:'issue-104-production-v7',entry:'dist/production-entry.js',manifest:manifest(release),manifestDigest:'',node:{path:node,sha256:hash(readFileSync(node))},git:{path:git,sha256:hash(readFileSync(git))},gh:{path:git,sha256:hash(readFileSync(git))},codex,pnpm,repository:{owner:'acme',repo:'widgets',objectRoot},github:{configDirectory,actorId:options.githubActorId??'123',qualification:'controlled actor evidence only',observationQualification:'controlled readback evidence only',confinementQualification:'controlled fixture boundary only'},mergePolicy:policy,environment:{TACHIKO_NODE_PROGRAM:node,TACHIKO_GIT_PROGRAM:git,TACHIKO_IMPLEMENTATION_AGENT:'luna-isolated',TACHIKO_EXECUTION_PROFILE_CONFIG:JSON.stringify(PRODUCTION_EXECUTION_PROFILE_CONFIG),TACHIKO_LOCAL_VALIDATION_CONFIG:JSON.stringify(PRODUCTION_LOCAL_VALIDATION_CONFIG),TACHIKO_HOSTED_CHECK_POLICY_CONFIG:JSON.stringify(PRODUCTION_HOSTED_CHECK_POLICY_CONFIG),TACHIKO_PNPM_PROGRAM:pnpm.path,TACHIKO_PNPM_DEPENDENCY_ARTIFACT:path.join(accountRoot,'dependencies'),TACHIKO_PLAYWRIGHT_BROWSERS_PATH:path.join(accountRoot,'browsers'),...environmentPatch}};
   if(options.lunaHome){const lunaHome=path.join(accountRoot,'luna');mkdirSync(lunaHome);writeFileSync(path.join(lunaHome,'config.toml'),'tachiko_luna_runtime_revision = \"luna-qualified-runtime-v1\"\nplugins = false\napps = false\nmcp_servers = {}\nweb_search = false\nnetwork_access = false\n');(record.environment as Record<string,string>).TACHIKO_LUNA_CODEX_HOME=lunaHome;}
   privateFixtureTree(home);
+  reportTiming('fixture-prepared', performance.now()-timingStart);
   const nextId=acceptedReleaseId({...record,manifestDigest:distributionManifestDigest(record.manifest)});
   (record as {releaseId:string}).releaseId=nextId;(policy as {releaseId:string}).releaseId=nextId;
   const acceptedDirectory=path.join(accountRoot,'releases',nextId);renameSync(release,acceptedDirectory);release=acceptedDirectory;
   mkdirSync(path.join(accountRoot,'production'),{recursive:true,mode:0o700});
   const recordPath=path.join(release,'accepted-release.json'); const hostPath=path.join(accountRoot,'production/host.json'); const dispatchPath=path.join(accountRoot,'production/dispatch.json');
-  const accept=()=>{(record as {manifest:Record<string,string>}).manifest=manifest(release);(record as {manifestDigest:string}).manifestDigest=distributionManifestDigest(record.manifest);if(acceptedReleaseId(record)!==record.releaseId)throw new Error('Fixture cannot reuse a release ID for changed installation bytes.');writeFileSync(recordPath,JSON.stringify(record),{mode:0o600});};accept();
+  const accept=()=>{const started=performance.now();try{(record as {manifest:Record<string,string>}).manifest=manifest(release);(record as {manifestDigest:string}).manifestDigest=distributionManifestDigest(record.manifest);if(acceptedReleaseId(record)!==record.releaseId)throw new Error('Fixture cannot reuse a release ID for changed installation bytes.');writeFileSync(recordPath,JSON.stringify(record),{mode:0o600});}finally{reportTiming('manifest-sealed',performance.now()-started);}};accept();
   const enable=(enabled=true)=>writeFileSync(hostPath,JSON.stringify({schemaVersion:1,revision:'host-v1',releaseId:record.releaseId,manifestDigest:record.manifestDigest,enabled,...(enabled?{merge:policy}:{})}),{mode:0o600});enable();
   const dispatch={revision:'dispatch-v1',owner:'acme',repo:'widgets',controlIssue:1,queueCommentId:2,leaseDurationMs:60000,merge:policy};writeFileSync(dispatchPath,JSON.stringify(dispatch),{mode:0o600});
   const userInfo=os.userInfo; const execArgv=process.execArgv;const argv=process.argv; const moduleState=Module as unknown as {globalPaths:string[]};const previousGlobalPaths=moduleState.globalPaths; const environment={...process.env}; const cwd=process.cwd();
   os.userInfo=(()=>({...userInfo(),homedir:home})) as typeof os.userInfo;process.execArgv=['--no-global-search-paths'];process.execPath=node;process.argv=[node,path.join(release,'dist/production-entry.js')];moduleState.globalPaths=[];
   delete process.env.NODE_OPTIONS; delete process.env.NODE_PATH;delete process.env.LD_PRELOAD; delete process.env.DYLD_INSERT_LIBRARIES;
-  const hostModule=await import(pathToFileURL(path.join(release,'dist/production-host.js')).href) as {resolveProductionHost:(entry:string,runner?:ProcessRunner,historical?:NativeCompletionHosts)=>ProductionHostSnapshot};
+  const hostModule=await import(pathToFileURL(path.join(release,'dist/production-host.js')).href) as {resolveProductionHost:(entry:string,runner?:ProcessRunner,historical?:NativeCompletionHosts)=>ProductionHostSnapshot;controlledInstallationTiming?:{calls:number;durationMs:number}};
+  fenceTiming = hostModule.controlledInstallationTiming;
   const entryUrl=pathToFileURL(path.join(release,'dist/production-entry.js')).href;
   const resolve=(runner?:ProcessRunner,historical?:NativeCompletionHosts)=>hostModule.resolveProductionHost(entryUrl,runner,historical);
   const invoke=async(argv:string[],dependencies:CliNativeDependencies & {runner?:ProcessRunner}={})=>{
     const mod=await import(entryUrl) as {productionMain:(argv:string[],dependencies?:CliNativeDependencies & {runner?:ProcessRunner})=>Promise<number>};
-    return mod.productionMain(argv,dependencies);
+    const started = performance.now();
+    reportTiming('command-start', 0, ['dispatch','run','wait','browser','production'].includes(argv[0]??'') ? argv[0]! : 'other');
+    try { return await mod.productionMain(argv,dependencies); }
+    finally { reportTiming('command-completed', performance.now()-started, ['dispatch','run','wait','browser','production'].includes(argv[0]??'') ? argv[0]! : 'other'); }
   };
-  const cleanup=()=>{process.execPath=actualNode;os.userInfo=userInfo;process.execArgv=execArgv;process.argv=argv;moduleState.globalPaths=previousGlobalPaths;for(const k of Object.keys(process.env))delete process.env[k];Object.assign(process.env,environment);process.chdir(cwd);rmSync(home,{recursive:true,force:true});};
+  const cleanup=()=>{const started=performance.now();process.execPath=actualNode;os.userInfo=userInfo;process.execArgv=execArgv;process.argv=argv;moduleState.globalPaths=previousGlobalPaths;for(const k of Object.keys(process.env))delete process.env[k];Object.assign(process.env,environment);process.chdir(cwd);rmSync(home,{recursive:true,force:true});reportTiming('cleanup',performance.now()-started);};
   try{const baseline=resolve();if(options.expectedRejection){assert.equal(baseline.installation,'unavailable');assert.match(baseline.reason,options.expectedRejection);}else assert.equal(baseline.installation,'accepted',baseline.reason);}catch(error){cleanup();throw error;}
+  reportTiming('fixture-ready', performance.now()-timingStart);
   return {home,accountRoot,release,objectRoot,record,recordPath,hostPath,dispatchPath,dispatch,policy,accept,enable,resolve,invoke,entryUrl,
     cleanup};
 }
