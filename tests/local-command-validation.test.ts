@@ -2,13 +2,17 @@ import assert from 'node:assert/strict';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, realpathSync, rmSync, symlinkSync, truncateSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { spawnSync } from 'node:child_process';
+import childProcess, { spawnSync } from 'node:child_process';
+import { syncBuiltinESMExports } from 'node:module';
 import { createHash } from 'node:crypto';
 import { afterEach, describe, it } from 'node:test';
 
 import { ConfiguredLocalValidationAdapter, copyDependencyStore, disposePrivateTrees, hasPinnedPnpmAuthority, ignoredManifest } from '../src/validation/local-command.js';
 import type { LocalValidationConfiguration } from '../src/adapters/validation.js';
-import { TARGET } from './helpers.js';
+import { TARGET, T0 } from './helpers.js';
+import { ExecutionAdmissionRefusal } from '../src/adapters/agent.js';
+import { installedFixture } from './production-host-fixture.js';
+import { readOperationalRuntimeProjectionState, setMaintenanceHold } from '../src/operational/runtime-projection.js';
 
 const dirs: string[] = [];
 
@@ -1355,6 +1359,150 @@ exec ${JSON.stringify(realGit)} "$@"
 });
 
 
-it('cleans the reconstructed validation tree when current authority is revoked before materialization',async()=>{
-  const owned=request();const proof=mkdtempSync(path.join(os.tmpdir(),'tachiko-validation-revoked-proof-'));dirs.push(proof);const marker=path.join(proof,'candidate-executed');const cleaned:string[]=[];let fences=0;const adapter=new ConfiguredLocalValidationAdapter(configuration([process.execPath,'-e',`require('node:fs').writeFileSync(${JSON.stringify(marker)},'ran')`]),undefined,async paths=>{cleaned.push(...paths);return disposePrivateTrees(paths);});await assert.rejects(adapter.validate({...owned,beforeExecution(){fences++;if(fences===3)throw new Error('Controlled post-reconstruction authority revoked');}}),/Controlled post-reconstruction authority revoked/);assert.equal(fences,3);assert.ok(cleaned.some(root=>path.basename(root).startsWith('tachiko-validation-snapshot-')),'the reconstructed command tree reached cleanup despite revoked initiation');assert.ok(cleaned.every(root=>!existsSync(root)));assert.equal(existsSync(marker),false);
+it('cleans the reconstructed validation tree when current authority is revoked before materialization', async () => {
+  const owned = request();
+  const proof = mkdtempSync(path.join(os.tmpdir(), 'tachiko-validation-revoked-proof-')); dirs.push(proof);
+  const marker = path.join(proof, 'candidate-executed');
+  const cleaned: string[] = [];
+  let reconstructed = false;
+  const original = childProcess.spawnSync;
+  childProcess.spawnSync = ((...args: Parameters<typeof original>) => {
+    const result = original(...args);
+    const argv = Array.isArray(args[1]) ? args[1] : [];
+    if (argv.some(arg => typeof arg === 'string' && arg.includes('tachiko-validation-snapshot-')) &&
+      argv.includes('ls-files') && argv.includes('--stage')) reconstructed = true;
+    return result;
+  }) as typeof original;
+  syncBuiltinESMExports();
+  try {
+    const adapter = new ConfiguredLocalValidationAdapter(configuration([process.execPath, '-e', `require('node:fs').writeFileSync(${JSON.stringify(marker)},'ran')`]),
+      undefined, async paths => { cleaned.push(...paths); return disposePrivateTrees(paths); });
+    await assert.rejects(adapter.validate({ ...owned, beforeExecution() {
+      if (reconstructed) throw new Error('Controlled post-reconstruction authority revoked');
+    } }), /Controlled post-reconstruction authority revoked/);
+    assert.equal(reconstructed, true, 'the exact command reconstruction reached its final Git probe');
+    assert.ok(cleaned.some(root => path.basename(root).startsWith('tachiko-validation-snapshot-')));
+    assert.ok(cleaned.every(root => !existsSync(root)));
+    assert.equal(existsSync(marker), false);
+  } finally { childProcess.spawnSync = original; syncBuiltinESMExports(); }
+});
+
+describe('validation removal-only authority after awaited work', () => {
+  for (const phase of ['positive', 'admission-manifest', 'command', 'command-manifest', 'cleanup'] as const) {
+    for (const change of (phase === 'positive' || phase === 'admission-manifest' ? ['descriptor'] as const : ['descriptor', 'artifact', 'hold'] as const)) {
+      it(`rechecks accepted ${change} authority after ${phase} before later effects or PASS`, async () => {
+        const owned = request();
+        const proof = mkdtempSync(path.join(os.tmpdir(), 'tachiko-validation-await-proof-')); dirs.push(proof);
+        const marker = path.join(proof, 'first-command');
+        const later = path.join(proof, 'later-command');
+        const f = await installedFixture();
+        const captured = f.resolve();
+        assert.equal(captured.installation, 'accepted', captured.reason);
+        captured.assertInitiation();
+        setMaintenanceHold(captured.runsDirectory, false, T0);
+        let revoked = false;
+        let forbiddenAfter = 0;
+        let commands = 0;
+        let laterChildren = 0;
+        let manifests = 0;
+        const helperRoots = new Set<string>();
+        const cleaned: string[] = [];
+        const revoke = () => {
+          if (revoked) return;
+          if (change === 'descriptor') f.enable(false);
+          else if (change === 'artifact') writeFileSync(path.join(f.record.codex.runtimeDirectory, 'runtime.cjs'), '// changed accepted runtime\n');
+          else setMaintenanceHold(captured.runsDirectory, true, T0);
+          revoked = true;
+        };
+        const assertCurrent = () => {
+          if (phase === 'command' && existsSync(marker)) revoke();
+          try {
+            captured.assertInitiation();
+            const hold = readOperationalRuntimeProjectionState(captured.runsDirectory);
+            if (hold.status !== 'valid' || hold.projection.maintenanceHold.active) throw new Error('Controlled current HOLD refused validation.');
+          } catch (cause) {
+            throw new ExecutionAdmissionRefusal('Controlled captured validation authority refused.', false, { cause });
+          }
+        };
+        const originalSpawn = childProcess.spawn;
+        const originalSync = childProcess.spawnSync;
+        childProcess.spawnSync = ((...args: Parameters<typeof originalSync>) => {
+          if (String(args[0]) === f.record.git.path && revoked) forbiddenAfter += 1;
+          return originalSync(...args);
+        }) as typeof originalSync;
+        childProcess.spawn = ((...args: Parameters<typeof originalSpawn>) => {
+          const argv = Array.isArray(args[1]) ? args[1] : [];
+          const manifest = argv.some(arg => typeof arg === 'string' && arg.startsWith("const fs=require('node:fs'),p=require('node:path')"));
+          if (manifest) {
+            manifests += 1; if (revoked) forbiddenAfter += 1;
+            assert.equal(typeof argv[3], 'string'); assert.equal(typeof argv[5], 'string');
+            helperRoots.add(path.dirname(argv[3] as string)); helperRoots.add(path.dirname(argv[5] as string));
+          }
+          if (argv.some(arg => typeof arg === 'string' && arg.includes(marker))) commands += 1;
+          if (argv.some(arg => typeof arg === 'string' && arg.includes(later))) laterChildren += 1;
+          const child = originalSpawn(...args);
+          if (manifest && ((phase === 'admission-manifest' && !existsSync(marker)) || (phase === 'command-manifest' && existsSync(marker)))) {
+            child.once('close', revoke);
+          }
+          return child;
+        }) as typeof originalSpawn;
+        syncBuiltinESMExports();
+        const adapter = new ConfiguredLocalValidationAdapter({
+          revision: 'await-authority-v1', gitProgram: f.record.git.path,
+          commands: [
+            { argv: [f.record.node.path, '-e', `require('node:fs').writeFileSync(${JSON.stringify(marker)},'ran')`], timeoutMs: 5_000 },
+            { argv: [f.record.node.path, '-e', `require('node:fs').writeFileSync(${JSON.stringify(later)},'ran')`], timeoutMs: 5_000 },
+          ],
+        }, undefined, async paths => {
+          cleaned.push(...paths);
+          const result = await disposePrivateTrees(paths);
+          if (phase === 'cleanup') revoke();
+          return result;
+        });
+        try {
+          if (phase === 'positive') {
+            const result = await adapter.validate({ ...owned, beforeExecution: assertCurrent });
+            assert.equal(result.status, 'passed');
+            assert.deepEqual(result.commands.map(command => command.outcome), ['passed', 'passed']);
+            assert.equal(existsSync(later), true);
+          } else {
+            await assert.rejects(adapter.validate({ ...owned, beforeExecution: assertCurrent }), (error: unknown) => {
+              assert.ok(error instanceof ExecutionAdmissionRefusal);
+              assert.equal(error.authorityUnknown, false);
+              assert.equal(error.runSuperseded, false);
+              return true;
+            });
+            assert.equal(revoked, true, 'the selected awaited phase performed the real current-authority change');
+            assert.equal(forbiddenAfter, 0, 'no configured Git or manifest helper starts after revocation');
+            assert.equal(existsSync(later), phase === 'cleanup', 'only final cleanup occurs after both commands');
+          }
+          assert.ok(manifests > 0, 'the positive admission manifest helper actually ran');
+          assert.equal(commands, phase === 'admission-manifest' ? 0 : 1);
+          assert.equal(laterChildren, phase === 'positive' || phase === 'cleanup' ? 1 : 0, 'no later command child starts after the selected refusal');
+          assert.ok(cleaned.every(root => !existsSync(root)), 'owned command roots are cleaned after typed refusal');
+          assert.ok([...helperRoots].every(root => !existsSync(root)), 'all observed private manifest/comparison roots are cleaned too');
+          if (phase !== 'admission-manifest') assert.ok(cleaned.some(root => path.basename(root).startsWith('tachiko-validation-snapshot-')));
+        } finally {
+          childProcess.spawn = originalSpawn; childProcess.spawnSync = originalSync; syncBuiltinESMExports();
+          f.cleanup();
+        }
+      });
+    }
+  }
+
+  for (const kind of ['unknown', 'superseded'] as const) it(`preserves the exact ${kind} primary refusal when owned cleanup cannot be proven`, async () => {
+    const owned = request();
+    const proof = mkdtempSync(path.join(os.tmpdir(), 'tachiko-validation-primary-proof-')); dirs.push(proof);
+    const marker = path.join(proof, 'command');
+    const cause = new Error('Controlled original authority cause.');
+    const primary = new ExecutionAdmissionRefusal('Controlled primary validation refusal.', kind === 'superseded', { cause, authorityUnknown: kind === 'unknown' });
+    const retained: string[] = [];
+    const adapter = new ConfiguredLocalValidationAdapter(configuration([process.execPath, '-e', `require('node:fs').writeFileSync(${JSON.stringify(marker)},'ran')`]),
+      undefined, async roots => { retained.push(...roots); return false; });
+    await assert.rejects(adapter.validate({ ...owned, beforeExecution() { if (existsSync(marker)) throw primary; } }), (error: unknown) => {
+      assert.strictEqual(error, primary); assert.strictEqual((error as Error).cause, cause); return true;
+    });
+    assert.equal(retained.length, 2);
+    for (const root of retained) { assert.equal(existsSync(root), true); dirs.push(root); }
+  });
 });

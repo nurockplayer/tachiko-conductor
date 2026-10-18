@@ -316,6 +316,10 @@ describe('fixed production entry through real parser and canonical dispatcher',(
             if(cut!=='positive'&&!tripped&&selected&&(cut.endsWith('spawn')?atSpawn:!atSpawn)){
               originRun=f.store().list()[0]!;
               originOwner=readRunOwnerReceipt(resolveRunOwnerReceiptPath('acme/widgets',originRun.id));originClaim=f.claim();
+              assert.ok(originClaim);assert.equal(originClaim.runId,null,'The newly running remote claim has not yet received the durable Run ID');
+              assert.equal(originClaim.state,'running');assert.equal(originRun.dispatchClaimId,originClaim.claimId);
+              assert.equal(f.store().list().filter(candidate=>candidate.dispatchClaimId===originClaim!.claimId).length,1,'Exactly one canonical Run owns the immutable claim ID');
+              assert.ok(originOwner);assert.equal(originOwner.runId,originRun.id);assert.equal(originOwner.claimId,originClaim.claimId);
               spawnCutObserved=atSpawn;tripped=true;
               if(drift==='descriptor')f.enable(false);
               else writeFileSync(path.join(f.record.codex.runtimeDirectory,'runtime.cjs'),'revoked controlled runtime bytes');
@@ -344,7 +348,8 @@ describe('fixed production entry through real parser and canonical dispatcher',(
         const owner=readRunOwnerReceipt(resolveRunOwnerReceiptPath('acme/widgets',run.id))!;
         const lane=createHostAdmissionRegistry().readLane(owner.laneId)!;
         process.stderr.write('STAGE10_TYPED_FINALIZATION '+JSON.stringify({cut,drift,finalizationRefused,spawnCutObserved,state:run.state,ownerPhase:owner.phase,laneState:lane.status,claimState:claim.state,workerChildren,headChildren})+'\n');
-        assert.ok(run.dispatchClaimId);assert.equal(claim.claimId,run.dispatchClaimId);assert.equal(claim.runId,run.id);
+        assert.ok(run.dispatchClaimId);assert.equal(claim.claimId,run.dispatchClaimId);
+        assert.equal(f.store().list().filter(candidate=>candidate.dispatchClaimId===claim.claimId).length,1,'The retained claim resolves to exactly this canonical Run');
         assert.equal(owner.runId,run.id);assert.equal(owner.claimId,claim.claimId);
         assert.equal(owner.missionId,lane.missionId);assert.equal(owner.laneId,lane.laneId);assert.equal(owner.generation,lane.generation);
         assert.equal(owner.phase,'parked');assert.equal(owner.token,undefined);assert.equal(lane.status,'parked');
@@ -352,7 +357,7 @@ describe('fixed production entry through real parser and canonical dispatcher',(
         assert.equal(run.history.some(h=>h.type==='agent_failed'),false,'An admission refusal is not a provider failure');
         if(cut==='positive'){
           assert.equal(code,0);assert.equal(finalizationRefused,false);assert.equal(tripped,false);assert.equal(workerChildren,1);assert.equal(f.workers(),1);
-          assert.ok(headEntered);assert.equal(headChildren,1);assert.match(run.interrupt!.reason,/Worker result did not advance the authorized HEAD/);assert.equal(claim.state,'needs_human');
+          assert.ok(headEntered);assert.equal(headChildren,1);assert.match(run.interrupt!.reason,/Worker result did not advance the authorized HEAD/);assert.equal(claim.state,'needs_human');assert.equal(claim.runId,run.id);
         }else{
           assert.equal(tripped,true,'The selected concrete authority cut must execute');
           assert.equal(spawnCutObserved,cut.endsWith('spawn'),'Final-spawn cases must observe the real synchronous createChild frame');
@@ -361,14 +366,14 @@ describe('fixed production entry through real parser and canonical dispatcher',(
           assert.equal(JSON.stringify(run.execution)===JSON.stringify(originRun.execution),true);assert.equal(JSON.stringify(run.bootstrap)===JSON.stringify(originRun.bootstrap),true);
           assert.equal(JSON.stringify(run.implementationAuthority)===JSON.stringify(originRun.implementationAuthority),true);
           for(const key of ['missionId','laneId','runId','claimId'] as const)assert.equal(owner[key],originOwner[key]);
-          assert.equal(claim.claimId,originClaim.claimId);assert.equal(claim.runId,originClaim.runId);
+          assert.equal(claim.claimId,originClaim.claimId);assert.equal(originClaim.runId,null);assert.equal(run.dispatchClaimId,originClaim.claimId);
           assert.match(run.interrupt!.reason,/Implementation execution was refused at the current host admission boundary/);
           assert.equal(run.agentResult,undefined,'Refusal cannot manufacture provider completion');
           assert.equal(workerChildren,headCut?1:0);assert.equal(f.workers(),headCut?1:0);assert.equal(headChildren,0);
           if(drift==='artifact'){
-            assert.equal(finalizationRefused,true);assert.equal(code,undefined);assert.equal(claim.state,'running','Invalid installation cannot settle the remote claim');
+            assert.equal(finalizationRefused,true);assert.equal(code,undefined);assert.equal(claim.state,'running','Invalid installation cannot settle the remote claim');assert.equal(claim.runId,null);
             assert.equal(JSON.stringify(claim)===JSON.stringify(originClaim),true,'The original remote claim remains truthfully unsettled');
-          }else{assert.equal(finalizationRefused,false);assert.equal(code,0);assert.equal(claim.state,'needs_human');}
+          }else{assert.equal(finalizationRefused,false);assert.equal(code,0);assert.equal(claim.state,'needs_human');assert.equal(claim.runId,run.id);}
           if(headCut){
             const workspace=run.bootstrap!.workspacePath;
             assert.equal(existsSync(path.join(workspace,'controlled-worker.txt')),true);

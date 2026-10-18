@@ -199,6 +199,7 @@ async function ignoredManifestWithSettlement(
   gitProgram: string,
   options: IgnoredManifestLimits,
   settlement: ExecutionSettlement,
+  beforeExecution?: () => void,
 ): Promise<string[] | null> {
   if (settlement.unproven) return null;
   const limits = {
@@ -216,16 +217,21 @@ async function ignoredManifestWithSettlement(
   try { temporary = mkdtempSync(path.join(os.tmpdir(), 'tcv-manifest-')); } catch { return null; }
   const result = path.join(temporary, 'result.json');
   let manifest: string[] | null = null;
+  let authorityRefused = false;
+  const assertCurrent = () => { try { beforeExecution?.(); } catch (error) { authorityRefused = true; throw error; } };
   try {
+    assertCurrent();
     const execution = await execute(-1, { argv: [nodeProgram, '-e', IGNORED_MANIFEST_PROGRAM, gitProgram, authority.gitDir, authority.path, result, JSON.stringify(limits)], timeoutMs: limits.timeoutMs }, temporary, validatorGitEnvironment(), undefined, settlement);
+    assertCurrent();
     if (execution.outcome !== 'passed') return null;
     if (statSync(result).size > limits.maxOutputBytes) return null;
     const raw = readFileSync(result, 'utf8');
     const parsed: unknown = JSON.parse(raw);
     if (typeof parsed === 'object' && parsed !== null && (parsed as { ok?: unknown }).ok === true && Array.isArray((parsed as { manifest?: unknown }).manifest) &&
       (parsed as { manifest: unknown[] }).manifest.every((entry) => typeof entry === 'string')) manifest = (parsed as { manifest: string[] }).manifest;
-  } catch { manifest = null; }
-  finally { if (!(await cleanPrivateTreesWithSettlement([temporary], settlement))) manifest = null; }
+  } catch (error) { if (authorityRefused) throw error; manifest = null; }
+  finally { if (!(await cleanPrivateTreesWithSettlement([temporary], settlement).catch(() => false))) manifest = null; }
+  assertCurrent();
   return manifest;
 }
 
@@ -251,79 +257,94 @@ async function workspaceMatches(
   const cleanPrivateTrees: PrivateTreeCleaner = (paths) => cleanPrivateTreesWithSettlement(paths, settlement);
   const authority = directGitAuthority(workspacePath);
   if (authority === null) return null;
-  // This verification reads candidate Git metadata.  A candidate-controlled
-  // core.fsmonitor program must never gain execution authority merely because
-  // the host is proving the candidate clean.
-  const invoke: GitInvoke = (args, timeoutMs = TERMINATION_GRACE_MS) => spawnSync(gitProgram, gitArguments(authority, args), {
-    encoding: 'utf8', shell: false, timeout: timeoutMs, maxBuffer: GIT_STATUS_MAX_BUFFER, env: environment,
-  }) as SpawnSyncReturns<string>;
-  const head = invoke(['rev-parse', 'HEAD']);
-  // Do not content-compare through worker metadata/config: use a no-local
-  // private bare clone and private index below as the settlement authority.
-  const comparison = await baselineWorkspace(workspacePath, cleanPrivateTrees, request.headSha, gitProgram, environment);
-  if (comparison === null) return null;
-  const comparisonInvoke: GitInvoke = (args, timeoutMs = TERMINATION_GRACE_MS) => spawnSync(gitProgram, gitArguments(comparison, args), { encoding: 'utf8', shell: false, timeout: timeoutMs, maxBuffer: GIT_STATUS_MAX_BUFFER, env: environment }) as SpawnSyncReturns<string>;
-  const tracked = comparisonInvoke(['diff', '--no-ext-diff', '--no-textconv', '--no-renames', '--quiet', '--exit-code', 'HEAD', '--']);
-  const manifest = await ignoredManifestWithSettlement(comparison, gitProgram, {}, settlement);
-  if (settlement.unproven) return null;
-  const hiddenIndexFlags = hasHiddenIndexFlags(invoke);
-  if (head.status !== 0 || head.stdout.trim() !== request.headSha || tracked.status !== 0 || manifest === null || hiddenIndexFlags !== false) { await cleanPrivateTrees([comparison.privateRoot]); return null; }
-  if (trustedIgnoredBaselinePath !== undefined) {
-    // A configured baseline becomes the command cwd, even when both ignored
-    // manifests are empty.  Prove it is a separate, clean checkout of this
-    // exact implementation before it gains any execution authority.
-    let baselinePath: string;
-    let workerPath: string;
-    try {
-      baselinePath = realpathSync(trustedIgnoredBaselinePath);
-      workerPath = realpathSync(workspacePath);
-    } catch { await cleanPrivateTrees([comparison.privateRoot]); return null; }
-    if (baselinePath === workerPath || baselinePath.startsWith(`${workerPath}${path.sep}`) || workerPath.startsWith(`${baselinePath}${path.sep}`)) { await cleanPrivateTrees([comparison.privateRoot]); return null; }
-    const baselineAuthority = await baselineWorkspace(baselinePath, cleanPrivateTrees, request.headSha, gitProgram, environment);
-    if (baselineAuthority === null) { await cleanPrivateTrees([comparison.privateRoot]); return null; }
-    const baselineInvoke: GitInvoke = (args, timeoutMs = TERMINATION_GRACE_MS) => spawnSync(gitProgram, gitArguments(baselineAuthority, args), {
-      encoding: 'utf8', shell: false, timeout: timeoutMs, maxBuffer: GIT_STATUS_MAX_BUFFER, env: environment,
-    }) as SpawnSyncReturns<string>;
-    const baselineHead = baselineInvoke(['rev-parse', 'HEAD']);
-    const baselineTracked = baselineInvoke(['diff', '--no-ext-diff', '--no-textconv', '--no-renames', '--quiet', '--exit-code', 'HEAD', '--']);
-    const baselineManifest = await ignoredManifestWithSettlement(baselineAuthority, gitProgram, {}, settlement);
+  const privateTrees: string[] = [];
+  let primary = false;
+  try {
+    // Every resumed helper and direct configured Git effect uses the same
+    // captured removal-only callback; cleanup remains independent.
+    const invoke: GitInvoke = (args, timeoutMs = TERMINATION_GRACE_MS) => {
+      request.beforeExecution?.();
+      return spawnSync(gitProgram, gitArguments(authority, args), {
+        encoding: 'utf8', shell: false, timeout: timeoutMs, maxBuffer: GIT_STATUS_MAX_BUFFER, env: environment,
+      }) as SpawnSyncReturns<string>;
+    };
+    const head = invoke(['rev-parse', 'HEAD']);
+    const comparison = await baselineWorkspace(workspacePath, cleanPrivateTrees, request.headSha, gitProgram, environment, request.beforeExecution);
+    if (comparison === null) return null;
+    privateTrees.push(comparison.privateRoot);
+    request.beforeExecution?.();
+    const comparisonInvoke: GitInvoke = (args, timeoutMs = TERMINATION_GRACE_MS) => {
+      request.beforeExecution?.();
+      return spawnSync(gitProgram, gitArguments(comparison, args), { encoding: 'utf8', shell: false, timeout: timeoutMs, maxBuffer: GIT_STATUS_MAX_BUFFER, env: environment }) as SpawnSyncReturns<string>;
+    };
+    const tracked = comparisonInvoke(['diff', '--no-ext-diff', '--no-textconv', '--no-renames', '--quiet', '--exit-code', 'HEAD', '--']);
+    const manifest = await ignoredManifestWithSettlement(comparison, gitProgram, {}, settlement, request.beforeExecution);
+    request.beforeExecution?.();
     if (settlement.unproven) return null;
-    const baselineHiddenIndexFlags = hasHiddenIndexFlags(baselineInvoke);
-    const baselineValid = baselineHead.status === 0 && baselineHead.stdout.trim() === request.headSha && baselineTracked.status === 0 && baselineManifest !== null && baselineManifest.join('\n') === manifest.join('\n') && baselineHiddenIndexFlags === false;
-    const baselineCleaned = await cleanPrivateTrees([baselineAuthority.privateRoot]);
-    if (!baselineCleaned) { await cleanPrivateTrees([comparison.privateRoot]); return null; }
-    if (!baselineValid) { await cleanPrivateTrees([comparison.privateRoot]); return null; }
-  } else if (manifest.length > 0) {
-    // Never globally ignore ignored paths. They are admissible only when a
-    // separate host-owned clean checkout at this exact HEAD proves identical
-    // bytes existed before the worker could have written its workspace.
-    await cleanPrivateTrees([comparison.privateRoot]); return null;
+    const hiddenIndexFlags = hasHiddenIndexFlags(invoke);
+    if (head.status !== 0 || head.stdout.trim() !== request.headSha || tracked.status !== 0 || manifest === null || hiddenIndexFlags !== false) return null;
+    if (trustedIgnoredBaselinePath !== undefined) {
+      let baselinePath: string;
+      let workerPath: string;
+      try { baselinePath = realpathSync(trustedIgnoredBaselinePath); workerPath = realpathSync(workspacePath); }
+      catch { return null; }
+      if (baselinePath === workerPath || baselinePath.startsWith(`${workerPath}${path.sep}`) || workerPath.startsWith(`${baselinePath}${path.sep}`)) return null;
+      const baselineAuthority = await baselineWorkspace(baselinePath, cleanPrivateTrees, request.headSha, gitProgram, environment, request.beforeExecution);
+      if (baselineAuthority === null) return null;
+      privateTrees.push(baselineAuthority.privateRoot);
+      request.beforeExecution?.();
+      const baselineInvoke: GitInvoke = (args, timeoutMs = TERMINATION_GRACE_MS) => {
+        request.beforeExecution?.();
+        return spawnSync(gitProgram, gitArguments(baselineAuthority, args), {
+          encoding: 'utf8', shell: false, timeout: timeoutMs, maxBuffer: GIT_STATUS_MAX_BUFFER, env: environment,
+        }) as SpawnSyncReturns<string>;
+      };
+      const baselineHead = baselineInvoke(['rev-parse', 'HEAD']);
+      const baselineTracked = baselineInvoke(['diff', '--no-ext-diff', '--no-textconv', '--no-renames', '--quiet', '--exit-code', 'HEAD', '--']);
+      const baselineManifest = await ignoredManifestWithSettlement(baselineAuthority, gitProgram, {}, settlement, request.beforeExecution);
+      request.beforeExecution?.();
+      if (settlement.unproven) return null;
+      const baselineHiddenIndexFlags = hasHiddenIndexFlags(baselineInvoke);
+      if (!(baselineHead.status === 0 && baselineHead.stdout.trim() === request.headSha && baselineTracked.status === 0 && baselineManifest !== null && baselineManifest.join('\n') === manifest.join('\n') && baselineHiddenIndexFlags === false)) return null;
+    } else if (manifest.length > 0) return null;
+    if (!requireRepositoryIdentity) return manifest;
+    const remote = invoke(['remote', 'get-url', 'origin']);
+    return remote.status === 0 && remoteMatchesTarget(remote.stdout, request) ? manifest : null;
+  } catch (error) {
+    primary = true;
+    throw error;
+  } finally {
+    // Own every allocated comparison root across all new callback throws.
+    const cleaned = privateTrees.length === 0 || await cleanPrivateTrees(privateTrees).catch(() => false);
+    if (!cleaned && !primary) return null;
   }
-  if (!(await cleanPrivateTrees([comparison.privateRoot]))) return null;
-  if (!requireRepositoryIdentity) return manifest;
-  const remote = invoke(['remote', 'get-url', 'origin']);
-  return remote.status === 0 && remoteMatchesTarget(remote.stdout, request) ? manifest : null;
 }
 
 /** The reconstructed checkout has no remote by design.  Bind command evidence
  * to its immutable exact commit and reject any tracked/index mutation. */
-async function commandWorkspaceManifest(authority: GitAuthority, headSha: string, gitProgram = 'git', environment = validatorGitEnvironment(), settlement: ExecutionSettlement = { unproven: false }): Promise<string[] | null> {
+async function commandWorkspaceManifest(authority: GitAuthority, headSha: string, gitProgram = 'git', environment = validatorGitEnvironment(), settlement: ExecutionSettlement = { unproven: false }, beforeExecution?: () => void): Promise<string[] | null> {
   if (settlement.unproven) return null;
   // The reconstructed checkout contains candidate history.  Every trusted
   // host-side probe pins fsmonitor off so a copied or otherwise planted local
   // config cannot execute while evidence is being verified.
-  const invoke: GitInvoke = (args, timeoutMs = TERMINATION_GRACE_MS) => spawnSync(gitProgram, gitArguments(authority, args), {
+  const invoke: GitInvoke = (args, timeoutMs = TERMINATION_GRACE_MS) => {
+    beforeExecution?.();
+    return spawnSync(gitProgram, gitArguments(authority, args), {
     encoding: 'utf8', shell: false, timeout: timeoutMs, maxBuffer: GIT_STATUS_MAX_BUFFER, env: environment,
   }) as SpawnSyncReturns<string>;
+  };
   const head = invoke(['rev-parse', 'HEAD']);
   const tracked = invoke(['diff', '--no-ext-diff', '--no-textconv', '--no-renames', '--quiet', '--exit-code', 'HEAD', '--']);
   const hiddenIndexFlags = hasHiddenIndexFlags(invoke);
   if (head.status !== 0 || head.stdout.trim() !== headSha || tracked.status !== 0 || hiddenIndexFlags !== false) return null;
-  return ignoredManifestWithSettlement(authority, gitProgram, {}, settlement);
+  const manifest = await ignoredManifestWithSettlement(authority, gitProgram, {}, settlement, beforeExecution);
+  beforeExecution?.();
+  return manifest;
 }
 
-async function commandWorkspaceMatches(authority: GitAuthority, headSha: string, expectedIgnored: readonly string[] = [], gitProgram = 'git', environment = validatorGitEnvironment(), settlement: ExecutionSettlement = { unproven: false }): Promise<boolean> {
-  const manifest = await commandWorkspaceManifest(authority, headSha, gitProgram, environment, settlement);
+async function commandWorkspaceMatches(authority: GitAuthority, headSha: string, expectedIgnored: readonly string[] = [], gitProgram = 'git', environment = validatorGitEnvironment(), settlement: ExecutionSettlement = { unproven: false }, beforeExecution?: () => void): Promise<boolean> {
+  const manifest = await commandWorkspaceManifest(authority, headSha, gitProgram, environment, settlement, beforeExecution);
+  beforeExecution?.();
   return manifest !== null && manifest.join('\n') === expectedIgnored.join('\n');
 }
 
@@ -451,6 +472,7 @@ async function reconstructedWorkspace(
   cleanPrivateTrees: PrivateTreeCleaner,
   gitProgram = 'git',
   environment = validatorGitEnvironment(),
+  beforeExecution?: () => void,
 ): Promise<ValidationWorkspace | null> {
   let snapshot: string;
   try { snapshot = mkdtempSync(path.join(os.tmpdir(), 'tachiko-validation-snapshot-')); }
@@ -458,7 +480,11 @@ async function reconstructedWorkspace(
   const workspace = path.join(snapshot, 'workspace');
   const gitDir = path.join(snapshot, 'git');
   const authority: GitAuthority = { path: workspace, gitDir };
-  const invoke = (args: readonly string[]) => spawnSync(gitProgram, [
+  let authorityRefused = false;
+  const assertCurrent = (): void => { try { beforeExecution?.(); } catch (error) { authorityRefused = true; throw error; } };
+  const invoke = (args: readonly string[]) => {
+    assertCurrent();
+    return spawnSync(gitProgram, [
     '-c', `core.hooksPath=${os.devNull}`,
     '-c', 'core.fsmonitor=false',
     '-c', `core.attributesFile=${os.devNull}`,
@@ -467,6 +493,7 @@ async function reconstructedWorkspace(
     encoding: 'utf8', shell: false, timeout: RECONSTRUCTION_TIMEOUT_MS, maxBuffer: GIT_STATUS_MAX_BUFFER,
     env: environment,
   });
+  };
   try {
     const cloned = invoke(['clone', '--no-local', '--no-checkout', `--separate-git-dir=${gitDir}`, sourcePath, workspace]);
     // `clone` records the source path as origin. That path is worker-owned for
@@ -494,8 +521,9 @@ async function reconstructedWorkspace(
       return null;
     }
     return { path: workspace, gitDir, privateRoot: snapshot };
-  } catch {
-    try { await cleanPrivateTrees([snapshot]); } catch { /* fail closed below */ }
+  } catch (error) {
+    try { await cleanPrivateTrees([snapshot]); } catch { /* preserve primary refusal */ }
+    if (authorityRefused) throw error;
     return null;
   }
 }
@@ -509,30 +537,37 @@ async function baselineWorkspace(
   expectedHead: string,
   gitProgram = 'git',
   environment = validatorGitEnvironment(),
+  beforeExecution?: () => void,
 ): Promise<ValidationWorkspace | null> {
   const protectedAuthority = directGitAuthority(baselinePath);
   if (protectedAuthority === null) return null;
   let privateRoot: string;
   try { privateRoot = mkdtempSync(path.join(os.tmpdir(), 'tachiko-validation-baseline-')); } catch { return null; }
   const gitDir = path.join(privateRoot, 'git');
+  let authorityRefused = false;
+  const assertCurrent = (): void => { try { beforeExecution?.(); } catch (error) { authorityRefused = true; throw error; } };
   try {
+    assertCurrent();
     const clone = spawnSync(gitProgram, ['-c', `core.hooksPath=${os.devNull}`, '-c', 'core.fsmonitor=false', '-c', `core.attributesFile=${os.devNull}`, 'clone', '--no-local', '--bare', baselinePath, gitDir], {
       encoding: 'utf8', shell: false, timeout: RECONSTRUCTION_TIMEOUT_MS, maxBuffer: GIT_STATUS_MAX_BUFFER, env: environment,
     });
     if (clone.status !== 0 || clone.signal !== null) throw Error('clone');
     const metadata = realpathSync(gitDir);
+    assertCurrent();
     const disconnected = spawnSync(gitProgram, gitArguments({ path: protectedAuthority.path, gitDir: metadata }, ['remote', 'remove', 'origin']), { encoding: 'utf8', shell: false, timeout: RECONSTRUCTION_TIMEOUT_MS, maxBuffer: GIT_STATUS_MAX_BUFFER, env: environment });
     if (disconnected.status !== 0 || disconnected.signal !== null) throw Error('remote');
     // A bare clone has no index. Populate its private index before the
     // candidate can run so later diff/status probes never consult baseline
     // metadata or create a lock in the protected settlement authority.
     const privateAuthority = { path: protectedAuthority.path, gitDir: metadata };
-    const privateInvoke: GitInvoke = (args, timeoutMs = TERMINATION_GRACE_MS) => spawnSync(gitProgram, gitArguments(privateAuthority, args), { encoding: 'utf8', shell: false, timeout: timeoutMs, maxBuffer: GIT_STATUS_MAX_BUFFER, env: environment }) as SpawnSyncReturns<string>;
+    const privateInvoke: GitInvoke = (args, timeoutMs = TERMINATION_GRACE_MS) => { assertCurrent(); return spawnSync(gitProgram, gitArguments(privateAuthority, args), { encoding: 'utf8', shell: false, timeout: timeoutMs, maxBuffer: GIT_STATUS_MAX_BUFFER, env: environment }) as SpawnSyncReturns<string>; };
     // Inspect immutable blobs before any status/diff can consult worktree attributes.
     if (hasTrackedFilterAttributes(protectedAuthority.path, expectedHead, privateInvoke) !== false) throw Error('filter');
+    assertCurrent();
     const indexed = spawnSync(gitProgram, gitArguments(privateAuthority, ['read-tree', expectedHead]), {
       encoding: 'utf8', shell: false, timeout: RECONSTRUCTION_TIMEOUT_MS, maxBuffer: GIT_STATUS_MAX_BUFFER, env: environment,
     });
+    assertCurrent();
     const verified = spawnSync(gitProgram, gitArguments({ path: protectedAuthority.path, gitDir: metadata }, ['rev-parse', 'HEAD']), { encoding: 'utf8', shell: false, timeout: RECONSTRUCTION_TIMEOUT_MS, maxBuffer: GIT_STATUS_MAX_BUFFER, env: environment });
     if (indexed.status !== 0 || indexed.signal !== null || verified.status !== 0 || verified.signal !== null || verified.stdout.trim() !== expectedHead) throw Error('index');
     const pointer = path.join(protectedAuthority.path, '.git');
@@ -549,8 +584,9 @@ async function baselineWorkspace(
       protectedPaths.push(resolvedCommon);
     }
     return { path: protectedAuthority.path, gitDir: metadata, privateRoot, protectedGitDir: [...new Set(protectedPaths)] };
-  } catch {
-    try { await cleanPrivateTrees([privateRoot]); } catch { /* fail closed */ }
+  } catch (error) {
+    try { await cleanPrivateTrees([privateRoot]); } catch { /* preserve primary refusal */ }
+    if (authorityRefused) throw error;
     return null;
   }
 }
@@ -1038,12 +1074,14 @@ export class ConfiguredLocalValidationAdapter implements ValidationAdapter {
     // input so worker-controlled .git bytes have no validation authority.
     const baseline = this.configuration.trustedIgnoredBaselinePath;
     const commandWorkspace = baseline === undefined
-      ? await reconstructedWorkspace(workspacePath, request.headSha, cleanPrivateTrees, this.configuration.gitProgram, gitEnvironment)
-      : await baselineWorkspace(baseline, cleanPrivateTrees, request.headSha, this.configuration.gitProgram, gitEnvironment);
+      ? await reconstructedWorkspace(workspacePath, request.headSha, cleanPrivateTrees, this.configuration.gitProgram, gitEnvironment, request.beforeExecution)
+      : await baselineWorkspace(baseline, cleanPrivateTrees, request.headSha, this.configuration.gitProgram, gitEnvironment, request.beforeExecution);
     if (commandWorkspace === null) {
       return { status: 'unknown', configRevision: revision, commands: [workspaceUnavailable(0)] };
     }
     let runtimeRoot: string | undefined;
+    let successful: LocalValidationEvidence | undefined;
+    let primary = false;
     try {
       request.beforeExecution?.();
       if (!validHostBrowserArtifacts(this.configuration.playwrightBrowsersPath)) {
@@ -1075,6 +1113,7 @@ export class ConfiguredLocalValidationAdapter implements ValidationAdapter {
           return { status: 'unknown', configRevision: revision, commands: [workspaceUnavailable(0)] };
         }
       }
+      request.beforeExecution?.();
       const environment = credentialFreeValidationEnvironment(runtimeRoot, this.configuration.playwrightBrowsersPath ?? undefined, this.configuration.nodeProgram, this.configuration.pnpmProgram, this.configuration.gitProgram, privateStore);
       if (environment === null) return { status: 'unknown', configRevision: revision, commands: [workspaceUnavailable(0)] };
       // A production plan has one host-provisioned pnpm authority.  Reject a
@@ -1097,7 +1136,7 @@ export class ConfiguredLocalValidationAdapter implements ValidationAdapter {
       // itself never grants this authority, and later checks pin this same
       // manifest (or the separately captured cold-hydration manifest).
       const initialIgnoredManifest = baseline === undefined ? [] : admittedIgnoredManifest;
-      if (!(await commandWorkspaceMatches(commandWorkspace, request.headSha, initialIgnoredManifest, this.configuration.gitProgram, gitEnvironment, settlement))) return { status: 'unknown', configRevision: revision, commands: [workspaceUnavailable(0)] };
+      if (!(await commandWorkspaceMatches(commandWorkspace, request.headSha, initialIgnoredManifest, this.configuration.gitProgram, gitEnvironment, settlement, request.beforeExecution))) return { status: 'unknown', configRevision: revision, commands: [workspaceUnavailable(0)] };
       let hydratedManifest: readonly string[] = initialIgnoredManifest;
       let settledManifest: readonly string[] = initialIgnoredManifest;
       for (let index = 0; index < configured.length; index += 1) {
@@ -1108,12 +1147,13 @@ export class ConfiguredLocalValidationAdapter implements ValidationAdapter {
         }
         request.beforeExecution?.();
         const result = await execute(index, command, commandWorkspace.path, environment, sandboxProfile, settlement);
+        request.beforeExecution?.();
         evidence.push(result);
         if (result.outcome === 'failed' || result.outcome === 'timed_out') {
           return { status: 'failed', configRevision: revision, commands: evidence };
         }
         if (result.outcome !== 'passed') return { status: 'unknown', configRevision: revision, commands: evidence };
-        const manifest = await commandWorkspaceManifest(commandWorkspace, request.headSha, this.configuration.gitProgram, gitEnvironment, settlement);
+        const manifest = await commandWorkspaceManifest(commandWorkspace, request.headSha, this.configuration.gitProgram, gitEnvironment, settlement, request.beforeExecution);
         const isHydration = index === 0 && this.configuration.dependencyArtifactPath !== undefined;
         const isFinal = index === configured.length - 1;
         const manifestAdmitted = manifest !== null && (
@@ -1130,7 +1170,7 @@ export class ConfiguredLocalValidationAdapter implements ValidationAdapter {
         if (isHydration) hydratedManifest = manifest;
         settledManifest = manifest;
       }
-      if (!(await commandWorkspaceMatches(commandWorkspace, request.headSha, settledManifest, this.configuration.gitProgram, gitEnvironment, settlement))) {
+      if (!(await commandWorkspaceMatches(commandWorkspace, request.headSha, settledManifest, this.configuration.gitProgram, gitEnvironment, settlement, request.beforeExecution))) {
         evidence.push(workspaceUnavailable(evidence.length));
         return { status: 'unknown', configRevision: revision, commands: evidence };
       }
@@ -1138,7 +1178,10 @@ export class ConfiguredLocalValidationAdapter implements ValidationAdapter {
         evidence.push(workspaceUnavailable(evidence.length));
         return { status: 'unknown', configRevision: revision, commands: evidence };
       }
-      return { status: 'passed', configRevision: revision, commands: evidence };
+      successful = { status: 'passed', configRevision: revision, commands: evidence };
+    } catch (error) {
+      primary = true;
+      throw error;
     } finally {
       const privateTrees = [
         ...(runtimeRoot === undefined ? [] : [runtimeRoot]),
@@ -1146,9 +1189,12 @@ export class ConfiguredLocalValidationAdapter implements ValidationAdapter {
       ];
       let cleaned = privateTrees.length === 0;
       try { cleaned = cleaned || await cleanPrivateTrees(privateTrees); } catch { cleaned = false; }
-      if (!cleaned) {
+      if (!cleaned && !primary) {
         return { status: 'unknown', configRevision: revision, commands: [...evidence, workspaceUnavailable(evidence.length)] };
       }
     }
+    // Successful evidence is returned only after owned cleanup has settled.
+    request.beforeExecution?.();
+    return successful!;
   }
 }

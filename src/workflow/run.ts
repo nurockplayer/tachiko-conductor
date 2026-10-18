@@ -530,6 +530,7 @@ async function validateExactHead(
     onExecutionStart?.();
     beforeValidation?.();
     local = await validation!.validate({ target, headSha: run.headSha, beforeExecution:beforeValidation, ...(run.bootstrap === undefined ? {} : { workspacePath: run.bootstrap.workspacePath }) });
+    beforeValidation?.();
   }
   return combineValidation(run.headSha, local, hostedValidation(snapshot, hostedPolicy));
 }
@@ -1522,7 +1523,21 @@ export async function runWorkflow(
         let postValidationSnapshot: GitHubLiveSnapshot;
         try {
           postValidationSnapshot = await github.readLiveSnapshot(target);
+          assertFinalExecutionAdmission(store, validationExpected, options, true);
         } catch (error) {
+          if (isExecutionAdmissionRefusal(error)) {
+            if (error.authorityUnknown) throw error;
+            try {
+              const compareAndSwap = store.updateIfUnchanged;
+              if (compareAndSwap === undefined) throw new Error('Strict Run compare-and-swap is unavailable during post-validation refusal reconciliation.');
+              if (!compareAndSwap.call(store, validationExpected, validationExpected) || error.runSuperseded) {
+                return staleWorkflowOutcome(run.id, validationExpected, store, 'Run changed during the post-validation admission check; preserving the newer Run.');
+              }
+              return park(validationExpected, `Post-validation evidence was refused at the current host admission boundary: ${error.message}`, store, now, [CANCEL_RUN_DECISION]);
+            } catch {
+              throw error;
+            }
+          }
           return githubFailureOutcome(run, error, store, now);
         }
         if (!updateIfCurrent(store, validationExpected, validationExpected)) return staleWorkflowOutcome(run.id, validationExpected, store, 'Run changed during the post-validation live read; preserving the newer Run.');
