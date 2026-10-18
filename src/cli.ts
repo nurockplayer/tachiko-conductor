@@ -2455,20 +2455,26 @@ function printRunInspection(run: Run): void {
   console.log(lines.join('\n'));
 }
 
-function buildBrowserRuntime(env: NodeJS.ProcessEnv = process.env): ManagedPlaywrightMcpRuntime {
+function buildBrowserRuntime(
+  env: NodeJS.ProcessEnv = process.env,
+  production?: ProductionHostSnapshot,
+): ManagedPlaywrightMcpRuntime {
   const roots = resolveBrowserRoots(env);
+  const repositoryRoot = production?.repositoryRoot ?? resolveRepositoryRoot();
   return new ManagedPlaywrightMcpRuntime({
     ...roots,
-    repositoryRoot: resolveRepositoryRoot(),
+    repositoryRoot,
     env,
   });
 }
 
 function buildBrowserCapabilityResolver(
   browserProfile: string | undefined,
+  env: NodeJS.ProcessEnv,
+  production?: ProductionHostSnapshot,
 ): ImplementationCapabilityResolver | undefined {
   if (browserProfile === undefined) return undefined;
-  const runtime = buildBrowserRuntime();
+  const runtime = buildBrowserRuntime(env, production);
   return async () => await browserImplementationCapabilities(runtime, browserProfile);
 }
 
@@ -2717,7 +2723,7 @@ export async function main(argv: string[], native: CliNativeDependencies = {}): 
   }
 
   if (command === 'browser') {
-    const runtime = buildBrowserRuntime(commandEnvironment);
+    const runtime = buildBrowserRuntime(commandEnvironment, production);
     try {
       if (subcommand === 'start' || subcommand === 'bootstrap') {
         const { values, positionals } = parseArgs({
@@ -3381,7 +3387,7 @@ export async function main(argv: string[], native: CliNativeDependencies = {}): 
     const [id] = positionals;
     if (id === undefined) throw new Error('run resume requires a run id.');
     if (values.decision === undefined) throw new Error('run resume requires --decision <choice>.');
-    const resolveCapabilities = buildBrowserCapabilityResolver(values['browser-profile']);
+    const resolveCapabilities = buildBrowserCapabilityResolver(values['browser-profile'], commandEnvironment, production);
     const outcome = await withCommandAdmissionLock(async (releaseAdmissionLock) => {
       const run = store.read(id);
       if (run === null) throw new Error(`No run with id "${id}" found.`);
@@ -3460,7 +3466,7 @@ export async function main(argv: string[], native: CliNativeDependencies = {}): 
     throw new Error('run requires exactly one owner/repo#123 reference.');
   }
   const outcome = await withCommandAdmissionLock(async (releaseAdmissionLock) => {
-    const resolveCapabilities = buildBrowserCapabilityResolver(values['browser-profile']);
+    const resolveCapabilities = buildBrowserCapabilityResolver(values['browser-profile'], commandEnvironment, production);
     const target = parseIssueRef(ref);
     const existing = findRunByTarget(store, target);
     if (existing === null && values['execution-profile'] === undefined) {

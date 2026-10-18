@@ -124,7 +124,12 @@ describe('ManagedPlaywrightMcpRuntime', () => {
       const records=()=>existsSync(report)?readFileSync(report,'utf8').trim().split('\n').filter(Boolean).map(line=>JSON.parse(line) as {phase:string;execArgv?:string[];selected?:string;value?:string;code?:string;name?:string}):[];
       const detail=()=>JSON.stringify({mode,children:spawns.length,errors,phases:records().map(record=>record.phase)});
       try{
-        execFileSync(f.record.git.path,['init','--quiet',f.objectRoot],{env:{HOME:f.home,PATH:'/usr/bin:/bin',GIT_CONFIG_NOSYSTEM:'1',GIT_CONFIG_GLOBAL:'/dev/null'}});process.chdir(f.objectRoot);f.enable(false);
+        execFileSync(f.record.git.path,['init','--quiet',f.objectRoot],{env:{HOME:f.home,PATH:'/usr/bin:/bin',GIT_CONFIG_NOSYSTEM:'1',GIT_CONFIG_GLOBAL:'/dev/null'}});
+        const caller=mode==='manifested'?f.release:path.join(f.home,'non-git-caller');
+        if(mode!=='manifested')mkdirSync(caller,{mode:0o700});
+        process.chdir(caller);f.enable(false);
+        process.env.TACHIKO_BROWSER_PROFILE_ROOT=path.join(f.objectRoot,'ambient-profiles');
+        process.env.TACHIKO_BROWSER_RUNTIME_ROOT=path.join(f.objectRoot,'ambient-runtimes');
         const accepted=f.resolve();assert.equal(accepted.installation,'accepted',accepted.reason);accepted.assertRecoveryScope('acme','widgets');
         const selected=f.record.environment.TACHIKO_PLAYWRIGHT_BROWSERS_PATH;
         assert.equal(accepted.environment.PLAYWRIGHT_BROWSERS_PATH,selected);
@@ -175,6 +180,18 @@ describe('ManagedPlaywrightMcpRuntime', () => {
             const latest=records().filter(record=>record.phase==='spawn').at(-1)!;assert.equal(latest.selected,selected);assert.deepEqual(latest.execArgv,call.args.slice(0,2));
             assert.equal(records().filter(record=>record.phase==='dependency-loaded').at(-1)?.value,'manifested');
             if(command==='bootstrap'){assert.ok(records().some(record=>record.phase==='tool'&&record.name==='browser_navigate'));rmSync(selected!,{recursive:true});}
+            let statusRuntimeId:string|undefined;
+            console.log=(value?:unknown)=>{try{const parsed=JSON.parse(String(value)) as {runtime?:{runtimeId:string}};statusRuntimeId=parsed.runtime?.runtimeId;}catch{/* Only the controlled status JSON is inspected. */}};
+            commandPhase='browser:status';assert.equal(await f.invoke(['browser','status',profile]),0,detail());assert.equal(statusRuntimeId,snapshot.runtimeId);
+            assert.equal(existsSync(path.join(f.objectRoot,'ambient-profiles')),false);
+            assert.equal(existsSync(path.join(f.objectRoot,'ambient-runtimes')),false);
+            if(command==='start'){
+              commandPhase='run:browser-profile-construction';
+              await assert.rejects(f.invoke(['run','invalid-reference','--browser-profile',profile]),/Invalid issue reference/);
+              commandPhase='run:resume:browser-profile-construction';
+              await assert.rejects(f.invoke(['run','resume','absent-browser-run','--decision','continue','--browser-profile',profile]),/No run with id "absent-browser-run" found/);
+              assert.equal(spawns.length,1,'Optional capability composition cannot start another browser');
+            }
             commandPhase='browser:stop';const stopping=f.invoke(['browser','stop',profile]);void stopping.catch(()=>undefined);assert.equal(await running,0,detail());running=undefined;assert.equal(await stopping,0,detail());
             assert.equal(existsSync(path.join(f.accountRoot,'browser/profiles',profile,'.tachiko-runtime-lock.json')),false);
           }
@@ -196,6 +213,8 @@ describe('ManagedPlaywrightMcpRuntime', () => {
           assert.equal(existsSync(path.join(f.accountRoot,'browser/profiles/missing-binding')),false);assert.equal(records().length,0);
           accepted.assertInstallation();accepted.assertRecoveryScope('acme','widgets');
         }
+        assert.equal(rootProbes,0,'Accepted browser composition must not discover a repository from caller cwd');
+        process.stderr.write('STAGE10_BROWSER_COMPOSITION '+JSON.stringify({mode,caller:mode==='manifested'?'release':'non-git',rootProbes,optionalConstructors:mode==='manifested'?2:0,ambientStorageCreated:existsSync(path.join(f.objectRoot,'ambient-profiles'))||existsSync(path.join(f.objectRoot,'ambient-runtimes')),children:spawns.length})+'\n');
         process.stderr.write('STAGE10_BROWSER_BINDING '+JSON.stringify({mode,children:spawns.length,selectedBinding:mode==='missing-binding'?'unavailable':'accepted',closedLookup:spawns.length===0?null:spawns.every(call=>call.args[0]==='--no-global-search-paths'),dependency:mode==='global-only'?'refused':mode==='manifested'?'manifested':'not-started',locksReleased:true})+'\n');
       }finally{
         let cleanupSignalRequested=false, fixtureRemoved=false;
