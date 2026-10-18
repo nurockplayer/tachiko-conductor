@@ -19,6 +19,8 @@ export const HEARTBEAT_OWNER_RECEIPTS_DIR_ENV = 'TACHIKO_HEARTBEAT_ADMISSION_REC
 export const RUN_OWNER_RECEIPTS_DIR_ENV = 'TACHIKO_RUN_OWNER_RECEIPTS_DIR';
 
 export interface HostAdmissionResolverOptions {
+  /** Source-composed installed-command compatibility fence; never read from configuration. */
+  readonly assertInstallation?: () => void;
   readonly env?: NodeJS.ProcessEnv;
   readonly homeDirectory?: string;
 }
@@ -64,6 +66,7 @@ export function resolveHostAdmissionConfig(env: NodeJS.ProcessEnv = process.env)
 }
 
 export function createHostAdmissionRegistry(options: HostAdmissionResolverOptions = {}): MissionAdmissionRegistry {
+  options.assertInstallation?.();
   const env = options.env ?? process.env;
   const homeDirectory = options.homeDirectory ?? resolveAccountHomeDirectory();
   const filePath = resolveHostAdmissionPath({ ...options, homeDirectory });
@@ -74,14 +77,28 @@ export function createHostAdmissionRegistry(options: HostAdmissionResolverOption
     assertSafeAccountOwnedPath(homeDirectory, path.join(homeDirectory, '.tachiko-conductor', 'dispatch', 'once.lock.admission'), 'file');
   };
   validateRegistryPath();
-  return new MissionAdmissionRegistry({
+  const registry = new MissionAdmissionRegistry({
     filePath,
     config: resolveHostAdmissionConfig(env),
     validatePath: validateRegistryPath,
     onPublishedTransition: () => {
-      try { signalDispatchWake(dispatchWakePath(env, homeDirectory)); } catch { /* registry publication is authoritative; the safety poll recovers lost hints */ }
+      try { options.assertInstallation?.(); signalDispatchWake(dispatchWakePath(env, homeDirectory)); } catch { /* registry publication is authoritative; the safety poll recovers lost hints */ }
     },
   });
+  if (options.assertInstallation !== undefined) {
+    // Admission, adoption, execution and publication need compatible code.
+    // Exact-token park/release remain the existing stopped-owner cleanup path.
+    for (const method of ['admit', 'strengthen', 'renew', 'parkManual', 'retireManual', 'releaseParked',
+      'withLaneLock', 'withRunTransitionFence', 'reconcileMergedRun', 'withExactReleasedLane',
+      'assertCanMutate', 'assertCanPublish'] as const) {
+      const operation = registry[method];
+      Object.defineProperty(registry, method, { value: (...args: unknown[]) => {
+        options.assertInstallation!();
+        return Reflect.apply(operation, registry, args);
+      } });
+    }
+  }
+  return registry;
 }
 
 function containsPath(parent: string, child: string): boolean {

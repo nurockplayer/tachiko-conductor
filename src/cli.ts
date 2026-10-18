@@ -594,6 +594,7 @@ export async function browserBootstrapCommand(
 ): Promise<BrowserStartCommandResult> {
   const handle = await runtime.start({ profile, ...options, headless: false });
   try {
+    options.beforeStart?.();
     const lease = await abortable(
       () => openBrowser(handle.snapshot.endpoint),
       options.signal,
@@ -856,6 +857,7 @@ export function publishAdmissionRuntimeProjection(
   registry: MissionAdmissionRegistry,
   store: RunStore,
   update: RuntimeProjectionUpdate,
+  ownedCleanup = false,
 ): ReturnType<typeof composeOperationalRuntimeProjection> {
   const priorRead = readOperationalRuntimeProjectionState(runsDir);
   if (priorRead.status === 'invalid') throw new Error('Existing operational runtime projection is unreadable or malformed; refusing to overwrite it.');
@@ -931,6 +933,11 @@ export function publishAdmissionRuntimeProjection(
     lane.role === 'production_captain' && lane.evidence.repositoryScope === true && lane.evidence.repository === prior.manualLane!.repository &&
     lane.evidence.workspace === prior.manualLane!.worktree && validatedManualIds.has(lane.laneId));
   const reentryEvidenceComplete = pristine || (hasValidatedHistory && noTransitionalMutationOwners && everyMutationOwnerValidated && everyRunValidated && priorWriterResolved && priorManualResolved);
+  if (ownedCleanup && (!hasValidatedHistory || validatedRunIds.size === 0 || !reentryEvidenceComplete ||
+    update.supervisor !== 'stopped' || !['needs_human', 'failed', 'pre_execution_released'].includes(update.stage) ||
+    update.eventWakeEligible === true || update.nextPollAt !== undefined)) {
+    throw new Error('Unavailable installation cannot publish anything except a fully ownership-proven stopped Run cleanup.');
+  }
   const projection = composeOperationalRuntimeProjection({
     admission, runs, prior, now: new Date().toISOString(), stage: update.stage, supervisor: update.supervisor,
     eventWakeEligible: update.eventWakeEligible ?? false,
@@ -1526,6 +1533,7 @@ export function parseGitHubRepositoryRemote(remote: string): string {
 }
 
 export interface WorkflowCommandOptions {
+  readonly assertInstallation?: () => void;
   readonly assertReviewClaim?: (run: Run) => Promise<void>;
   readonly assertLeadInitiation?: (run: Run) => Promise<void>;
   readonly leadObservationOnly?: boolean;
@@ -1578,6 +1586,7 @@ export async function runIssueCommand(
       releaseDispatchAdmissionLock: release,
     }));
   }
+  options.assertInstallation?.();
   const target = parseIssueRef(ref);
   let run = findRunByTarget(deps.store, target);
   if (run !== null && run.dispatchClaimId !== options.dispatchClaimId) {
@@ -1690,6 +1699,7 @@ export async function resumeCommand(
   decision: string,
   options: WorkflowCommandOptions = {},
 ): Promise<WorkflowOutcome> {
+  options.assertInstallation?.();
   let run = deps.store.read(id);
   if (run === null) throw new Error(`No run with id "${id}" found.`);
   if (run.dispatchClaimId !== options.dispatchClaimId) {
@@ -1721,6 +1731,7 @@ export async function resumeCommand(
     const cancelled = applyTransition(run, { type: 'fail', reason: CANCEL_RUN_DECISION }, now());
   if (run.dispatchClaimId !== undefined && options.commitDispatchResumeTransition !== undefined) {
     await options.commitDispatchResumeTransition(run, cancelled, () => {
+      options.assertInstallation?.();
       updateClaimedRunIfUnchanged(deps.store, run, cancelled);
       mayReleaseAsPreExecution = false;
     });
@@ -1789,8 +1800,10 @@ export async function resumeCommand(
     },
     now(),
   );
+  options.assertInstallation?.();
   if (run.dispatchClaimId !== undefined && options.commitDispatchResumeTransition !== undefined) {
     await options.commitDispatchResumeTransition(run, resumed, () => {
+      options.assertInstallation?.();
       updateClaimedRunIfUnchanged(deps.store, run, resumed);
       mayReleaseAsPreExecution = false;
     });
@@ -2643,6 +2656,26 @@ export async function main(argv: string[], native: CliNativeDependencies = {}): 
   const production = native.production;
   if (production !== undefined && !isProductionHostSnapshot(production)) throw new Error('Unvalidated production composition.');
   const commandEnvironment = production?.environment ?? process.env;
+  const assertInstallation = () => production?.assertInstallation();
+  const withCommandAdmissionLock = async <T>(operation: (release: () => void) => T | Promise<T>): Promise<T> => {
+    assertInstallation();
+    return withDispatchAdmissionLock(release => { assertInstallation(); return operation(release); });
+  };
+  const commandAdmission = () => createHostAdmissionRegistry({ assertInstallation });
+  const publishCommandRuntimeProjection: typeof publishAdmissionRuntimeProjection = (...args) => {
+    assertInstallation();
+    return publishAdmissionRuntimeProjection(...args);
+  };
+  const publishOwnedRuntimeProjection = (registry: MissionAdmissionRegistry, runStore: RunStore, update: RuntimeProjectionUpdate) => {
+    try { assertInstallation(); }
+    catch (error) {
+      if (production?.installation !== 'accepted') throw error;
+      // This callback is available only to the already-owned workflow.
+      // The existing publisher must prove every parked/released owner/receipt.
+      return publishAdmissionRuntimeProjection(resolveRunsDir(commandEnvironment), registry, runStore, update, true);
+    }
+    return publishAdmissionRuntimeProjection(resolveRunsDir(commandEnvironment), registry, runStore, update);
+  };
   const transportForCommand = () => { if (production) { production.assertInstallation(); return production.transport!; } return new GhCliTransport(); };
   const makeWorkflow = (store: RunStore, capabilities: ImplementationCapabilityResolver | undefined, env: NodeJS.ProcessEnv, transport: GhCliTransport, issuedOnly = false) => {
     const workflow = buildWorkflowDeps(store, capabilities, env, transport, issuedOnly ? undefined : native.nativeReviewerHost, issuedOnly ? undefined : (production === undefined ? native.nativeMergeHost : production.nativeMergeHost), issuedOnly ? undefined : native.nativeLeadHost, production);
@@ -2653,17 +2686,19 @@ export async function main(argv: string[], native: CliNativeDependencies = {}): 
     };
     return { ...workflow, ...(native.validation ? { validation:native.validation } : {}), ...(native.implementation ? { implementation:native.implementation } : {}) };
   };
-  const historical = production?.historicalCompletionHosts ?? (native.historicalCompletionHosts === undefined ? [] : Array.isArray(native.historicalCompletionHosts) ? native.historicalCompletionHosts : [native.historicalCompletionHosts]);
-  // Must precede every command's initial read/list, including model-free stopped recovery.
-  const store = new JsonFileStore({ dir: resolveRunsDir(commandEnvironment), nativeCompletionHosts: [...historical, { review: native.nativeReviewerHost, lead: native.nativeLeadHost }] });
-  if(production)recoveryAuthentication.set(store,run=>{
-    authenticateNativeRun(run,historical,true);
-    for(const role of ['review','lead'] as const) for(const request of (role==='review'?run.nativeReview?.requests:run.nativeLead?.requests)??[]) {
-      if(request.terminalDigest!==undefined&&!hasAuthenticatedCompletion(request.identity,request.terminalDigest,request.completionProof,role))throw new Error('Historical completion authentication is required before recovery authority writes.');
-    }
-  });
   const [command, subcommand, ...rest] = argv;
-
+  const ownsWorkflow = command === 'dispatch' && (subcommand === 'once' || subcommand === 'serve') ||
+    command === 'run' && (subcommand === 'resume' || subcommand !== undefined && !['create', 'show', 'inspect', 'transition', 'list', 'admission', 'projections'].includes(subcommand));
+  // Unaccepted code may diagnose existing state, add only an emergency HOLD,
+  // or stop an exactly owned browser. It may not adopt/release authority.
+  const diagnostic = command === undefined || command === '--help' || command === '-h' ||
+    command === 'production' && subcommand === 'preflight' ||
+    command === 'dispatch' && (subcommand === 'admission' && rest[0] === 'status' || subcommand === 'launchd' && rest[0] === 'render') ||
+    command === 'run' && ['show', 'inspect', 'list'].includes(subcommand ?? '') ||
+    command === 'browser' && subcommand === 'status';
+  const emergencyHold = command === 'dispatch' && subcommand === 'maintenance' && rest.length === 1 && rest[0] === 'hold';
+  const ownedBrowserStop = command === 'browser' && subcommand === 'stop';
+  if (!diagnostic && !emergencyHold && !ownedBrowserStop) assertInstallation();
   if (command === undefined || command === '--help' || command === '-h') {
     console.log(USAGE);
     return 0;
@@ -2692,7 +2727,7 @@ export async function main(argv: string[], native: CliNativeDependencies = {}): 
           throw new Error('browser bootstrap is always headed so a human can complete authentication.');
         }
         const port = values.port === undefined ? undefined : parseBrowserPort(values.port);
-        const shared = { ...(port === undefined ? {} : { port }), ...(values.host === undefined ? {} : { host: values.host }) };
+        const shared = { beforeStart: assertInstallation, ...(port === undefined ? {} : { port }), ...(values.host === undefined ? {} : { host: values.host }) };
         const finalSnapshot = await waitForOwnedBrowser(
           async (signal) =>
             subcommand === 'bootstrap'
@@ -2750,6 +2785,75 @@ export async function main(argv: string[], native: CliNativeDependencies = {}): 
     return 1;
   }
 
+  if (command === 'production') {
+    if (subcommand !== 'preflight' || rest.length !== 0) {
+      console.error(`Unknown command: production ${subcommand ?? ''}\n`);
+      console.error(USAGE);
+      return 1;
+    }
+    const result = productionPreflightReport(commandEnvironment, production);
+    console.log(JSON.stringify(result.report, null, 2));
+    return result.code;
+  }
+
+  if (command === 'dispatch' && subcommand === 'launchd' && rest[0] === 'render') {
+      const { values, positionals } = parseArgs({
+        args: rest.slice(1),
+        options: {
+          program: { type: 'string' },
+          'node-program': { type: 'string' },
+          'pnpm-program': { type: 'string' },
+          'git-program': { type: 'string' },
+          'dependency-artifact-path': { type: 'string' },
+          'luna-codex-home': { type: 'string' },
+          'playwright-browsers-path': { type: 'string' },
+          'working-directory': { type: 'string' },
+          label: { type: 'string' },
+          'stdout-path': { type: 'string' },
+          'stderr-path': { type: 'string' },
+        },
+      });
+      if (positionals.length > 0 || values.program === undefined || values['node-program'] === undefined || values['pnpm-program'] === undefined || values['git-program'] === undefined || values['dependency-artifact-path'] === undefined || values['luna-codex-home'] === undefined || values['playwright-browsers-path'] === undefined || values['working-directory'] === undefined) {
+        throw new Error('dispatch launchd render requires --program, --node-program, --pnpm-program, --git-program, --dependency-artifact-path, --luna-codex-home, --playwright-browsers-path, and --working-directory.');
+      }
+      console.log(renderDispatchLaunchdPlist({
+        program: values.program,
+        nodeProgram: values['node-program'],
+        pnpmProgram: values['pnpm-program'],
+        gitProgram: values['git-program'],
+        dependencyArtifactPath: values['dependency-artifact-path'],
+        lunaCodexHome: values['luna-codex-home'],
+        playwrightBrowsersPath: values['playwright-browsers-path'],
+        workingDirectory: values['working-directory'],
+        ...(values.label === undefined ? {} : { label: values.label }),
+        ...(values['stdout-path'] === undefined ? {} : { standardOutPath: values['stdout-path'] }),
+        ...(values['stderr-path'] === undefined ? {} : { standardErrorPath: values['stderr-path'] }),
+      }));
+      return 0;
+    }
+  if (production && diagnostic && !existsSync(resolveRunsDir(commandEnvironment))) assertInstallation();
+  const historical = production?.historicalCompletionHosts ?? (native.historicalCompletionHosts === undefined ? [] : Array.isArray(native.historicalCompletionHosts) ? native.historicalCompletionHosts : [native.historicalCompletionHosts]);
+  // Must precede every command's initial read/list, including model-free stopped recovery.
+  const store = new JsonFileStore({ dir: resolveRunsDir(commandEnvironment), nativeCompletionHosts: [...historical, { review: native.nativeReviewerHost, lead: native.nativeLeadHost }], ...(ownsWorkflow ? {} : { beforeConditionalWrite: assertInstallation }) });
+  if (production && !ownsWorkflow) {
+    // Keep the existing store and strict CAS. Every resumed canonical write
+    // checks the current immutable installation, including wait telemetry.
+    for (const method of ['create', 'update', 'updateIfUnchanged', 'delete', 'rebuildOperationalProjections'] as const) {
+      const operation = store[method];
+      Object.defineProperty(store, method, { value: (...args: unknown[]) => {
+        assertInstallation();
+        return Reflect.apply(operation, store, args);
+      } });
+    }
+  }
+  if(production)recoveryAuthentication.set(store,run=>{
+    authenticateNativeRun(run,historical,true);
+    for(const role of ['review','lead'] as const) for(const request of (role==='review'?run.nativeReview?.requests:run.nativeLead?.requests)??[]) {
+      if(request.terminalDigest!==undefined&&!hasAuthenticatedCompletion(request.identity,request.terminalDigest,request.completionProof,role))throw new Error('Historical completion authentication is required before recovery authority writes.');
+    }
+  });
+
+
   if (command === 'dispatch') {
     if (subcommand === 'admission' && rest[0] === 'status' && rest.length === 1) {
       console.log(JSON.stringify(dispatchAdmissionStatus(createHostAdmissionRegistry(), store), null, 2));
@@ -2769,20 +2873,20 @@ export async function main(argv: string[], native: CliNativeDependencies = {}): 
       }
       const expectedGeneration = expectedRaw === undefined ? undefined : Number(expectedRaw);
       if (action === 'retire' && (!Number.isSafeInteger(expectedGeneration) || expectedGeneration! <= 0)) throw new Error('--expected-generation must be a positive integer.');
-      return await withDispatchAdmissionLock(async () => {
+      return await withCommandAdmissionLock(async () => {
       const worktree = execFileSync('git', ['rev-parse', '--show-toplevel'], { encoding: 'utf8' }).trim();
       const branch = execFileSync('git', ['symbolic-ref', '--quiet', '--short', 'HEAD'], { encoding: 'utf8' }).trim();
       const checkpointSha = execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
       const clean = execFileSync('git', ['status', '--porcelain'], { encoding: 'utf8' }).trim() === '';
       const remote = execFileSync('git', ['config', '--get', 'remote.origin.url'], { encoding: 'utf8' }).trim();
       const repository = parseGitHubRepositoryRemote(remote);
-      const registry = createHostAdmissionRegistry();
+      const registry = commandAdmission();
       const identity = canonicalizeMissionEvidence({ repository, repositoryScope: true, workspace: worktree });
       const laneId = `manual:${createHash('sha256').update(`${repository}\0${identity.workspace}`).digest('hex').slice(0, 32)}`;
       const receiptPath = resolveManualOwnerReceiptPath(repository, identity.workspace!);
       const now = new Date().toISOString();
       const manualProjection = (state: 'active' | 'parked') =>
-        publishAdmissionRuntimeProjection(resolveRunsDir(commandEnvironment), registry, store, { stage: state === 'active' ? 'manual_implementation' : 'manual_parked', supervisor: 'parked' });
+        publishCommandRuntimeProjection(resolveRunsDir(commandEnvironment), registry, store, { stage: state === 'active' ? 'manual_implementation' : 'manual_parked', supervisor: 'parked' });
       if (action === 'register') {
         const prior = registry.readLane(laneId);
         let missionId: string;
@@ -2872,7 +2976,7 @@ export async function main(argv: string[], native: CliNativeDependencies = {}): 
         throw new Error(`Manual retirement did not release its exact parked generation; the parked projection remains authoritative: ${detail}`);
       }
       let projection: ReturnType<typeof composeOperationalRuntimeProjection>;
-      try { projection = publishAdmissionRuntimeProjection(resolveRunsDir(commandEnvironment), registry, store, { stage: 'idle', supervisor: 'parked' }); }
+      try { projection = publishCommandRuntimeProjection(resolveRunsDir(commandEnvironment), registry, store, { stage: 'idle', supervisor: 'parked' }); }
       catch (error) {
         const detail = error instanceof Error ? error.message : String(error);
         throw new Error(`Manual lane generation ${receipt.generation} is retired in the registry, but its parked projection could not be cleared; preserve the released generation and retry exact-generation reconciliation: ${detail}`);
@@ -2885,10 +2989,10 @@ export async function main(argv: string[], native: CliNativeDependencies = {}): 
     }
     if (subcommand === 'maintenance' && (rest[0] === 'hold' || rest[0] === 'release') && rest.length === 1) {
       const desired = rest[0] === 'hold';
-      const { projection, wake } = await withDispatchAdmissionLock(() => {
+      const { projection, wake } = await (desired ? withDispatchAdmissionLock : withCommandAdmissionLock)(() => {
         const wasHeld = readOperationalRuntimeProjection(resolveRunsDir(commandEnvironment))?.maintenanceHold.active === true;
-        const registry = createHostAdmissionRegistry();
-        const projection = publishAdmissionRuntimeProjection(resolveRunsDir(commandEnvironment), registry, store, {
+        const registry = desired ? createHostAdmissionRegistry() : commandAdmission();
+        const projection = (desired ? publishAdmissionRuntimeProjection : publishCommandRuntimeProjection)(resolveRunsDir(commandEnvironment), registry, store, {
           stage: desired ? 'maintenance_hold' : 'idle', supervisor: desired ? 'parked' : 'stopped',
           maintenanceHold: desired ? { active: true, reason: 'Operator restart hold' } : { active: false },
         });
@@ -2901,42 +3005,8 @@ export async function main(argv: string[], native: CliNativeDependencies = {}): 
       return 0;
     }
     if (subcommand === 'wake' && rest.length === 0) {
+      assertInstallation();
       console.log(JSON.stringify({ outcome: 'wake_signaled', token: signalDispatchWake(dispatchWakePath()) }));
-      return 0;
-    }
-    if (subcommand === 'launchd' && rest[0] === 'render') {
-      const { values, positionals } = parseArgs({
-        args: rest.slice(1),
-        options: {
-          program: { type: 'string' },
-          'node-program': { type: 'string' },
-          'pnpm-program': { type: 'string' },
-          'git-program': { type: 'string' },
-          'dependency-artifact-path': { type: 'string' },
-          'luna-codex-home': { type: 'string' },
-          'playwright-browsers-path': { type: 'string' },
-          'working-directory': { type: 'string' },
-          label: { type: 'string' },
-          'stdout-path': { type: 'string' },
-          'stderr-path': { type: 'string' },
-        },
-      });
-      if (positionals.length > 0 || values.program === undefined || values['node-program'] === undefined || values['pnpm-program'] === undefined || values['git-program'] === undefined || values['dependency-artifact-path'] === undefined || values['luna-codex-home'] === undefined || values['playwright-browsers-path'] === undefined || values['working-directory'] === undefined) {
-        throw new Error('dispatch launchd render requires --program, --node-program, --pnpm-program, --git-program, --dependency-artifact-path, --luna-codex-home, --playwright-browsers-path, and --working-directory.');
-      }
-      console.log(renderDispatchLaunchdPlist({
-        program: values.program,
-        nodeProgram: values['node-program'],
-        pnpmProgram: values['pnpm-program'],
-        gitProgram: values['git-program'],
-        dependencyArtifactPath: values['dependency-artifact-path'],
-        lunaCodexHome: values['luna-codex-home'],
-        playwrightBrowsersPath: values['playwright-browsers-path'],
-        workingDirectory: values['working-directory'],
-        ...(values.label === undefined ? {} : { label: values.label }),
-        ...(values['stdout-path'] === undefined ? {} : { standardOutPath: values['stdout-path'] }),
-        ...(values['stderr-path'] === undefined ? {} : { standardErrorPath: values['stderr-path'] }),
-      }));
       return 0;
     }
     if (subcommand !== 'once' && subcommand !== 'serve') {
@@ -2958,6 +3028,7 @@ export async function main(argv: string[], native: CliNativeDependencies = {}): 
     }
     let lock;
     try {
+      assertInstallation();
       const lockPath = dispatchLockPath();
       assertSafeAccountOwnedPath(resolveAccountHomeDirectory(), lockPath, 'file');
       lock = acquireDispatchInvocationLock({ lockPath });
@@ -2970,15 +3041,15 @@ export async function main(argv: string[], native: CliNativeDependencies = {}): 
       throw error;
     }
     try {
-      const admission = createHostAdmissionRegistry();
-      const publishRuntime = (stage: string, supervisor: 'running' | 'stopped' | 'parked', nextPollAt?: string) => publishAdmissionRuntimeProjection(resolveRunsDir(commandEnvironment), admission, store, {
+      const admission = commandAdmission();
+      const publishRuntime = (stage: string, supervisor: 'running' | 'stopped' | 'parked', nextPollAt?: string) => publishCommandRuntimeProjection(resolveRunsDir(commandEnvironment), admission, store, {
         stage, supervisor, eventWakeEligible: subcommand === 'serve', ...(nextPollAt === undefined ? {} : { nextPollAt }),
       });
       const idlePollMs = values['idle-poll-ms'] === undefined ? DEFAULT_DISPATCH_IDLE_POLL_MS : Number(values['idle-poll-ms']);
       const nextPollAt = () => subcommand === 'serve' ? new Date(Date.now() + idlePollMs).toISOString() : undefined;
       let processConfig: ReturnType<typeof resolveDispatchConfiguration> | undefined;
       let processWorkflow: WorkflowDependencies | undefined;
-      const reconcile = async () => await withDispatchAdmissionLock(async (releaseAdmissionLock) => {
+      const reconcile = async () => await withCommandAdmissionLock(async (releaseAdmissionLock) => {
         // This durable typed fence precedes queue reads, configuration, GitHub,
         // workflow construction, and every model-capable boundary. The same
         // admission lock serializes an operator hold/release with this entire
@@ -3039,7 +3110,7 @@ export async function main(argv: string[], native: CliNativeDependencies = {}): 
             if(production && recovering===undefined)production.assertRunInitiation({execution});
             return await runIssueCommand(workflow, ref, {
               ...(execution === undefined ? {} : { execution }), dispatchClaimId, repairTaskShapeAuthority, admission: missionAdmission!,
-              publishRuntimeProjection: (registry, runStore, update) => publishAdmissionRuntimeProjection(resolveRunsDir(commandEnvironment), registry, runStore, update),
+              assertInstallation, publishRuntimeProjection: publishOwnedRuntimeProjection,
               releaseDispatchAdmissionLock: release, withDispatchAdmissionLock: withLock,
               assertReviewClaim, leadObservationOnly: leadObservationOnly || recovering !== undefined && !recovering.mergeAttempt?.submissionPossible && !recoveryDecision, nativeRecoveryDecisionOnly:recoveryDecision, leadRecoveryConfiguration,
               assertLeadInitiation:async(run)=>{if(readOperationalRuntimeProjection(resolveRunsDir(commandEnvironment))?.maintenanceHold.active)throw new Error('Maintenance HOLD prevents lead/repair initiation.');if(!assertLeadInitiation)throw new Error('Lead dispatch authority unavailable.');await assertLeadInitiation(run);production?.assertRunInitiation(run);},
@@ -3060,7 +3131,7 @@ export async function main(argv: string[], native: CliNativeDependencies = {}): 
               dispatchClaimId,
               ...(run.repairTaskShapeAuthority === undefined ? {} : { repairTaskShapeAuthority: run.repairTaskShapeAuthority }),
               admission: missionAdmission!,
-              publishRuntimeProjection: (registry, runStore, update) => publishAdmissionRuntimeProjection(resolveRunsDir(commandEnvironment), registry, runStore, update),
+              assertInstallation, publishRuntimeProjection: publishOwnedRuntimeProjection,
               ...(workspace === undefined ? {} : { admissionWorkspace: workspace }),
               releaseDispatchAdmissionLock: release, withDispatchAdmissionLock: withLock,
               assertReviewClaim, leadObservationOnly: leadObservationOnly || recovering !== undefined && !recovering.mergeAttempt?.submissionPossible && !recoveryDecision, nativeRecoveryDecisionOnly:recoveryDecision, leadRecoveryConfiguration,
@@ -3075,7 +3146,7 @@ export async function main(argv: string[], native: CliNativeDependencies = {}): 
           },
         });
       });
-      const publishSettledRuntime = async (result: Awaited<ReturnType<typeof reconcile>>) => await withDispatchAdmissionLock(() => {
+      const publishSettledRuntime = async (result: Awaited<ReturnType<typeof reconcile>>) => await withCommandAdmissionLock(() => {
         const held = readOperationalRuntimeProjection(resolveRunsDir(commandEnvironment))?.maintenanceHold.active === true;
         publishRuntime(held || result.outcome === 'maintenance_hold' ? 'maintenance_hold' : result.outcome === 'dispatched' ? result.execution.state.toLowerCase() : 'idle', held || result.outcome === 'maintenance_hold' ? 'parked' : 'stopped');
       });
@@ -3099,16 +3170,6 @@ export async function main(argv: string[], native: CliNativeDependencies = {}): 
     }
   }
 
-  if (command === 'production') {
-    if (subcommand !== 'preflight' || rest.length !== 0) {
-      console.error(`Unknown command: production ${subcommand ?? ''}\n`);
-      console.error(USAGE);
-      return 1;
-    }
-    const result = productionPreflightReport(commandEnvironment, production);
-    console.log(JSON.stringify(result.report, null, 2));
-    return result.code;
-  }
 
   if (command === 'wait') {
     if (subcommand !== 'observe' && subcommand !== 'await') {
@@ -3150,10 +3211,14 @@ export async function main(argv: string[], native: CliNativeDependencies = {}): 
       throw error;
     }
     try {
-      const dependencies = buildWaitCommandDependencies({ store, run });
+      assertInstallation();
+      const dependencies = buildWaitCommandDependencies({ store, run, env: commandEnvironment });
+      const writeLedger = dependencies.ledgerStore.write.bind(dependencies.ledgerStore);
+      dependencies.ledgerStore.write = ledger => { assertInstallation(); writeLedger(ledger); };
       const result = subcommand === 'observe'
         ? await waitObserveCommand({ id, mode: 'observe', policy }, dependencies)
         : await waitAwaitCommand({ id, mode: 'wait', policy, ...(pollIntervalMs === undefined ? {} : { pollIntervalMs }) }, dependencies);
+      assertInstallation();
       printWaitResult(result);
       // Only after the wake has been emitted is it safe to mark it delivered; a
       // crash before this point makes the next process replay it.
@@ -3218,7 +3283,7 @@ export async function main(argv: string[], native: CliNativeDependencies = {}): 
     if (id === undefined || values.generation === undefined) throw new Error('run admission recover requires <run-id> --generation <n>.');
     const generation = Number(values.generation);
     if (!Number.isSafeInteger(generation) || generation < 1) throw new Error('--generation must be a positive safe integer.');
-    const disposition = await withDispatchAdmissionLock(() => recoverRunAdmission(store, createHostAdmissionRegistry(), id, generation, values.stopped === true, undefined, { retireWork: values['retire-work'] === true }));
+    const disposition = await withCommandAdmissionLock(() => recoverRunAdmission(store, commandAdmission(), id, generation, values.stopped === true, undefined, { retireWork: values['retire-work'] === true }));
     console.log(JSON.stringify({ outcome: disposition, runId: id, generation }));
     return 0;
   }
@@ -3244,8 +3309,8 @@ export async function main(argv: string[], native: CliNativeDependencies = {}): 
       throw new Error(`Unknown transition "${type}". Valid transitions: ${TRANSITION_TYPES.join(', ')}.`);
     }
     const next = type === 'merged'
-      ? await runMergedTransitionCommand(store, id, new LiveGitHubAdapter({ transport: transportForCommand() }), createHostAdmissionRegistry(), withDispatchAdmissionLock)
-      : await withDispatchAdmissionLock(() => runTransitionCommand(store, id, type as TransitionType, values.reason, createHostAdmissionRegistry()));
+      ? await runMergedTransitionCommand(store, id, new LiveGitHubAdapter({ transport: transportForCommand() }), commandAdmission(), withCommandAdmissionLock)
+      : await withCommandAdmissionLock(() => runTransitionCommand(store, id, type as TransitionType, values.reason, commandAdmission()));
     console.log(`Run ${next.id}: ${next.state}.`);
     printRun(next);
     return 0;
@@ -3276,7 +3341,7 @@ export async function main(argv: string[], native: CliNativeDependencies = {}): 
     if (id === undefined) throw new Error('run resume requires a run id.');
     if (values.decision === undefined) throw new Error('run resume requires --decision <choice>.');
     const resolveCapabilities = buildBrowserCapabilityResolver(values['browser-profile']);
-    const outcome = await withDispatchAdmissionLock(async (releaseAdmissionLock) => {
+    const outcome = await withCommandAdmissionLock(async (releaseAdmissionLock) => {
       const run = store.read(id);
       if (run === null) throw new Error(`No run with id "${id}" found.`);
       const admissionWorkspace = persistedRunWorkspace(run);
@@ -3316,6 +3381,7 @@ export async function main(argv: string[], native: CliNativeDependencies = {}): 
           // or the process dies, the retained claim plus active Run can be
           // reconciled by dispatch; a claim-only `running` state could strand
           // the still-parked Run from its public resume path.
+          assertInstallation();
           commitRun();
           await runtime.updateRuntimeComment(live.id, renderDispatchRuntime(transitionClaim));
           const observed = selectDispatchRuntime(await runtime.listRuntimeComments());
@@ -3323,8 +3389,8 @@ export async function main(argv: string[], native: CliNativeDependencies = {}): 
         };
       }
       return await resumeCommand(makeWorkflow(store, resolveCapabilities, attentionObservation ? {} : commandEnvironment, transportForCommand()), id, values.decision!, {
-        admission: createHostAdmissionRegistry(),
-        publishRuntimeProjection: (registry, runStore, update) => publishAdmissionRuntimeProjection(resolveRunsDir(commandEnvironment), registry, runStore, update),
+        admission: commandAdmission(),
+        assertInstallation, publishRuntimeProjection: publishOwnedRuntimeProjection,
         ...(admissionWorkspace === undefined ? {} : { admissionWorkspace }),
         releaseDispatchAdmissionLock: releaseAdmissionLock,
         withDispatchAdmissionLock: withLock,
@@ -3352,7 +3418,7 @@ export async function main(argv: string[], native: CliNativeDependencies = {}): 
   if (ref === undefined || extra !== undefined) {
     throw new Error('run requires exactly one owner/repo#123 reference.');
   }
-  const outcome = await withDispatchAdmissionLock(async (releaseAdmissionLock) => {
+  const outcome = await withCommandAdmissionLock(async (releaseAdmissionLock) => {
     const resolveCapabilities = buildBrowserCapabilityResolver(values['browser-profile']);
     const target = parseIssueRef(ref);
     const existing = findRunByTarget(store, target);
@@ -3371,8 +3437,8 @@ export async function main(argv: string[], native: CliNativeDependencies = {}): 
     if(production&&(existing===null||!unresolvedNativeWork(existing)))assertOperationalExecutionAdmission(production.runsDirectory);
     production?.assertRunInitiation({execution:existing?.execution??execution});
     return runIssueCommand(makeWorkflow(store, resolveCapabilities, commandEnvironment, transportForCommand()), ref, {
-      execution, repairTaskShapeAuthority, admission: createHostAdmissionRegistry(),
-      publishRuntimeProjection: (registry, runStore, update) => publishAdmissionRuntimeProjection(resolveRunsDir(commandEnvironment), registry, runStore, update),
+      execution, repairTaskShapeAuthority, admission: commandAdmission(),
+      assertInstallation, publishRuntimeProjection: publishOwnedRuntimeProjection,
       releaseDispatchAdmissionLock: releaseAdmissionLock,
       withDispatchAdmissionLock: async <T>(operation: () => T | Promise<T>) => await withDispatchAdmissionLock(operation),
     });

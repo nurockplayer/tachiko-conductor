@@ -71,6 +71,8 @@ export interface BrowserRuntimeSnapshot {
 }
 
 export interface StartBrowserRuntimeOptions {
+  /** Source-composed installed-command fence; cleanup is independent. */
+  readonly beforeStart?: () => void;
   readonly profile: string;
   readonly port?: number;
   readonly host?: string;
@@ -213,6 +215,7 @@ export class ManagedPlaywrightMcpRuntime implements BrowserRuntime {
   }
 
   async start(options: StartBrowserRuntimeOptions): Promise<BrowserRuntimeHandle> {
+    options.beforeStart?.();
     this.validateRoots();
     validateProfile(options.profile);
     const host = normalizeBrowserHost(options.host ?? '127.0.0.1');
@@ -229,6 +232,7 @@ export class ManagedPlaywrightMcpRuntime implements BrowserRuntime {
       );
     }
 
+    options.beforeStart?.();
     const runtimeId = randomUUID();
     const profileDir = this.profileDir(options.profile);
     const outputDir = path.join(this.runtimeRoot, `${options.profile}-output`);
@@ -296,6 +300,7 @@ export class ManagedPlaywrightMcpRuntime implements BrowserRuntime {
     };
     const publish = async (file: string, value: unknown): Promise<void> => {
       try {
+        options.beforeStart?.();
         this.jsonWriter(file, value);
       } catch (error) {
         await failPublication(error);

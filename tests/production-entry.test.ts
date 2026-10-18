@@ -24,7 +24,8 @@ import { hasAuthenticatedCompletion, type NativeCompletionHosts } from '../src/o
 import { PRODUCTION_POLICY_REVISION } from '../src/production-policy.js';
 import type { Run } from '../src/domain/types.js';
 import { dispatchOnceCommand } from '../src/dispatch/command.js';
-import { runIssueCommand } from '../src/cli.js';
+import { runIssueCommand, resolveWaitLedgerFile } from '../src/cli.js';
+import { dispatchWakePath } from '../src/dispatch/wake.js';
 import { fixture as leadRepairFixture } from './native-lead-fixture.js';
 import { installedFixture } from './production-host-fixture.js';
 import { TARGET, T0, approval, successResult, validationPassed } from './helpers.js';
@@ -142,6 +143,48 @@ async function directExecutionFixture(options:{productionWorker?:boolean;commitW
   } catch(error){f.cleanup();throw error;}
 }
 
+
+async function commandAuthorityFixture() {
+  const f = await installedFixture(true, false, {}, { lunaHome: true });
+  let calls = 0;
+  const runner: ProcessRunner = { async run() { calls += 1; throw new Error('Command authority proof cannot call a provider or tool runner.'); } };
+  const invoke = async (argv: string[]) => {
+    const log = console.log; console.log = () => {};
+    try { return await f.invoke(argv, { runner }); } finally { console.log = log; }
+  };
+  try {
+    assert.equal(await invoke(['run', 'acme/widgets#42', '--execution-profile', 'routine', '--repair-task-shape-authority', '{"revision":"task-v1","shape":"bounded"}']), 0);
+    const store = new JsonFileStore({ dir: path.join(f.accountRoot, 'runs') });
+    const run = store.list()[0]!;
+    assert.equal(run.state, 'WAITING_DEPENDENCY');
+    assert.equal(run.nativeReview?.wait?.kind, 'binding');
+    assert.equal(run.interrupt?.reason, 'Native review unavailable: no accepted trusted host reviewer binding; implementation and repair are waiting.');
+    assert.ok(readRunOwnerReceipt(resolveRunOwnerReceiptPath('acme/widgets', run.id)));
+    assert.equal(calls, 0);
+    assert.equal(await invoke(['wait', 'observe', run.id]), 0);
+    const ledger = resolveWaitLedgerFile(run.id);
+    assert.equal(existsSync(ledger), true, 'the accepted baseline actually writes the canonical wait ledger');
+    assert.equal(await invoke(['dispatch', 'maintenance', 'hold']), 0);
+    const roots = [path.join(f.accountRoot, 'runs'), path.join(f.accountRoot, 'mission-admission'), path.join(f.accountRoot, 'dispatch'), path.dirname(ledger)];
+    const durable = (excluded: readonly string[] = []) => {
+      const result: Record<string, string> = {};
+      const walk = (file: string) => {
+        if (excluded.includes(file)) return;
+        if (!existsSync(file)) { result[file] = 'absent'; return; }
+        const stat = lstatSync(file);
+        if (stat.isDirectory()) {
+          result[file] = 'directory';
+          for (const entry of readdirSync(file).sort()) walk(path.join(file, entry));
+        } else if (stat.isFile()) result[file] = createHash('sha256').update(readFileSync(file)).digest('hex');
+        else throw new Error('Unexpected authority fixture object type.');
+      };
+      for (const root of roots) walk(root);
+      return JSON.stringify(result);
+    };
+    return { ...f, invoke, run, ledger, store, durable, calls: () => calls };
+  } catch (error) { f.cleanup(); throw error; }
+}
+
 describe('fixed production entry through real parser and canonical dispatcher',()=>{
   beforeEach(t=>traceCut(t.name,'case','entered'));
   afterEach(t=>traceCut(t.name,'case','finished'));
@@ -161,6 +204,111 @@ describe('fixed production entry through real parser and canonical dispatcher',(
     assert.equal(originalImplementationMatches(run,{...current,handoff:{...current.handoff!,sections:{...current.handoff!.sections,Scope:'foreign replacement scope'}}}),false);
     assert.equal(JSON.stringify(run),original,'Live-view comparison never rewrites original authority');
   });
+  it('requires current compatible installation for canonical command authority and preserves safe emergency HOLD', async t => {
+    for (const cut of ['checkout', 'missing-record', 'corrupt-record', 'artifact', 'cached-artifact'] as const) await t.test(cut, async () => {
+      const f = await commandAuthorityFixture();
+      const originalWrite = fs.writeFileSync, originalSpawn = childProcess.spawn;
+      const log = console.log; console.log = () => {};
+      let wakeWrites = 0, childStarts = 0;
+      const wake = dispatchWakePath();
+      fs.writeFileSync = ((file: fs.PathOrFileDescriptor, ...args: unknown[]) => {
+        if (String(file) === wake) wakeWrites += 1;
+        return Reflect.apply(originalWrite, fs, [file, ...args]);
+      }) as typeof fs.writeFileSync;
+      childProcess.spawn = ((...args: Parameters<typeof originalSpawn>) => { childStarts += 1; return originalSpawn(...args); }) as typeof originalSpawn;
+      syncBuiltinESMExports();
+      try {
+        // Positive first: installation compatibility alone permits release,
+        // including valid DISABLED/missing and invalid-initiation descriptors.
+        for (const descriptor of (cut === 'checkout' ? ['enabled', 'disabled', 'missing', 'malformed'] as const : ['enabled'] as const)) {
+          if (descriptor === 'enabled') f.enable();
+          else if (descriptor === 'disabled') f.enable(false);
+          else if (descriptor === 'missing') unlinkSync(f.hostPath);
+          else writeFileSync(f.hostPath, '{malformed');
+          assert.equal(f.resolve().installation, 'accepted');
+          assert.equal(await f.invoke(['dispatch', 'maintenance', 'hold']), 0);
+          const beforeWake = wakeWrites;
+          assert.equal(await f.invoke(['dispatch', 'maintenance', 'release']), 0);
+          assert.equal(readOperationalRuntimeProjection(path.join(f.accountRoot, 'runs'))!.maintenanceHold.active, false);
+          assert.equal(wakeWrites, beforeWake + 1, 'accepted release wakes exactly once');
+          const token = readFileSync(wake, 'utf8');
+          assert.equal(await f.invoke(['dispatch', 'maintenance', 'release']), 0);
+          assert.equal(wakeWrites, beforeWake + 1);
+          assert.equal(readFileSync(wake, 'utf8') === token, true, 'idempotent release retains the wake token');
+        }
+        const beforeExplicitWake = wakeWrites;
+        assert.equal(await f.invoke(['dispatch', 'wake']), 0);
+        assert.equal(wakeWrites, beforeExplicitWake + 1);
+        f.enable();
+        assert.equal(await f.invoke(['dispatch', 'maintenance', 'hold']), 0);
+        const captured = f.resolve();
+        const cli = await import(new URL('./cli.js', f.entryUrl).href) as typeof import('../src/cli.js');
+        if (cut === 'checkout') process.argv[1] = path.join(f.objectRoot, 'dist/production-entry.js');
+        else if (cut === 'missing-record') unlinkSync(f.recordPath);
+        else if (cut === 'corrupt-record') writeFileSync(f.recordPath, '{corrupt');
+        else writeFileSync(path.join(f.record.codex.runtimeDirectory, 'runtime.cjs'), '// changed accepted program\n');
+        const before = f.durable(), calls = f.calls(), wakes = wakeWrites, children = childStarts;
+        const rejected = (argv: string[]) => cut === 'cached-artifact' ? cli.main(argv, { production: captured }) : f.invoke(argv);
+        // Each refusal state independently exercises actual release/wake.
+        // One captured-artifact case also represents every distinct mutation family;
+        // source classification covers sibling parse forms without a cross-product.
+        const commands = [
+          ['dispatch', 'maintenance', 'release'], ['dispatch', 'wake'],
+          ...(cut === 'cached-artifact' ? [
+            ['dispatch', 'manual', 'register'], ['run', 'transition', f.run.id, 'fail'],
+            ['run', 'admission', 'recover', f.run.id, '--generation', '1', '--stopped'],
+            ['run', 'projections', 'rebuild'], ['wait', 'observe', f.run.id],
+            ['dispatch', 'once'], ['browser', 'start', 'authority-proof'],
+          ] : []),
+        ];
+        for (const argv of commands) {
+          await assert.rejects(rejected(argv), /Installation unavailable|Accepted artifact\/program filesystem identity changed/i);
+          assert.equal(f.durable() === before, true, 'refused ' + argv.slice(0, 3).join('/') + ' preserves every canonical authority byte');
+        }
+        assert.equal(f.calls(), calls); assert.equal(wakeWrites, wakes); assert.equal(childStarts, children);
+        assert.equal(readOperationalRuntimeProjection(path.join(f.accountRoot, 'runs'))!.maintenanceHold.active, true);
+        const projection = operationalRuntimeProjectionPath(path.join(f.accountRoot, 'runs'));
+        const beforeEmergency = f.durable([projection]);
+        // This one narrowly safe unavailable-entry mutation adds only HOLD.
+        assert.equal(await f.invoke(['dispatch', 'maintenance', 'hold']), 0);
+        assert.equal(f.durable([projection]) === beforeEmergency, true, 'emergency HOLD cannot rewrite other authority');
+        assert.equal(readOperationalRuntimeProjection(path.join(f.accountRoot, 'runs'))!.maintenanceHold.active, true);
+        assert.equal(wakeWrites, wakes); assert.equal(f.calls(), calls); assert.equal(childStarts, children);
+        const diagnosticBytes = f.durable();
+        for (const argv of [['--help'], ['run', 'show', f.run.id], ['run', 'inspect', f.run.id], ['run', 'list'], ['dispatch', 'admission', 'status']]) assert.equal(await f.invoke(argv), 0);
+        assert.equal(f.durable() === diagnosticBytes, true, 'safe unavailable-entry diagnostics do not write canonical authority');
+        process.stderr.write('STAGE10_COMMAND_AUTHORITY ' + JSON.stringify({ cut, refusedActions: commands.length, authorityPreserved: true, held: true, wakeWritesAfterRefusal: wakeWrites - wakes, providerCallsAfterRefusal: f.calls() - calls, childStartsAfterRefusal: childStarts - children }) + '\n');
+      } finally {
+        fs.writeFileSync = originalWrite; childProcess.spawn = originalSpawn; syncBuiltinESMExports(); console.log = log; f.cleanup();
+      }
+    });
+  });
+
+  it('refuses wait ledger and telemetry writes after an awaited observation loses accepted installation', async () => {
+    const f = await commandAuthorityFixture();
+    const originalRead = fs.readFileSync, log = console.log, originalStackLimit = Error.stackTraceLimit;
+    console.log = () => {}; Error.stackTraceLimit = 64;
+    let tripped = false;
+    const before = f.durable(), calls = f.calls();
+    const runPath = path.join(f.accountRoot, 'runs', f.run.id + '.json');
+    fs.readFileSync = ((file: fs.PathOrFileDescriptor, ...args: unknown[]) => {
+      const value = Reflect.apply(originalRead, fs, [file, ...args]);
+      if (!tripped && String(file) === runPath && (new Error().stack ?? '').includes('RunRuntimeObserver.observe')) {
+        tripped = true;
+        writeFileSync(path.join(f.record.codex.runtimeDirectory, 'runtime.cjs'), '// revoked while real observation awaits\n');
+      }
+      return value;
+    }) as typeof fs.readFileSync;
+    syncBuiltinESMExports();
+    try {
+      await assert.rejects(f.invoke(['wait', 'observe', f.run.id]), /Accepted artifact\/program filesystem identity changed/);
+      assert.equal(tripped, true, 'the actual runtime observer reaches its awaited continuation');
+      assert.equal(f.durable() === before, true, 'lost compatibility preserves ledger, Run, receipt, registry, projection and wake bytes');
+      assert.equal(f.calls(), calls);
+      process.stderr.write('STAGE10_COMMAND_AUTHORITY ' + JSON.stringify({ cut: 'wait-post-await', tripped, authorityPreserved: true, providerCallsAfterRefusal: f.calls() - calls }) + '\n');
+    } finally { fs.readFileSync = originalRead; syncBuiltinESMExports(); Error.stackTraceLimit = originalStackLimit; console.log = log; f.cleanup(); }
+  });
+
   it('uses the actual accepted entry for model-free held once/serve and local diagnostics',async()=>{
     const f=await installedFixture(true);const log=console.log;const output:string[]=[];console.log=(v?:unknown)=>output.push(String(v));try{let calls=0;const runner:ProcessRunner={async run(){calls++;throw new Error('Held entry must not spawn a process');}};process.env.TACHIKO_DATA_DIR='/candidate/empty';assert.equal(await f.invoke(['dispatch','maintenance','hold'],{runner}),0);writeFileSync(f.hostPath,'{malformed');writeFileSync(f.dispatchPath,'{malformed');assert.equal(await f.invoke(['dispatch','once'],{runner}),0);assert.equal(await f.invoke(['dispatch','serve','--max-cycles','1','--idle-poll-ms','1'],{runner}),0);assert.equal(calls,0);assert.equal(await f.invoke(['production','preflight'],{runner}),78);assert.ok(output.some(v=>v.includes('maintenance_hold')));assert.equal(readOperationalRuntimeProjection(path.join(f.accountRoot,'runs'))!.maintenanceHold.active,true);assert.equal(process.env.TACHIKO_DATA_DIR,undefined);}finally{console.log=log;f.cleanup();}
   });
