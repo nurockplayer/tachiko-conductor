@@ -254,6 +254,11 @@ A fresh missing projection retains the existing initial-admission semantics. The
 runs at normal bootstrap/final worker effect callbacks after awaited authority reads.
 Original issued/cached observation, authenticated settlement and permitted cancellation or
 cleanup keep their existing routes under HOLD; healthy held preflight remains positive.
+Resume cancellation is exempt only when the exact cancellation decision is actually
+offered by the canonical interruption. Literal cancellation text with absent/empty choices
+remains ordinary resume admission and is held. Unclaimed direct admission still parks at
+the mandatory native reviewer/claim gate; this HOLD check protects earlier durable
+admission/transition writes and does not grant unclaimed worker authority.
 
 Normal workflow effects carry the captured production Run fence through final review/lead
 preparation, marker and request cuts, worker/repair creation, validation probes/commands

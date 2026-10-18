@@ -3277,7 +3277,7 @@ export async function main(argv: string[], native: CliNativeDependencies = {}): 
       const admissionWorkspace = persistedRunWorkspace(run);
       const attentionObservation = unresolvedNativeLead(run) || unresolvedNativeReview(run);
       if(production&&!unresolvedNativeWork(run)){
-        if(values.decision!.trim()!==CANCEL_RUN_DECISION)assertOperationalExecutionAdmission(production.runsDirectory);
+        if(!(values.decision!.trim()===CANCEL_RUN_DECISION&&run.interrupt?.choices?.includes(CANCEL_RUN_DECISION)===true))assertOperationalExecutionAdmission(production.runsDirectory);
         production.assertRunInitiation(run);
       }
       const withLock = async <T>(operation: () => Promise<T> | T) => await withDispatchAdmissionLock(operation);

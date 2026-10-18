@@ -100,16 +100,20 @@ async function directExecutionFixture() {
     const remote=path.join(f.accountRoot,'controlled-remote.git');git(f.objectRoot,['init','--bare',remote]);git(f.objectRoot,['init','--initial-branch','main']);
     writeFileSync(path.join(f.objectRoot,'README.md'),'base\n');git(f.objectRoot,['add','.']);git(f.objectRoot,['commit','--quiet','-m','base']);git(f.objectRoot,['remote','add','origin','file://'+remote]);git(f.objectRoot,['push','--quiet','origin','main']);const base=git(f.objectRoot,['rev-parse','HEAD']);
     let gitCalls=0,apiCalls=0;let onGit:((args:readonly string[])=>void)|undefined;
+    let runtimeComments:{id:number;body:string}[]=[];let gitStage='none';let gitExit:number|undefined;
     const actual=new NodeProcessRunner();
     const runner:ProcessRunner={async run(file,args,options){
       options.beforeSpawn?.();
       if(args[0]!=='api'){
         onGit?.(args);options.beforeSpawn?.();gitCalls++;
         if(args.includes('get-url'))return{exitCode:0,stdout:'git@github.com:acme/widgets.git\n',stderr:''};
-        return actual.run(file,args,options);
+        gitStage=args.includes('fetch')?'fetch':args.includes('get-url')?'remote-url':args.includes('ls-remote')?'ls-remote':args.includes('check-ref-format')?'check-ref-format':args.includes('init')?'init':args.includes('checkout')?'checkout':args.includes('switch')?'switch':args.includes('status')?'status':args.includes('rev-parse')?'head':'other';const result=await actual.run(file,args,options);gitExit=result.exitCode;return result;
       }
-      apiCalls++;const methodIndex=args.indexOf('--method');const endpoint=args[methodIndex+2]!;let result:unknown;
-      if(endpoint==='repos/acme/widgets/issues/42')result=ORIGINAL_ISSUE;
+      apiCalls++;const methodIndex=args.indexOf('--method');const method=args[methodIndex+1]!;const endpoint=args[methodIndex+2]!;const fields=Object.fromEntries(args.filter((_,i)=>args[i-1]==='-f'||args[i-1]==='-F').map(value=>{const i=value.indexOf('=');return[value.slice(0,i),value.slice(i+1)];}));let result:unknown;
+      if(endpoint==='repos/acme/widgets/issues/1/comments'){if(method==='GET')result=runtimeComments;else{runtimeComments=[{id:9,body:fields.body!}];result=runtimeComments[0];}}
+      else if(endpoint==='repos/acme/widgets/issues/comments/9'){runtimeComments=[{id:9,body:fields.body!}];result=runtimeComments[0];}
+      else if(endpoint==='repos/acme/widgets/issues/comments/2')result={id:2,body:DISPATCH_QUEUE_MARKER+'\nready:\n  - issue: 42\n    route: codex\n    profile: routine\n    task-shape-revision: task-v1\n    task-shape: bounded'};
+      else if(endpoint==='repos/acme/widgets/issues/42')result=ORIGINAL_ISSUE;
       else if(endpoint==='repos/acme/widgets/issues/42/comments')result=[originalHandoffComment(null)];
       else if(endpoint==='repos/acme/widgets/issues/42/timeline')result=[];
       else if(endpoint==='repos/acme/widgets')result={default_branch:'main'};
@@ -125,11 +129,15 @@ async function directExecutionFixture() {
     assert.equal(hasGovernedPublicationConfinement(implementation),true);
     const {JsonFileStore:InstalledStore}=await import(new URL('./store/json-file-store.js',f.entryUrl).href) as typeof import('../src/store/json-file-store.js');
     const runtime=await import(new URL('./operational/runtime-projection.js',f.entryUrl).href) as typeof import('../src/operational/runtime-projection.js');
+    const {JsonFileOracleReceiptStore:InstalledReceipts}=await import(new URL('./oracle/receipt-store.js',f.entryUrl).href) as typeof import('../src/oracle/receipt-store.js');
+    const reviewer:NativeReviewerHost={binding:{bindingId:'controlled-direct-hold-reviewer',contractRevision:'host-contract-v1',policyRevision:f.policy.reviewPolicyRevision,scope:'complete-candidate',model:'controlled-latest-oracle',supportedEfforts:['Medium','High','Extra High'],authorActorIds:['author'],allowTransportReplacement:true},receipts:new InstalledReceipts(path.join(f.accountRoot,'oracle')),source:(base,head)=>readNativeSourceManifest(f.objectRoot,base,head),async submit(){throw new Error('No review submission expected before the unchanged-HEAD bootstrap park');},authenticate(){return false;}};
+    const {resolveNativeReviewer}=await import(new URL('./oracle/native-reviewer.js',f.entryUrl).href) as typeof import('../src/oracle/native-reviewer.js');assert.equal(resolveNativeReviewer(reviewer).native!.available(),true,'The controlled claimed route has a usable reviewer binding');
     const store=()=>new InstalledStore({dir:snapshot.runsDirectory});
     const counter=path.join(f.accountRoot,'controlled-worker-count');
     const workers=()=>existsSync(counter)?Number(readFileSync(counter,'utf8')):0;
-    const invoke=async(argv:string[])=>{const log=console.log;console.log=()=>{};try{return await f.invoke(argv,{runner,implementation});}finally{console.log=log;}};
-    return{...f,runner,snapshot,runtime,store,invoke,workers,stats:()=>({gitCalls,apiCalls,workers:workers()}),onGit:(hook:typeof onGit)=>{onGit=hook;}};
+    const invoke=async(argv:string[],claimed=false)=>{const log=console.log;console.log=()=>{};try{return await f.invoke(argv,{runner,implementation,...(claimed?{nativeReviewerHost:reviewer}:{})});}finally{console.log=log;if(argv[0]==='dispatch')facts('dispatch-invoke-finally');}};
+    const facts=(cut:string)=>{const run=store().list()[0];const reason=run?.interrupt?.reason;const bootstrapCode=['INVALID_REQUEST','COMMAND_FAILED','BASE_DRIFT','COLLISION','STALE_IDENTITY','HEAD_MISMATCH','DIRTY_WORKSPACE','REPOSITORY_MISMATCH'].find(code=>reason?.startsWith('Implementation bootstrap failed ('+code+'):'))??'absent';process.stderr.write('STAGE10_DIRECT_HOLD '+JSON.stringify({cut,state:run?.state??'absent',interruptedFrom:run?.interruptedFrom??'absent',reviewWait:run?.nativeReview?.wait?.kind??'absent',reason:reason==='Native review unavailable: no accepted trusted host reviewer binding; implementation and repair are waiting.'?'native-binding':reason?.includes('Maintenance HOLD')?'maintenance-hold':reason?.includes('Worker result did not advance the authorized HEAD')?'unchanged-head-bootstrap':reason?.startsWith('Implementation bootstrap failed')?'bootstrap-other':reason?.includes('Governed implementation')?'governed-runtime':'other',bootstrapCode,hasClaim:run?.dispatchClaimId!==undefined,claimState:selectDispatchRuntime(runtimeComments.map(v=>({id:String(v.id),body:v.body})))?.claim.state??'absent',gitStage,gitExit:gitExit??-1,gitCalls,apiCalls,workers:workers()})+'\n');};
+    return{...f,runner,snapshot,runtime,store,invoke,workers,facts,stats:()=>({gitCalls,apiCalls,workers:workers()}),claim:()=>selectDispatchRuntime(runtimeComments.map(v=>({id:String(v.id),body:v.body})))?.claim,onGit:(hook:typeof onGit)=>{onGit=hook;}};
   } catch(error){f.cleanup();throw error;}
 }
 
@@ -157,58 +165,64 @@ describe('fixed production entry through real parser and canonical dispatcher',(
   });
 
 
-  it('holds direct issue and parked implementation resume before any durable admission or execution effect',async(t)=>{
+  it('holds direct durable admission and native-binding resume before owner or transition changes',async(t)=>{
     for(const entry of ['issue','resume'] as const)await t.test(entry,async()=>{
       const f=await directExecutionFixture();const originalRead=fs.readFileSync;
       const issue=['run','acme/widgets#42','--execution-profile','routine','--repair-task-shape-authority','{"revision":"task-v1","shape":"bounded"}'];
+      const registryFile=path.join(f.accountRoot,'mission-admission/registry.json');
+      const bindingReason='Native review unavailable: no accepted trusted host reviewer binding; implementation and repair are waiting.';
       try{
         f.runtime.setMaintenanceHold(f.snapshot.runsDirectory,false,T0);
-        assert.equal(await f.invoke(issue),0);assert.equal(f.workers(),1,'Inactive HOLD must reach the actual no-model worker');
-        let parked=f.store().list()[0]!;assert.equal(parked.state,'NEEDS_HUMAN');assert.equal(parked.interruptedFrom,'IMPLEMENTING');assert.ok(parked.bootstrap);assert.match(parked.interrupt!.reason,/bootstrap/i);
-        const retry=parked.interrupt!.choices!.find(choice=>choice!=='Cancel the run')!;assert.ok(retry);
-        assert.equal(await f.invoke(['run','resume',parked.id,'--decision',retry]),0);assert.equal(f.workers(),2,'The legitimate inactive-HOLD parked resume must execute');
-        parked=f.store().read(parked.id)!;assert.equal(parked.state,'NEEDS_HUMAN');assert.equal(parked.interruptedFrom,'IMPLEMENTING');
-        if(entry==='issue')assert.equal(await f.invoke(['run','resume',parked.id,'--decision','Cancel the run']),1);
-        const command=entry==='issue'?issue:['run','resume',parked.id,'--decision',retry];
+        const initialRegistry=readFileSync(registryFile,'utf8');
+        assert.equal(await f.invoke(issue),0);f.facts('direct-admission-baseline');
+        let parked=f.store().list()[0]!;assert.equal(parked.state,'WAITING_DEPENDENCY');assert.equal(parked.interruptedFrom,'READY');assert.equal(parked.interrupt!.reason,bindingReason);assert.equal(parked.nativeReview!.wait!.kind,'binding');assert.equal((parked.interrupt!.choices??[]).length,0);assert.equal(f.workers(),0);
+        assert.notEqual(readFileSync(registryFile,'utf8'),initialRegistry,'The inactive direct baseline genuinely admits and parks an owner');
+        const receiptPath=resolveRunOwnerReceiptPath('acme/widgets',parked.id);const receipt=readRunOwnerReceipt(receiptPath)!;assert.equal(receipt.phase,'parked');
+        const previous=parked;const generation=receipt.generation;
+        // Without an offered Cancel choice this literal is an ordinary resume,
+        // not cancellation. Inactive HOLD proves its real admission/re-park path.
+        assert.equal(await f.invoke(['run','resume',parked.id,'--decision','Cancel the run']),0);f.facts('no-choice-literal-cancel-inactive');
+        parked=f.store().read(parked.id)!;assert.equal(parked.state,'WAITING_DEPENDENCY');assert.equal(parked.interruptedFrom,'READY');assert.equal(parked.interrupt!.reason,bindingReason);assert.equal((parked.interrupt!.choices??[]).length,0);assert.ok(parked.history.length>previous.history.length);assert.ok(readRunOwnerReceipt(receiptPath)!.generation>generation);assert.equal(f.workers(),0);
+        const cleanupOwned=async()=>{const owner=readRunOwnerReceipt(receiptPath)!;assert.equal(f.workers(),0,'This controlled binding wait never started a child');assert.equal(await f.invoke(['run','admission','recover',parked.id,'--generation',String(owner.generation),'--stopped']),0);assert.equal(await f.invoke(['run','transition',parked.id,'fail','--reason','Controlled owned cleanup']),0);assert.equal(f.store().read(parked.id)!.state,'FAILED');};
+        if(entry==='issue')await cleanupOwned();
         const projection=f.runtime.operationalRuntimeProjectionPath(f.snapshot.runsDirectory);
-        const durable=()=>{
-          const result:Record<string,string>={};
-          const walk=(directory:string)=>{if(!existsSync(directory))return;for(const name of readdirSync(directory).sort()){const file=path.join(directory,name);const stat=lstatSync(file);if(stat.isDirectory())walk(file);else{assert.equal(stat.isFile(),true);result[path.relative(f.accountRoot,file)]=createHash('sha256').update(Reflect.apply(originalRead,fs,[file])).digest('hex');}}};
-          for(const directory of [f.snapshot.runsDirectory,path.join(f.accountRoot,'mission-admission'),path.join(f.accountRoot,'workspaces'),f.objectRoot])walk(directory);
-          return result;
-        };
+        const durable=()=>{const result:Record<string,string>={};const walk=(directory:string)=>{if(!existsSync(directory))return;for(const name of readdirSync(directory).sort()){const file=path.join(directory,name),stat=lstatSync(file);if(stat.isDirectory())walk(file);else{assert.equal(stat.isFile(),true);result[path.relative(f.accountRoot,file)]=createHash('sha256').update(Reflect.apply(originalRead,fs,[file])).digest('hex');}}};for(const directory of [f.snapshot.runsDirectory,path.join(f.accountRoot,'mission-admission'),path.join(f.accountRoot,'workspaces'),f.objectRoot])walk(directory);return result;};
         for(const cut of ['hold','malformed','unreadable'] as const){
-          f.runtime.setMaintenanceHold(f.snapshot.runsDirectory,cut==='hold',T0);
-          if(cut==='malformed')writeFileSync(projection,'{broken');
+          f.runtime.setMaintenanceHold(f.snapshot.runsDirectory,cut==='hold',T0);if(cut==='malformed')writeFileSync(projection,'{broken');
           const before=durable(),effects=f.stats();
           if(cut==='unreadable'){Object.defineProperty(fs,'readFileSync',{value:(...args:unknown[])=>{if(args[0]===projection)throw new Error('Controlled projection read refusal');return Reflect.apply(originalRead,fs,args);}});syncBuiltinESMExports();}
           try{
-            await assert.rejects(()=>f.invoke(command),error=>{assert.equal((error as {code?:string}).code,'EXECUTION_ADMISSION_REFUSED');assert.match(String(error),cut==='hold'?/Maintenance HOLD/:/unreadable or malformed/);return true;});
+            const decisions=entry==='issue'?['issue']:['Retry original admission','Cancel the run'];
+            for(const decision of decisions){const command=entry==='issue'?issue:['run','resume',parked.id,'--decision',decision];await assert.rejects(()=>f.invoke(command),error=>{assert.equal((error as {code?:string}).code,'EXECUTION_ADMISSION_REFUSED');assert.match(String(error),cut==='hold'?/Maintenance HOLD/:/unreadable or malformed/);return true;});}
           }finally{Object.defineProperty(fs,'readFileSync',{value:originalRead});syncBuiltinESMExports();}
-          assert.deepEqual(f.stats(),effects,'No Git, API, model or worker effect after '+cut);
-          assert.deepEqual(durable(),before,'Run/history, owner receipt, registry generations, workspace and object bytes unchanged at '+cut);
-          if(cut==='hold')assert.equal(f.runtime.readOperationalRuntimeProjection(f.snapshot.runsDirectory)!.maintenanceHold.active,true);
+          assert.deepEqual(f.stats(),effects);assert.deepEqual(durable(),before,'No Run/history, receipt, registry generation, workspace or object change at '+cut);if(cut==='hold')assert.equal(f.runtime.readOperationalRuntimeProjection(f.snapshot.runsDirectory)!.maintenanceHold.active,true);
         }
-        // Cancellation is a bounded non-executing decision and remains usable under HOLD.
         f.runtime.setMaintenanceHold(f.snapshot.runsDirectory,true,T0);
-        if(entry==='resume'){const before=f.stats();assert.equal(await f.invoke(['run','resume',parked.id,'--decision','Cancel the run']),1);assert.equal(f.store().read(parked.id)!.state,'FAILED');assert.deepEqual(f.stats(),before);}
+        if(entry==='resume'){const effects=f.stats();await cleanupOwned();assert.deepEqual(f.stats(),effects);}
         assert.equal(f.runtime.readOperationalRuntimeProjection(f.snapshot.runsDirectory)!.maintenanceHold.active,true);
       }finally{Object.defineProperty(fs,'readFileSync',{value:originalRead});syncBuiltinESMExports();f.cleanup();}
     });
   });
 
-  it('rechecks operational HOLD at the normal bootstrap mutation callback after direct resume admission',async()=>{
-    const f=await directExecutionFixture();try{
-      f.runtime.setMaintenanceHold(f.snapshot.runsDirectory,false,T0);
-      const args=['run','acme/widgets#42','--execution-profile','routine','--repair-task-shape-authority','{"revision":"task-v1","shape":"bounded"}'];
-      assert.equal(await f.invoke(args),0);assert.equal(f.workers(),1);
-      const parked=f.store().list()[0]!;assert.equal(parked.interruptedFrom,'IMPLEMENTING');const retry=parked.interrupt!.choices!.find(choice=>choice!=='Cancel the run')!;assert.ok(retry);
-      let tripped=false,fetches=0;
-      f.onGit(args=>{if(args.includes('get-url')&&!tripped){tripped=true;f.runtime.setMaintenanceHold(f.snapshot.runsDirectory,true,T0);}if(args.includes('fetch'))fetches++;});
-      assert.equal(await f.invoke(['run','resume',parked.id,'--decision',retry]),0);
-      assert.equal(tripped,true);assert.equal(fetches,0,'No immutable-base fetch after the awaited authority cut activates HOLD');assert.equal(f.workers(),1);
-      const after=f.store().read(parked.id)!;assert.equal(after.state,'NEEDS_HUMAN');assert.match(after.interrupt!.reason,/Maintenance HOLD/);assert.equal(f.runtime.readOperationalRuntimeProjection(f.snapshot.runsDirectory)!.maintenanceHold.active,true);
-    }finally{f.cleanup();}
+  it('uses actual dispatch claims for the normal worker baseline, offered cancellation and awaited HOLD fence',async(t)=>{
+    for(const cut of ['positive-cancel','prepare-hold'] as const)await t.test(cut,async()=>{
+      const f=await directExecutionFixture();try{
+        f.runtime.setMaintenanceHold(f.snapshot.runsDirectory,false,T0);
+        let remoteReads=0,fetches=0,tripped=false;
+        if(cut==='prepare-hold')f.onGit(args=>{if(args.includes('get-url')&&++remoteReads===3){tripped=true;f.runtime.setMaintenanceHold(f.snapshot.runsDirectory,true,T0);}if(args.includes('fetch'))fetches++;});
+        assert.equal(await f.invoke(['dispatch','once'],true),0);f.facts('claimed-'+cut);
+        const parked=f.store().list()[0]!;assert.ok(parked.dispatchClaimId);assert.equal(f.claim()!.claimId,parked.dispatchClaimId);assert.equal(parked.state,'NEEDS_HUMAN');assert.equal(parked.interruptedFrom,'IMPLEMENTING');
+        if(cut==='positive-cancel'){
+          assert.equal(f.workers(),1,'Genuine dispatcher claim, prepared workspace and concrete no-model runtime must reach the worker');assert.match(parked.interrupt!.reason,/Worker result did not advance the authorized HEAD/);assert.ok(parked.interrupt!.choices!.includes('Cancel the run'));
+          f.runtime.setMaintenanceHold(f.snapshot.runsDirectory,true,T0);const effects=f.stats();
+          assert.equal(await f.invoke(['run','resume',parked.id,'--decision','Cancel the run'],true),1);f.facts('offered-cancel-under-hold');
+          assert.equal(f.store().read(parked.id)!.state,'FAILED');assert.equal(f.workers(),1);assert.equal(f.stats().gitCalls,effects.gitCalls);assert.ok(f.stats().apiCalls>effects.apiCalls,'Canonical claim reads/settlement are permitted cleanup');assert.equal(f.claim()!.state,'failed');
+        }else{
+          assert.equal(tripped,true,'HOLD reaches the awaited first preparation remote-identity read after the two planning URL reads');assert.equal(fetches,0,'The actual beforeMutation callback prevents the first immutable-base fetch');assert.equal(f.workers(),0);assert.match(parked.interrupt!.reason,/Maintenance HOLD/);
+        }
+        assert.equal(f.runtime.readOperationalRuntimeProjection(f.snapshot.runsDirectory)!.maintenanceHold.active,true);
+      }finally{f.cleanup();}
+    });
   });
 
   it('reports installed actor binding as not probed without an authentication or user request',async()=>{
