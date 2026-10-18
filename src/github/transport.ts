@@ -295,7 +295,7 @@ export class GhCliTransport implements GitHubApiTransport {
     let token:string|undefined;let privateEnv:NodeJS.ProcessEnv|undefined;let captured:ProcessResult|undefined;
     try {
       const scope=this.options.repository;if(scope&&!path.startsWith(`repos/${scope.owner}/${scope.repo}/`))throw new GitHubMergeBindingError('authority');
-      if(this.options.hostname!=='github.com'||!this.options.env?.GH_CONFIG_DIR?.startsWith('/')||!(/^[1-9][0-9]*$/).test(this.options.acceptedActorId??''))throw new GitHubMergeBindingError('capture');
+      if(this.options.hostname!=='github.com'||!this.options.env?.GH_CONFIG_DIR?.startsWith('/')||(!(/^[1-9][0-9]*$/).test(this.options.acceptedActorId??'')||!Number.isSafeInteger(Number(this.options.acceptedActorId))||String(Number(this.options.acceptedActorId))!==this.options.acceptedActorId))throw new GitHubMergeBindingError('capture');
       const keys=new Set(['HOME','PATH','LANG','LC_ALL','GH_CONFIG_DIR']);
       const captureEnv=Object.freeze({...Object.fromEntries(Object.entries(this.options.env).filter(([key])=>keys.has(key))),GH_HOST:'github.com',GH_PROMPT_DISABLED:'1'});
       let checkingAuthority=false;

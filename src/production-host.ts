@@ -7,7 +7,7 @@ import { readOperationalRuntimeProjection } from './operational/runtime-projecti
 import type { NativeCompletionHosts } from './oracle/completion-proof.js';
 import { JsonFileOracleReceiptStore } from './oracle/receipt-store.js';
 import { fileURLToPath } from 'node:url';
-import { assertProductionPolicyConfiguration, PRODUCTION_EXECUTION_PROFILE_CONFIG, PRODUCTION_POLICY_REVISION } from './production-policy.js';
+import { assertProductionPolicyConfiguration, isSupportedProductionNodeVersion, PRODUCTION_EXECUTION_PROFILE_CONFIG, PRODUCTION_POLICY_REVISION } from './production-policy.js';
 import Module, { createRequire } from 'node:module';
 import { existsSync } from 'node:fs';
 import { assertSafeAccountOwnedPath, resolveAccountHomeDirectory } from './account-home.js';
@@ -178,7 +178,7 @@ function installationInventory(home: string, root: string, r: AcceptedRelease): 
 }
 function assertRuntime(record: AcceptedRelease, entry: string): void {
   if (process.argv[1] !== entry || realpathSync(process.argv[1]) !== entry) throw new Error('Actual launched entry is outside the accepted distribution.');
-  if (process.execPath !== record.node.path || process.version !== 'v24.21.0' || process.execArgv.length !== 1 || process.execArgv[0] !== '--no-global-search-paths' || process.env.NODE_OPTIONS || process.env.NODE_PATH || process.env.LD_PRELOAD || process.env.DYLD_INSERT_LIBRARIES) throw new Error('Unsupported production runtime/loader context.');
+  if (process.execPath !== record.node.path || !isSupportedProductionNodeVersion(process.version) || process.execArgv.length !== 1 || process.execArgv[0] !== '--no-global-search-paths' || process.env.NODE_OPTIONS || process.env.NODE_PATH || process.env.LD_PRELOAD || process.env.DYLD_INSERT_LIBRARIES) throw new Error('Unsupported production runtime/loader context.');
 }
 function readProtected(home: string, file: string): string { protectedPath(home, file, 'file'); return readFileSync(file, 'utf8'); }
 function validateRelease(home: string, root: string, entry: string, raw: string): AcceptedRelease {
@@ -186,6 +186,7 @@ function validateRelease(home: string, root: string, entry: string, raw: string)
   exact(r, 'schemaVersion,releaseId,sourceCommit,sourceTree,stateCompatibility,runtimePolicyRevision,entry,manifest,manifestDigest,node,git,gh,codex,pnpm,repository,github,mergePolicy,environment');
   if (r.schemaVersion !== 1 || !COMPONENT.test(r.releaseId) || r.releaseId === '.' || r.releaseId === '..' || !COMMIT.test(r.sourceCommit) || !COMMIT.test(r.sourceTree) || r.stateCompatibility !== ACCEPTED_STATE_COMPATIBILITY || r.runtimePolicyRevision !== 'issue-104-production-v7' || r.entry !== PRODUCTION_ENTRY || root !== path.join(home, '.tachiko-conductor', 'releases', r.releaseId) || entry !== path.join(root, PRODUCTION_ENTRY)) throw new Error('Installation identity or state compatibility is unavailable.');
   exact(r.repository, 'owner,repo,objectRoot'); exact(r.github, 'configDirectory,actorId,qualification,observationQualification,confinementQualification');
+  if(typeof r.github.actorId!=='string'||!(/^[1-9][0-9]*$/).test(r.github.actorId)||!Number.isSafeInteger(Number(r.github.actorId))||String(Number(r.github.actorId))!==r.github.actorId)throw new Error('Accepted actor ID must be a canonical positive safe integer decimal string.');
   for (const v of Object.values(r.github)) nonempty(v);
   if (!validMergePolicy(r.mergePolicy) || r.mergePolicy.releaseId !== r.releaseId || r.mergePolicy.owner !== r.repository.owner || r.mergePolicy.repo !== r.repository.repo) throw new Error('Accepted merge policy does not bind the installed repository.');
   protectedPath(home, r.repository.objectRoot, 'directory'); protectedPath(home, r.github.configDirectory, 'directory');

@@ -73,3 +73,12 @@ it('captures separately for subsequent merges and refuses foreign repository sco
   for(let i=0;i<2;i++)await transport.write('repos/acme/widgets/pulls/7/merge','PUT',{sha:head});assert.equal(captures,2);
   await assert.rejects(transport.write('repos/foreign/widgets/pulls/7/merge','PUT',{sha:head}),/binding unavailable/);assert.equal(captures,2);
 });
+
+
+it('rejects noncanonical or unsafe accepted actor metadata before private credential capture',async()=>{
+  for(const acceptedActorId of ['', 'abc', '0', '-1', '01', '1.0', '1e3', '9007199254740992']){
+    let calls=0;const runner:ProcessRunner={async run(){calls++;throw new Error('Invalid actor metadata must not invoke the host');}};
+    const transport=new GhCliTransport({runner,hostname:'github.com',acceptedActorId,env:{GH_CONFIG_DIR:'/accepted/github'}});
+    await assert.rejects(transport.write('repos/acme/widgets/pulls/7/merge','PUT',{sha:head,merge_method:'squash'}),/Merge actor binding unavailable/);assert.equal(calls,0);
+  }
+});
