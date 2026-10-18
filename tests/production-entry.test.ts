@@ -16,7 +16,7 @@ import { createRun } from '../src/domain/run.js';
 import { applyTransition } from '../src/domain/state-machine.js';
 import { DISPATCH_QUEUE_MARKER, renderDispatchRuntime, selectDispatchRuntime } from '../src/dispatch/queue.js';
 import { readRunOwnerReceipt } from '../src/mission-admission/run-owner-receipt.js';
-import { resolveRunOwnerReceiptPath } from '../src/mission-admission/host-registry.js';
+import { createHostAdmissionRegistry, resolveRunOwnerReceiptPath } from '../src/mission-admission/host-registry.js';
 import { operationalRuntimeProjectionPath, readOperationalRuntimeProjection, setMaintenanceHold } from '../src/operational/runtime-projection.js';
 import { pathToFileURL } from 'node:url';
 import { acquireDispatchInvocationLock } from '../src/dispatch/invocation-lock.js';
@@ -296,47 +296,79 @@ describe('fixed production entry through real parser and canonical dispatcher',(
   });
 
 
+
   it('preserves typed worker and selected HEAD refusals through genuinely claimed installed execution',async(t)=>{
     for(const cut of ['positive','worker-entry','worker-spawn','head-entry','head-spawn'] as const)for(const drift of (cut==='positive'?['descriptor']:['descriptor','artifact']) as ('descriptor'|'artifact')[])await t.test(cut+'-'+drift,async()=>{
       const headCut=cut.startsWith('head'),f=await directExecutionFixture({productionWorker:true,commitWorker:headCut});
-      const originalRead=fs.readFileSync,originalExec=childProcess.execFile;
-      let tripped=false,headEntered=false,workerChildren=0,headChildren=0;
+      const originalRead=fs.readFileSync,originalExec=childProcess.execFile,originalStackLimit=Error.stackTraceLimit;
+      let tripped=false,headEntered=false,workerChildren=0,headChildren=0,spawnCutObserved=false,finalizationRefused=false;
+      let originRun:Run|undefined,originOwner:ReturnType<typeof readRunOwnerReceipt> = null,originClaim:ReturnType<typeof f.claim>;
       try{
+        // Bounded observer only: the worker final callback has more than the
+        // default ten synchronous frames. Restore this global in finally.
+        Error.stackTraceLimit=64;
         f.runtime.setMaintenanceHold(f.snapshot.runsDirectory,false,T0);
         fs.readFileSync=((file:fs.PathOrFileDescriptor,...args:unknown[])=>{
           if(String(file)===f.recordPath){
-            const stack=new Error().stack??'',inHead=stack.includes('assertHead'),inWorker=stack.includes('assertWorkerAccess'),atSpawn=stack.includes('createChild');
+            const stack=new Error().stack??'',inHead=stack.includes('assertHead'),inWorker=stack.includes('assertWorkerAccess'),atSpawn=/\bat createChild\b/.test(stack);
             if(inHead)headEntered=true;
             const selected=headCut?inHead:inWorker;
             if(cut!=='positive'&&!tripped&&selected&&(cut.endsWith('spawn')?atSpawn:!atSpawn)){
-              tripped=true;
+              originRun=f.store().list()[0]!;
+              originOwner=readRunOwnerReceipt(resolveRunOwnerReceiptPath('acme/widgets',originRun.id));originClaim=f.claim();
+              spawnCutObserved=atSpawn;tripped=true;
               if(drift==='descriptor')f.enable(false);
               else writeFileSync(path.join(f.record.codex.runtimeDirectory,'runtime.cjs'),'revoked controlled runtime bytes');
             }
           }
           return Reflect.apply(originalRead,fs,[file,...args]);
         }) as typeof fs.readFileSync;
-        // A transparent observer delegates the original child boundary and
-        // records only controlled command categories; it grants no authority.
+        // Scope HEAD counting to Codex's selected adapter call, not later
+        // bootstrap/workspace reads; delegate every actual child unchanged.
         childProcess.execFile=((...args:unknown[])=>{
           if(args[0]===f.record.codex.path)workerChildren++;
-          const argv=args[1] as readonly string[]|undefined;
-          if(headEntered&&args[0]===f.record.git.path&&argv?.slice(-2).join('/')==='rev-parse/HEAD')headChildren++;
+          const argv=args[1] as readonly string[]|undefined,selectedHead=/\bat CodexCliAdapter\.readHead\b/.test(new Error().stack??'');
+          if(selectedHead&&args[0]===f.record.git.path&&argv?.slice(-2).join('/')==='rev-parse/HEAD')headChildren++;
           return Reflect.apply(originalExec,childProcess,args);
         }) as typeof childProcess.execFile;syncBuiltinESMExports();
-        const code=await f.invoke(['dispatch','once'],true);f.facts('typed-'+cut+'-'+drift);
-        const run=f.store().list()[0]!;
-        assert.ok(run.dispatchClaimId);assert.equal(f.claim()!.claimId,run.dispatchClaimId);
+        let code:number|undefined;
+        try{code=await f.invoke(['dispatch','once'],true);}
+        catch(error){
+          const failure=error as {code?:unknown;details?:{path?:unknown};cause?:unknown};
+          const expected=drift==='artifact'&&tripped&&error instanceof Error&&failure.code==='GH_TRANSPORT_FAILED'&&failure.details?.path==='repos/acme/widgets/issues/1/comments'&&failure.cause instanceof Error&&failure.cause.message==='Accepted artifact/program filesystem identity changed; restart/requalification required.';
+          if(!expected)throw error;
+          finalizationRefused=true;
+        }
+        f.facts('typed-'+cut+'-'+drift);
+        const run=f.store().list()[0]!,claim=f.claim()!;
+        const owner=readRunOwnerReceipt(resolveRunOwnerReceiptPath('acme/widgets',run.id))!;
+        const lane=createHostAdmissionRegistry().readLane(owner.laneId)!;
+        process.stderr.write('STAGE10_TYPED_FINALIZATION '+JSON.stringify({cut,drift,finalizationRefused,spawnCutObserved,state:run.state,ownerPhase:owner.phase,laneState:lane.status,claimState:claim.state,workerChildren,headChildren})+'\n');
+        assert.ok(run.dispatchClaimId);assert.equal(claim.claimId,run.dispatchClaimId);assert.equal(claim.runId,run.id);
+        assert.equal(owner.runId,run.id);assert.equal(owner.claimId,claim.claimId);
+        assert.equal(owner.missionId,lane.missionId);assert.equal(owner.laneId,lane.laneId);assert.equal(owner.generation,lane.generation);
+        assert.equal(owner.phase,'parked');assert.equal(owner.token,undefined);assert.equal(lane.status,'parked');
         assert.equal(run.state,'NEEDS_HUMAN');assert.equal(run.interruptedFrom,'IMPLEMENTING');
         assert.equal(run.history.some(h=>h.type==='agent_failed'),false,'An admission refusal is not a provider failure');
         if(cut==='positive'){
-          assert.equal(code,0);assert.equal(tripped,false);assert.equal(workerChildren,1);assert.equal(f.workers(),1);
-          assert.ok(headEntered);assert.equal(headChildren,1);assert.match(run.interrupt!.reason,/Worker result did not advance the authorized HEAD/);
+          assert.equal(code,0);assert.equal(finalizationRefused,false);assert.equal(tripped,false);assert.equal(workerChildren,1);assert.equal(f.workers(),1);
+          assert.ok(headEntered);assert.equal(headChildren,1);assert.match(run.interrupt!.reason,/Worker result did not advance the authorized HEAD/);assert.equal(claim.state,'needs_human');
         }else{
           assert.equal(tripped,true,'The selected concrete authority cut must execute');
+          assert.equal(spawnCutObserved,cut.endsWith('spawn'),'Final-spawn cases must observe the real synchronous createChild frame');
+          assert.ok(originRun);assert.ok(originOwner);assert.ok(originClaim);
+          assert.equal(run.id,originRun.id);assert.equal(JSON.stringify(run.target)===JSON.stringify(originRun.target),true);
+          assert.equal(JSON.stringify(run.execution)===JSON.stringify(originRun.execution),true);assert.equal(JSON.stringify(run.bootstrap)===JSON.stringify(originRun.bootstrap),true);
+          assert.equal(JSON.stringify(run.implementationAuthority)===JSON.stringify(originRun.implementationAuthority),true);
+          for(const key of ['missionId','laneId','runId','claimId'] as const)assert.equal(owner[key],originOwner[key]);
+          assert.equal(claim.claimId,originClaim.claimId);assert.equal(claim.runId,originClaim.runId);
           assert.match(run.interrupt!.reason,/Implementation execution was refused at the current host admission boundary/);
           assert.equal(run.agentResult,undefined,'Refusal cannot manufacture provider completion');
           assert.equal(workerChildren,headCut?1:0);assert.equal(f.workers(),headCut?1:0);assert.equal(headChildren,0);
+          if(drift==='artifact'){
+            assert.equal(finalizationRefused,true);assert.equal(code,undefined);assert.equal(claim.state,'running','Invalid installation cannot settle the remote claim');
+            assert.equal(JSON.stringify(claim)===JSON.stringify(originClaim),true,'The original remote claim remains truthfully unsettled');
+          }else{assert.equal(finalizationRefused,false);assert.equal(code,0);assert.equal(claim.state,'needs_human');}
           if(headCut){
             const workspace=run.bootstrap!.workspacePath;
             assert.equal(existsSync(path.join(workspace,'controlled-worker.txt')),true);
@@ -344,7 +376,7 @@ describe('fixed production entry through real parser and canonical dispatcher',(
             assert.notEqual(execFileSync(f.record.git.path,['rev-parse','HEAD'],{cwd:workspace,encoding:'utf8'}).trim(),run.bootstrap!.baseSha,'Actual successful worker commit remains in its private workspace');
           }
         }
-      }finally{fs.readFileSync=originalRead;childProcess.execFile=originalExec;syncBuiltinESMExports();f.cleanup();}
+      }finally{Error.stackTraceLimit=originalStackLimit;fs.readFileSync=originalRead;childProcess.execFile=originalExec;syncBuiltinESMExports();f.cleanup();}
     });
   });
 
@@ -478,7 +510,19 @@ describe('fixed production entry through real parser and canonical dispatcher',(
         let printed:string[]=[];try{printed=(await f.invoke(['dispatch','once'])).printed;}catch(error){assert.match(String(error),/runtime projection|actor binding|merge authority/i);}
         const current=f.store().read(f.runId)!;
         if(cut==='positive'){
-          assert.equal(invalidated,false);assert.equal(f.stats().squashes,1);assert.equal(f.stats().captures,1);assert.equal(current.state,'MERGED');
+          assert.equal(invalidated,false);assert.equal(f.stats().squashes,1);assert.equal(f.stats().captures,1);assert.equal(f.stats().boundActorGets,1);assert.equal(f.stats().boundPuts,1);
+          assert.equal(current.state,'MERGE_READY');assert.equal(current.mergeAttempt!.submissionPossible,true);assert.ok(current.mergeAttempt!.qualification);
+          assert.equal(current.mergeAttempt!.identity.treeSha,f.tree);const issuedIdentity=structuredClone(current.mergeAttempt!.identity);
+          assert.equal(f.claim()!.claimId,current.dispatchClaimId);assert.equal(f.claim()!.runId,current.id);
+          // Qualification is durable issuance evidence. The existing original-
+          // attempt dispatcher reconciliation settles it on the following poll.
+          await f.invoke(['dispatch','maintenance','hold']);await f.invoke(['dispatch','once'],false);
+          const settled=f.store().read(f.runId)!,released=readRunOwnerReceipt(ownerPath)!,settledClaim=f.claim()!;
+          assert.equal(settled.state,'MERGED');assert.deepEqual(settled.mergeAttempt!.identity,issuedIdentity);assert.deepEqual(settled.mergeAttempt!.qualification,current.mergeAttempt!.qualification);
+          assert.equal(released.phase,'released');assert.equal(released.token,undefined);for(const key of ['missionId','laneId','runId','claimId'] as const)assert.equal(released[key],owner[key]);
+          assert.equal(settledClaim.claimId,settled.dispatchClaimId);assert.equal(settledClaim.runId,settled.id);assert.equal(settledClaim.state,'merge_ready','HOLD retains the settled original queue fence in the existing protocol');
+          assert.equal(f.stats().squashes,1);assert.equal(f.stats().captures,1);assert.equal(f.stats().boundActorGets,1);assert.equal(f.stats().boundPuts,1);assert.equal(f.store().list().length,1);
+          assert.equal(readOperationalRuntimeProjection(path.join(f.accountRoot,'runs'))!.maintenanceHold.active,true);
         }else{
           assert.equal(invalidated,true);assert.equal(f.stats().squashes,0);assert.equal(f.stats().boundPuts,0);assert.equal(f.stats().captures,1);
           assert.equal(current.mergeAttempt?.submissionPossible,true,'Late refusal retains the monotonic possible-submission marker');
