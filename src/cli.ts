@@ -8,7 +8,7 @@ import { assertNativeMergeSettlement, issuedMergeRecoveryConfiguration, qualifie
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, statSync } from 'node:fs';
 import { parseArgs } from 'node:util';
 import { pathToFileURL } from 'node:url';
 
@@ -2444,11 +2444,12 @@ function printRunInspection(run: Run): void {
   console.log(lines.join('\n'));
 }
 
-function buildBrowserRuntime(): ManagedPlaywrightMcpRuntime {
-  const roots = resolveBrowserRoots();
+function buildBrowserRuntime(env: NodeJS.ProcessEnv = process.env): ManagedPlaywrightMcpRuntime {
+  const roots = resolveBrowserRoots(env);
   return new ManagedPlaywrightMcpRuntime({
     ...roots,
     repositoryRoot: resolveRepositoryRoot(),
+    env,
   });
 }
 
@@ -2705,7 +2706,7 @@ export async function main(argv: string[], native: CliNativeDependencies = {}): 
   }
 
   if (command === 'browser') {
-    const runtime = buildBrowserRuntime();
+    const runtime = buildBrowserRuntime(commandEnvironment);
     try {
       if (subcommand === 'start' || subcommand === 'bootstrap') {
         const { values, positionals } = parseArgs({
@@ -2727,7 +2728,18 @@ export async function main(argv: string[], native: CliNativeDependencies = {}): 
           throw new Error('browser bootstrap is always headed so a human can complete authentication.');
         }
         const port = values.port === undefined ? undefined : parseBrowserPort(values.port);
-        const shared = { beforeStart: assertInstallation, ...(port === undefined ? {} : { port }), ...(values.host === undefined ? {} : { host: values.host }) };
+        const beforeStart = () => {
+          assertInstallation();
+          if (production !== undefined) {
+            const selected = commandEnvironment.TACHIKO_PLAYWRIGHT_BROWSERS_PATH;
+            let available = false;
+            if (typeof selected === 'string' && selected.trim() !== '' && path.isAbsolute(selected) && commandEnvironment.PLAYWRIGHT_BROWSERS_PATH === selected) {
+              try { available = statSync(selected).isDirectory(); } catch { /* Missing selection never enables the default cache. */ }
+            }
+            if (!available) throw new BrowserRuntimeError(BROWSER_RUNTIME_ERROR_CODE.INVALID_CONFIG, 'Accepted managed-browser artifact directory is unavailable.');
+          }
+        };
+        const shared = { beforeStart, ...(port === undefined ? {} : { port }), ...(values.host === undefined ? {} : { host: values.host }) };
         const finalSnapshot = await waitForOwnedBrowser(
           async (signal) =>
             subcommand === 'bootstrap'

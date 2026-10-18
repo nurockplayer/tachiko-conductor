@@ -103,7 +103,21 @@ function privateFixtureTree(root: string): void {
   if(info.isDirectory()) { chmodSync(root,0o700);for(const name of readdirSync(root))privateFixtureTree(path.join(root,name)); }
   else { assert.equal(info.isFile(),true);chmodSync(root,(info.mode&0o111)!==0?0o700:0o600); }
 }
-export async function installedFixture(fullCli = false, compiled = false, environmentPatch: Readonly<Record<string,string>> = {}, options:{omitEnvironment?:readonly ('TACHIKO_LUNA_CODEX_HOME'|'TACHIKO_PNPM_DEPENDENCY_ARTIFACT'|'TACHIKO_PLAYWRIGHT_BROWSERS_PATH')[];profileLabel?:'held-control'|'command-authority'|'manual-registry'|'manual-recovery'|'merge-settlement';githubActorId?:string;lunaHome?:boolean;nodeBasename?:string;gitBasename?:string;gitNamespace?:string;controlledGitIdentity?:boolean;pathDelimiterInHome?:boolean;githubNamespace?:string;objectNamespace?:string;toolNamespaces?:Partial<Record<'codex'|'pnpm',string>>;toolInterpreter?:'ambient-node';codexRuntime?:string|((programs:{node:string;git:string})=>string);workerAlias?:'missing'|'unsupported';workerCommandAlias?:{name:'node'|'git';state:'missing'|'unsupported'};githubFixtureFile?:boolean;expectedRejection?:RegExp}={}) {
+/** Same permission specification on independent transpile and real-compiler fixtures. */
+export function assertPrivateFixturePermissions(home: string, release: string): void {
+  const visit = (directory: string) => {
+    assert.equal(lstatSync(directory).mode & 0o077, 0, directory);
+    for (const name of readdirSync(directory)) {
+      const file = path.join(directory,name), stat = lstatSync(file);
+      assert.equal(stat.isSymbolicLink(),false,file);assert.equal(stat.mode & 0o077,0,file);
+      if (stat.isDirectory()) visit(file);
+    }
+  };
+  visit(home);
+  assert.ok(lstatSync(path.join(release,'dist/mission-admission')).isDirectory());
+  assert.ok(lstatSync(path.join(release,'dist/oracle/receipt-store.js')).isFile());
+}
+export async function installedFixture(fullCli = false, compiled = false, environmentPatch: Readonly<Record<string,string>> = {}, options:{browserFixture?:'manifested'|'global-only';omitEnvironment?:readonly ('TACHIKO_LUNA_CODEX_HOME'|'TACHIKO_PNPM_DEPENDENCY_ARTIFACT'|'TACHIKO_PLAYWRIGHT_BROWSERS_PATH')[];profileLabel?:'held-control'|'command-authority'|'manual-registry'|'manual-recovery'|'merge-settlement';githubActorId?:string;lunaHome?:boolean;nodeBasename?:string;gitBasename?:string;gitNamespace?:string;controlledGitIdentity?:boolean;pathDelimiterInHome?:boolean;githubNamespace?:string;objectNamespace?:string;toolNamespaces?:Partial<Record<'codex'|'pnpm',string>>;toolInterpreter?:'ambient-node';codexRuntime?:string|((programs:{node:string;git:string})=>string);workerAlias?:'missing'|'unsupported';workerCommandAlias?:{name:'node'|'git';state:'missing'|'unsupported'};githubFixtureFile?:boolean;expectedRejection?:RegExp}={}) {
   const timingStart = performance.now();
   let fenceTiming: { calls: number; durationMs: number } | undefined;
   let emission: SourceEmissionStats | undefined;
@@ -144,6 +158,14 @@ export async function installedFixture(fullCli = false, compiled = false, enviro
   const dependencyStarted = performance.now();
   copyDependency('@modelcontextprotocol/sdk',process.cwd(),path.join(release,'node_modules'));
   { mkdirSync(path.join(release,'node_modules/closed-dependency'),{recursive:true});writeFileSync(path.join(release,'node_modules/closed-dependency/package.json'),'{}'); }
+  if (options.browserFixture !== undefined) {
+    const mcp = path.join(release,'node_modules/@playwright/mcp');mkdirSync(mcp,{recursive:true});
+    writeFileSync(path.join(mcp,'package.json'),JSON.stringify({name:'@playwright/mcp',main:'cli.js'}));
+    copyFileSync(path.resolve('tests/fixtures/accepted-browser-mcp.cjs'),path.join(mcp,'cli.js'));
+    const dependency = options.browserFixture === 'manifested' ? path.join(release,'node_modules/controlled-browser-dependency') : path.join(home,'.node_modules/controlled-browser-dependency');
+    mkdirSync(dependency,{recursive:true});writeFileSync(path.join(dependency,'package.json'),JSON.stringify({type:'commonjs',main:'index.js'}));writeFileSync(path.join(dependency,'index.js'),'module.exports = '+JSON.stringify(options.browserFixture)+';\n');
+    mkdirSync(path.join(accountRoot,'browsers'),{recursive:true});
+  }
   privateFixtureTree(release);
   reportTiming('dependencies-copied',performance.now()-dependencyStarted);
   const admissionDirectory=path.join(accountRoot,'mission-admission');mkdirSync(admissionDirectory,{recursive:true,mode:0o700});writeFileSync(path.join(admissionDirectory,'registry.json'),JSON.stringify({schemaVersion:1,revision:0,config:{schemaVersion:1,revision:'mission-admission-v1',limits:{maxCaptains:1,maxWriters:1,maxHighAutonomy:1}},lanes:[],lastTransition:null}),{mode:0o600});

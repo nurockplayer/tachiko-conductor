@@ -261,6 +261,7 @@ export class ManagedPlaywrightMcpRuntime implements BrowserRuntime {
       child = spawn(
         process.execPath,
         [
+          '--no-global-search-paths',
           `--title=${runtimeProcessIdentity(runtimeId)}`,
           this.playwrightCliPath,
           ...buildPlaywrightMcpArgs({ host, port, profileDir, outputDir, headless }),

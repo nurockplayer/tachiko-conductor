@@ -320,7 +320,7 @@ export function resolveProductionHost(entryUrl: string, runner: ProcessRunner = 
       }
     }
     const hostEnv: NodeJS.ProcessEnv = Object.freeze({ HOME: home, PATH: workerPath, LANG:'C', LC_ALL:'C', GH_CONFIG_DIR:r.github.configDirectory, GH_HOST:'github.com', GH_PROMPT_DISABLED:'1', GIT_CONFIG_NOSYSTEM:'1', GIT_CONFIG_GLOBAL:'/dev/null', GIT_CONFIG_COUNT:'0', GIT_TERMINAL_PROMPT:'0', GIT_NO_REPLACE_OBJECTS:'1' });
-    const environment = Object.freeze({ ...hostEnv, ...r.environment, ...(dispatchRaw === undefined ? {} : { TACHIKO_DISPATCH_CONFIG: dispatchRaw }) });
+    const environment = Object.freeze({ ...hostEnv, ...r.environment, ...(r.environment.TACHIKO_PLAYWRIGHT_BROWSERS_PATH === undefined ? {} : { PLAYWRIGHT_BROWSERS_PATH: r.environment.TACHIKO_PLAYWRIGHT_BROWSERS_PATH }), ...(dispatchRaw === undefined ? {} : { TACHIKO_DISPATCH_CONFIG: dispatchRaw }) });
     // Validate dispatch only on the ordinary CLI route. Malformed/absent current config must not suppress issued readback.
     const workerAuthority = (operation: () => void) => {
       try { operation(); } catch (error) {

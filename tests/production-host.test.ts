@@ -8,7 +8,7 @@ import { resolveProductionHost } from '../src/production-host.js';
 import Module, { syncBuiltinESMExports } from 'node:module';
 import { PRODUCTION_EXECUTION_PROFILE_CONFIG, PRODUCTION_LOCAL_VALIDATION_CONFIG } from '../src/production-policy.js';
 import { distributionManifestDigest, workerCommandPath, workerPnpmAlias } from '../src/production-host.js';
-import { manifest, installedFixture, emitSources } from './production-host-fixture.js';
+import { manifest, installedFixture, emitSources, assertPrivateFixturePermissions } from './production-host-fixture.js';
 import { buildWorkflowDeps } from '../src/cli.js';
 import { NodeProcessRunner } from '../src/github/transport.js';
 
@@ -382,8 +382,8 @@ process.stdout.write(${JSON.stringify(jsonl)});
       }finally{Object.defineProperty(fs,'readFileSync',{value:originalRead});syncBuiltinESMExports();f.cleanup();}
     }
   });
-  it('provisions accepted private copied and emitted permissions for transpile and actual compiled modes',async()=>{
-    for(const compiled of [false,true]){const f=await installedFixture(false,compiled);try{assert.equal(f.resolve().installation,'accepted');const assertPrivate=(directory:string)=>{assert.equal(lstatSync(directory).mode&0o077,0,directory);for(const name of readdirSync(directory)){const file=path.join(directory,name);const stat=lstatSync(file);assert.equal(stat.isSymbolicLink(),false,file);assert.equal(stat.mode&0o077,0,file);if(stat.isDirectory())assertPrivate(file);}};assertPrivate(f.home);assert.ok(lstatSync(path.join(f.release,'dist/mission-admission')).isDirectory());assert.ok(lstatSync(path.join(f.release,'dist/oracle/receipt-store.js')).isFile());}finally{f.cleanup();}}
+  it('provisions accepted private copied and emitted permissions for transpile mode',async()=>{
+    const f=await installedFixture(false,false);try{assert.equal(f.resolve().installation,'accepted');assertPrivateFixturePermissions(f.home,f.release);}finally{f.cleanup();}
   });
 
 });
