@@ -459,9 +459,12 @@ describe('fixed production entry through real parser and canonical dispatcher',(
         assert.notEqual(readOperationalRuntimeProjection(runs)!.supervisor,'running','Completed scanner settles truthfully');
         assert.equal(readOperationalRuntimeProjection(runs)!.maintenanceHold.active,false);
         const positiveCalls=apiCalls,positiveQueueReads=queueReads;
-        for(const refusal of ['initial-invalid','captured-drift'] as const){
-          f.enable(mode==='once');let captured=false;
+        for(const refusal of ['initial-invalid','captured-drift','dispatch-missing','dispatch-malformed','dispatch-schema'] as const){
+          f.enable(mode==='once');writeFileSync(f.dispatchPath,JSON.stringify(f.dispatch));let captured=false;
           if(refusal==='initial-invalid')writeFileSync(f.hostPath,'{malformed');
+          else if(refusal==='dispatch-missing')unlinkSync(f.dispatchPath);
+          else if(refusal==='dispatch-malformed')writeFileSync(f.dispatchPath,'{malformed');
+          else if(refusal==='dispatch-schema')writeFileSync(f.dispatchPath,JSON.stringify({...f.dispatch,queueCommentId:0}));
           else{
             fs.readFileSync=((file:fs.PathOrFileDescriptor,...args:unknown[])=>{
               const value=Reflect.apply(originalRead,fs,[file,...args]);
@@ -470,16 +473,85 @@ describe('fixed production entry through real parser and canonical dispatcher',(
             }) as typeof fs.readFileSync;syncBuiltinESMExports();
           }
           const before=authority(),projectionBefore=originalRead(projection,'utf8'),publicationCount=publications.length;
-          try{await assert.rejects(f.invoke(command,{runner}),refusal==='captured-drift'?/descriptor changed/:/descriptor|host/i);}
+          try{await assert.rejects(f.invoke(command,{runner}),refusal==='captured-drift'?/descriptor changed/:refusal.startsWith('dispatch-')?/TACHIKO_DISPATCH_CONFIG/:/descriptor|host/i);}
           finally{fs.readFileSync=originalRead;syncBuiltinESMExports();}
           assert.equal(captured,refusal==='captured-drift');
           assert.equal(publications.length,publicationCount,'Refusal cannot advertise a new running scanner');
           assert.equal(originalRead(projection,'utf8')===projectionBefore,true,'Typed projection including HOLD remains unchanged');
           assert.equal(authority()===before,true,'Run, owner, generation and canonical authority bytes remain unchanged');
           assert.equal(apiCalls,positiveCalls);assert.equal(queueReads,positiveQueueReads);
+          if(refusal.startsWith('dispatch-'))process.stderr.write('STAGE10_DISPATCH_PREREQUISITES '+JSON.stringify({mode,cut:refusal,authorityPreserved:true,projectionPreserved:true,queueReadsAfterRefusal:queueReads-positiveQueueReads,apiCallsAfterRefusal:apiCalls-positiveCalls,newRunningPublications:publications.length-publicationCount})+'\n');
         }
       }finally{fs.readFileSync=originalRead;fs.renameSync=originalRename;syncBuiltinESMExports();console.log=log;f.cleanup();}
     });
+  });
+
+  it('keeps authenticated original history usable while sealed incomplete routine environments refuse ordinary initiation', async t => {
+    const original = leadRepairFixture({ executionRevision: PRODUCTION_POLICY_REVISION, timeoutMs: 900000, localValidationRevision: PRODUCTION_POLICY_REVISION, hostedPolicy: { revision: PRODUCTION_POLICY_REVISION, policy: { mode: 'not_required' } }, liveSnapshot: canonicalProducerSnapshot });
+    try {
+      await original.poll();
+      if (original.run().state === 'WAITING_DEPENDENCY') { original.tick(); await original.poll(); }
+      const history = original.run();
+      assert.equal(history.state, 'MERGE_READY');
+      assert.ok(history.nativeReview!.requests.some(request => request.completionProof !== undefined));
+      assert.ok(history.nativeLead!.requests.some(request => request.completionProof !== undefined));
+      const complete = await installedFixture(true);
+      try {
+        for (const enabled of [true,false]) {
+          complete.enable(enabled);
+          const s = complete.resolve();
+          assert.equal(s.installation,'accepted',s.reason);assert.equal(s.initiationPolicy.available,true,s.initiationPolicy.reason);
+          s.assertInitiation();s.assertRunInitiation(history);
+          assert.equal(s.reviewer.available,false);assert.equal(s.lead.available,false);
+          assert.equal(s.nativeMergeHost !== undefined,enabled);
+        }
+      } finally { complete.cleanup(); }
+      for (const field of ['TACHIKO_LUNA_CODEX_HOME','TACHIKO_PNPM_DEPENDENCY_ARTIFACT','TACHIKO_PLAYWRIGHT_BROWSERS_PATH'] as const) {
+        for (const form of ['missing','blank','relative'] as const) await t.test(field + '/' + form, async () => {
+          const patch: Record<string,string> = {};
+          if (form !== 'missing') patch[field] = form === 'blank' ? ' \t ' : 'relative-controlled-path';
+          const f = await installedFixture(true,false,patch,{ omitEnvironment: form === 'missing' ? [field] : [] });
+          const log = console.log;console.log = () => {};
+          let calls = 0, reviewChecks = 0, leadChecks = 0;
+          const runner: ProcessRunner = { async run() { calls += 1;throw new Error('Incomplete initiation cannot call any API, worker or provider.'); } };
+          try {
+            const { JsonFileOracleReceiptStore: InstalledReceipts } = await import(new URL('./oracle/receipt-store.js',f.entryUrl).href) as typeof import('../src/oracle/receipt-store.js');
+            const { JsonFileStore: InstalledStore } = await import(new URL('./store/json-file-store.js',f.entryUrl).href) as typeof import('../src/store/json-file-store.js');
+            // Preserve the original producer's namespace and authenticators;
+            // no evidence, Run execution, receipt or history is rewritten.
+            const receipts = new InstalledReceipts(path.join(original.root,'oracle'));
+            const historical: NativeCompletionHosts = {
+              review: { receipts, authenticate(evidence) { reviewChecks += 1;return original.reviewer.authenticate(evidence); } },
+              lead: { receipts, authenticate(evidence) { leadChecks += 1;return original.lead.authenticate(evidence); } },
+            };
+            const s = f.resolve(runner,historical);
+            assert.equal(s.installation,'accepted',s.reason);s.assertInstallation();s.assertRecoveryScope('acme','widgets');
+            assert.equal(s.initiationPolicy.available,false);assert.match(s.initiationPolicy.reason,new RegExp(field));
+            assert.throws(s.assertInitiation,new RegExp(field));assert.equal(s.nativeMergeHost,undefined);
+            const sealed = JSON.parse(readFileSync(f.recordPath,'utf8')) as { environment: Record<string,string> };
+            assert.equal(Object.hasOwn(sealed.environment,field),form !== 'missing','the incomplete value is sealed before initial acceptance');
+            if (form !== 'missing') assert.equal(sealed.environment[field] === patch[field],true);
+            const store = new InstalledStore({dir:s.runsDirectory,nativeCompletionHosts:historical});
+            store.create(history);
+            assert.equal(JSON.stringify(store.read(history.id)) === JSON.stringify(history),true);
+            reviewChecks = 0;leadChecks = 0;
+            const files = [path.join(s.runsDirectory,history.id+'.json'),path.join(f.accountRoot,'mission-admission/registry.json'),resolveRunOwnerReceiptPath('acme/widgets',history.id),operationalRuntimeProjectionPath(s.runsDirectory),dispatchWakePath()];
+            const authority = () => JSON.stringify(files.map(file => [file,existsSync(file) ? createHash('sha256').update(readFileSync(file)).digest('hex') : 'absent']));
+            const before = authority();
+            assert.equal(await f.invoke(['run','show',history.id],{runner,historicalCompletionHosts:historical}),0);
+            assert.ok(reviewChecks > 0,'actual installed history read invokes the original review authenticator');
+            assert.ok(leadChecks > 0,'actual installed history read invokes the original lead authenticator');
+            const authenticatedReview = reviewChecks, authenticatedLead = leadChecks;
+            for (const command of [['dispatch','once'],['dispatch','serve','--max-cycles','1','--idle-poll-ms','1']]) {
+              await assert.rejects(f.invoke(command,{runner,historicalCompletionHosts:historical}),new RegExp(field));
+              assert.equal(authority() === before,true,'incomplete initiation cannot publish scanning, rewrite history or alter ownership/HOLD');
+            }
+            assert.equal(calls,0);
+            process.stderr.write('STAGE10_ROUTINE_ENVIRONMENT '+JSON.stringify({field,form,installationAccepted:true,initiationAvailable:false,originalReviewChecks:authenticatedReview,originalLeadChecks:authenticatedLead,authorityPreserved:true,externalCalls:calls})+'\n');
+          } finally { console.log = log;f.cleanup(); }
+        });
+      }
+    } finally { original.cleanup(); }
   });
 
   it('holds direct durable admission and native-binding resume before owner or transition changes',async(t)=>{

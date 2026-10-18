@@ -3086,8 +3086,8 @@ export async function main(argv: string[], native: CliNativeDependencies = {}): 
         // Refuse ordinary initiation while still admission-locked, before advertising a running scanner.
         // Issued observation and not-due/HOLD classifications above retain their independent paths.
         if (production && recovering === undefined) production.assertInitiation();
-        publishRuntime('scanning', 'running', nextPollAt());
         const config = recovering === undefined ? processConfig ??= resolveDispatchConfiguration(commandEnvironment) : recovering.mergeAttempt?.submissionPossible ? issuedMergeRecoveryConfiguration(recovering) : leadObservable(recovering) || leadRecoverable(recovering) ? issuedLeadRecoveryConfiguration(recovering) : issuedReviewRecoveryConfiguration(recovering);
+        publishRuntime('scanning', 'running', nextPollAt());
         const recoveryDecision=recovering!==undefined && !recovering.mergeAttempt?.submissionPossible && (leadRecoverable(recovering)||reviewRecoverable(recovering));
         const transport = transportForCommand();
         const runtime = new GitHubDispatchRuntime(transport, config);

@@ -280,7 +280,12 @@ export function resolveProductionHost(entryUrl: string, runner: ProcessRunner = 
         [WORKER_NODE_ALIAS, workerNodeAlias(r.node.path)],
         [WORKER_GIT_ALIAS, workerGitAlias(r.node.path, r.git.path)],
       ] as const) program(home, { path: path.join(root, relative), sha256: digest(bytes) });
-      assertProductionPolicyConfiguration(r.environment); if(r.environment.TACHIKO_IMPLEMENTATION_AGENT!=='luna-isolated'||r.mergePolicy.localValidationRevision!==PRODUCTION_POLICY_REVISION||r.mergePolicy.hostedValidationRevision!==PRODUCTION_POLICY_REVISION)throw new Error('Accepted initiation policy contradicts the unchanged routine-only v7 Luna contract.'); workerPath = acceptedWorkerPath; }
+      assertProductionPolicyConfiguration(r.environment);
+      for (const key of ['TACHIKO_LUNA_CODEX_HOME', 'TACHIKO_PNPM_DEPENDENCY_ARTIFACT', 'TACHIKO_PLAYWRIGHT_BROWSERS_PATH'] as const) {
+        const value = r.environment[key];
+        if (value === undefined || value.trim() === '' || !path.isAbsolute(value)) throw new Error(`Production initiation requires an absolute nonempty ${key}.`);
+      }
+      if(r.environment.TACHIKO_IMPLEMENTATION_AGENT!=='luna-isolated'||r.mergePolicy.localValidationRevision!==PRODUCTION_POLICY_REVISION||r.mergePolicy.hostedValidationRevision!==PRODUCTION_POLICY_REVISION)throw new Error('Accepted initiation policy contradicts the unchanged routine-only v7 Luna contract.'); workerPath = acceptedWorkerPath; }
     catch(error){policyReason=error instanceof Error?error.message:String(error);}
     const configFile = path.join(accountRoot, 'production/host.json'); const dispatchFile = path.join(accountRoot, 'production/dispatch.json');
     const readOptional = (file: string) => { try { return readProtected(home, file); } catch { return undefined; } };
