@@ -1,17 +1,55 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import { chmodSync, cpSync, linkSync, mkdirSync, lstatSync, readdirSync, readFileSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, cpSync, linkSync, mkdirSync, mkdtempSync, lstatSync, readdirSync, readFileSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
+import os from 'node:os';
 import { describe, it } from 'node:test';
 import { resolveProductionHost } from '../src/production-host.js';
 import Module, { syncBuiltinESMExports } from 'node:module';
 import { PRODUCTION_EXECUTION_PROFILE_CONFIG, PRODUCTION_LOCAL_VALIDATION_CONFIG } from '../src/production-policy.js';
 import { distributionManifestDigest, workerCommandPath, workerPnpmAlias } from '../src/production-host.js';
-import { manifest, installedFixture } from './production-host-fixture.js';
+import { manifest, installedFixture, emitSources } from './production-host-fixture.js';
 import { buildWorkflowDeps } from '../src/cli.js';
 import { NodeProcessRunner } from '../src/github/transport.js';
 
 describe('accepted-release fixed host resolver', () => {
+  it('reuses only immutable exact-input source emissions with byte-equivalent isolated outputs', () => {
+    const root = mkdtempSync(path.join(os.tmpdir(),'tachiko-source-preparation-'));
+    try {
+      const source = path.resolve('src'), fresh = path.join(root,'fresh'), warm = path.join(root,'warm'), reused = path.join(root,'reused');
+      let started = performance.now();const reference = emitSources(source,fresh,false);const freshMs = performance.now()-started;
+      emitSources(source,warm);
+      started = performance.now();const hit = emitSources(source,reused);const reusedMs = performance.now()-started;
+      assert.equal(reference.cacheHit,false);assert.equal(hit.cacheHit,true);assert.equal(hit.transpiledFiles,0);
+      assert.equal(reference.transpiledFiles,reference.sourceFiles);
+      assert.equal(hit.inputDigest,reference.inputDigest);assert.equal(hit.outputDigest,reference.outputDigest);
+      const expected = JSON.stringify(manifest(fresh));
+      assert.equal(JSON.stringify(manifest(warm)) === expected,true,'complete current source output is byte-equivalent');
+      assert.equal(JSON.stringify(manifest(reused)) === expected,true);
+      const name = 'production-host.js';
+      assert.notEqual(lstatSync(path.join(warm,name)).ino,lstatSync(path.join(reused,name)).ino);
+      assert.equal(lstatSync(path.join(warm,name)).nlink,1);assert.equal(lstatSync(path.join(reused,name)).nlink,1);
+      writeFileSync(path.join(warm,name),'controlled private case drift\n');
+      writeFileSync(path.join(warm,'extra.js'),'controlled private case addition\n');
+      const isolated = path.join(root,'isolated');assert.equal(emitSources(source,isolated).cacheHit,true);
+      assert.equal(JSON.stringify(manifest(isolated)) === expected,true,'private accepted-tree mutations cannot poison preparation');
+      assert.equal(JSON.stringify(manifest(reused)) === expected,true);
+      assert.throws(()=>emitSources(source,warm),/fresh empty output/);
+      const changedSource = path.join(root,'changed-source');mkdirSync(changedSource);
+      const input = path.join(changedSource,'index.ts');writeFileSync(input,'export const value: number = 1;\n');
+      const before = emitSources(changedSource,path.join(root,'before'));
+      writeFileSync(input,'export const value: number = 2;\n');
+      const afterRoot = path.join(root,'after'), after = emitSources(changedSource,afterRoot);
+      assert.equal(after.cacheHit,false);assert.notEqual(after.inputDigest,before.inputDigest);assert.notEqual(after.outputDigest,before.outputDigest);
+      const freshChanged = path.join(root,'fresh-changed');emitSources(changedSource,freshChanged,false);
+      assert.equal(JSON.stringify(manifest(afterRoot)) === JSON.stringify(manifest(freshChanged)),true,'changed input is re-emitted exactly');
+      assert.match(readFileSync(path.join(root,'before/index.js'),'utf8'),/value = 1/);
+      assert.match(readFileSync(path.join(afterRoot,'index.js'),'utf8'),/value = 2/);
+      assert.ok([freshMs,reusedMs].every(value=>Number.isFinite(value)&&value>=0));
+      process.stderr.write('STAGE10_SOURCE_PREPARATION '+JSON.stringify({phase:'complete-control',sourceFiles:reference.sourceFiles,outputFiles:reference.outputFiles,freshMs,reusedMs,freshTranspiledFiles:reference.transpiledFiles,reusedTranspiledFiles:hit.transpiledFiles,cacheHit:hit.cacheHit,byteEquivalent:true,inputInvalidated:true,separateFiles:true,mutationIsolated:true})+'\n');
+    } finally { rmSync(root,{recursive:true,force:true}); }
+  });
+
   it('refuses forged production factory context before reading stores or creating adapters',()=>{
     assert.throws(()=>Reflect.apply(buildWorkflowDeps,undefined,[null,undefined,{},undefined,undefined,undefined,undefined,{repositoryRoot:'/candidate/objects',gitRunner:{run(){throw new Error('must not run');}}}]),/Unvalidated production host snapshot/);
   });
