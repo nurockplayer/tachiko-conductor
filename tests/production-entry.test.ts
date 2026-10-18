@@ -68,13 +68,11 @@ describe('fixed production entry through real parser and canonical dispatcher',(
       childProcess.spawn = ((...args: Parameters<typeof originalSpawn>) => { childStarts += 1; return originalSpawn(...args); }) as typeof originalSpawn;
       syncBuiltinESMExports();
       try {
-        // Positive first: installation compatibility alone permits release,
-        // including valid DISABLED/missing and invalid-initiation descriptors.
-        for (const descriptor of (cut === 'checkout' ? ['enabled', 'disabled', 'missing', 'malformed'] as const : ['enabled'] as const)) {
+        // Positive first: release requires valid current initiation/configuration.
+        // Valid DISABLED merge remains eligible; missing/malformed is tested below.
+        for (const descriptor of (cut === 'checkout' ? ['enabled', 'disabled'] as const : ['enabled'] as const)) {
           if (descriptor === 'enabled') f.enable();
-          else if (descriptor === 'disabled') f.enable(false);
-          else if (descriptor === 'missing') unlinkSync(f.hostPath);
-          else writeFileSync(f.hostPath, '{malformed');
+          else f.enable(false);
           assert.equal(f.resolve().installation, 'accepted');
           assert.equal(await f.invoke(['dispatch', 'maintenance', 'hold']), 0);
           const beforeWake = wakeWrites;
@@ -85,6 +83,45 @@ describe('fixed production entry through real parser and canonical dispatcher',(
           assert.equal(await f.invoke(['dispatch', 'maintenance', 'release']), 0);
           assert.equal(wakeWrites, beforeWake + 1);
           assert.equal(readFileSync(wake, 'utf8') === token, true, 'idempotent release retains the wake token');
+        }
+        if (cut === 'checkout') {
+          const originalRead = fs.readFileSync;
+          const dispatchRaw = readFileSync(f.dispatchPath,'utf8');
+          const receipt = resolveRunOwnerReceiptPath('acme/widgets',f.run.id);
+          try {
+            for (const scenario of ['host-missing','host-malformed','host-stale','dispatch-missing','dispatch-malformed','dispatch-shape','host-drift','dispatch-drift'] as const) {
+              f.enable(false);writeFileSync(f.dispatchPath,dispatchRaw,{mode:0o600});
+              assert.equal(await f.invoke(['dispatch','maintenance','hold']),0);
+              if (scenario === 'host-missing') unlinkSync(f.hostPath);
+              if (scenario === 'host-malformed') writeFileSync(f.hostPath,'{malformed');
+              if (scenario === 'host-stale') writeFileSync(f.hostPath,JSON.stringify({...JSON.parse(readFileSync(f.hostPath,'utf8')),releaseId:'foreign-release'}));
+              if (scenario === 'dispatch-missing') unlinkSync(f.dispatchPath);
+              if (scenario === 'dispatch-malformed') writeFileSync(f.dispatchPath,'{malformed');
+              if (scenario === 'dispatch-shape') writeFileSync(f.dispatchPath,'{}');
+              let drifted = false, lockedCut = false;
+              const before = f.durable(), calls = f.calls(), wakes = wakeWrites, children = childStarts;
+              if (scenario === 'host-drift' || scenario === 'dispatch-drift') {
+                fs.readFileSync = ((...invocation:Parameters<typeof originalRead>) => {
+                  const value = originalRead(...invocation);
+                  if (!drifted && String(invocation[0]) === receipt) {
+                    lockedCut = existsSync(path.join(f.accountRoot,'dispatch/once.lock.admission'));
+                    assert.equal(lockedCut,true,'captured drift occurs inside the release admission lock during owner preparation');
+                    drifted = true;
+                    if (scenario === 'host-drift') f.enable();
+                    else writeFileSync(f.dispatchPath,JSON.stringify({...f.dispatch,leaseDurationMs:61000}));
+                  }
+                  return value;
+                }) as typeof originalRead;syncBuiltinESMExports();
+              }
+              try { await assert.rejects(f.invoke(['dispatch','maintenance','release']),/descriptor unavailable|TACHIKO_DISPATCH_CONFIG|changed|latched/); }
+              finally { fs.readFileSync = originalRead;syncBuiltinESMExports(); }
+              assert.equal(f.durable(),before,'refused release retains all Run/owner/registry/HOLD/wake bytes');
+              assert.equal(readOperationalRuntimeProjection(path.join(f.accountRoot,'runs'))!.maintenanceHold.active,true);
+              assert.equal(f.calls(),calls);assert.equal(wakeWrites,wakes);assert.equal(childStarts,children);
+              if (scenario === 'host-drift' || scenario === 'dispatch-drift') assert.equal(drifted && lockedCut,true);
+              process.stderr.write('STAGE10_RELEASE_AUTHORITY '+JSON.stringify({scenario,lockedCut,drifted,held:true,authorityPreserved:true,wakeWrites:0,providerCalls:0,childStarts:0})+'\n');
+            }
+          } finally { fs.readFileSync = originalRead;syncBuiltinESMExports();writeFileSync(f.dispatchPath,dispatchRaw,{mode:0o600});f.enable(); }
         }
         const beforeExplicitWake = wakeWrites;
         assert.equal(await f.invoke(['dispatch', 'wake']), 0);

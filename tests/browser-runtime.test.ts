@@ -115,7 +115,8 @@ describe('ManagedPlaywrightMcpRuntime', () => {
   it('binds accepted browser start and bootstrap to selected artifacts and closed child dependency lookup',async(t)=>{
     for(const mode of ['manifested','global-only','missing-binding'] as const)await t.test(mode,async()=>{
       const f=await installedFixture(true,false,{}, {browserFixture:mode==='global-only'?'global-only':'manifested',...(mode==='missing-binding'?{omitEnvironment:['TACHIKO_PLAYWRIGHT_BROWSERS_PATH'] as const}:{})});
-      const originalSpawn=childProcess.spawn, originalLog=console.log, originalError=console.error;
+      const originalSpawn=childProcess.spawn, originalExec=childProcess.execFileSync, originalLog=console.log, originalError=console.error;
+      let commandPhase='setup', rootProbes=0, childExits=0;
       let ownedChild:{kill(signal:'SIGTERM'):boolean}|undefined;
       const spawns:{file:string;args:readonly string[];selected:string|undefined}[]=[];
       const errors:string[]=[];let running:Promise<number>|undefined;
@@ -130,16 +131,41 @@ describe('ManagedPlaywrightMcpRuntime', () => {
         childProcess.spawn=((...invocation:Parameters<typeof originalSpawn>)=>{
           const child=originalSpawn(...invocation);
           const [file,args,options]=invocation;
-          if(Array.isArray(args)&&args.includes(path.join(f.release,'node_modules/@playwright/mcp/cli.js'))){spawns.push({file,args:[...args],selected:options?.env?.PLAYWRIGHT_BROWSERS_PATH});ownedChild=child;}
+          if(Array.isArray(args)&&args.includes(path.join(f.release,'node_modules/@playwright/mcp/cli.js'))){spawns.push({file,args:[...args],selected:options?.env?.PLAYWRIGHT_BROWSERS_PATH});child.once('exit',()=>{childExits+=1;});ownedChild=child;}
           return child;
         }) as typeof originalSpawn;syncBuiltinESMExports();
+        childProcess.execFileSync=((...invocation:Parameters<typeof originalExec>)=>{
+          const [file,args,options]=invocation;
+          if (!(file==='git'&&Array.isArray(args)&&args.length===2&&args[0]==='rev-parse'&&args[1]==='--show-toplevel')) return originalExec(...invocation);
+          const started=performance.now();rootProbes+=1;
+          let outcome:'success'|'empty'|'threw'='threw', returnedKind='none', rootMatches=false;
+          let status:number|null=null, signal:string|null=null, errorCode:string|null=null;
+          try {
+            const result=originalExec(...invocation);
+            returnedKind=typeof result==='string'?'string':Buffer.isBuffer(result)?'buffer':'other';
+            const text=typeof result==='string'?result.trim():Buffer.isBuffer(result)?result.toString('utf8').trim():'';
+            outcome=text===''?'empty':'success';rootMatches=text===f.objectRoot;status=0;
+            return result;
+          } catch (error) {
+            if (error!==null&&typeof error==='object') {
+              const value=error as {status?:unknown;signal?:unknown;code?:unknown};
+              if (typeof value.status==='number'&&Number.isInteger(value.status)) status=value.status;
+              if (typeof value.signal==='string') signal=['SIGTERM','SIGKILL','SIGABRT','SIGSEGV','SIGINT','SIGBUS','SIGHUP','SIGPIPE'].includes(value.signal)?value.signal:'OTHER';
+              if (typeof value.code==='string') errorCode=['ETIMEDOUT','ENOENT','EACCES','EPERM','ENOTDIR','E2BIG','ENOMEM','EAGAIN','UNKNOWN'].includes(value.code)?value.code:'OTHER';
+            }
+            throw error;
+          } finally {
+            const elapsedMs=performance.now()-started;
+            try { process.stderr.write('STAGE10_BROWSER_GIT_ROOT '+JSON.stringify({mode,commandPhase,phase:'completed',ordinal:rootProbes,outcome,returnedKind,status,signal,errorCode,elapsedMs,timeoutMs:options?.timeout===2000?2000:null,cwdMatches:options?.cwd===f.objectRoot,processCwdMatches:process.cwd()===f.objectRoot,selectedNode:process.execPath===f.record.node.path,aliasFirst:process.env.PATH?.split(path.delimiter)[0]===path.join(f.release,'worker-bin'),aliasPresent:existsSync(path.join(f.release,'worker-bin/git')),repositoryPresent:existsSync(path.join(f.objectRoot,'.git')),rootMatches,children:spawns.length})+'\n'); } catch { /* A diagnostic cannot replace the original result/error. */ }
+          }
+        }) as typeof originalExec;syncBuiltinESMExports();
         console.error=(value?:unknown)=>{try{const parsed=JSON.parse(String(value)) as {error?:{code?:string}};errors.push(parsed.error?.code??'OTHER');}catch{errors.push('NON_JSON');}};
         if(mode==='manifested'){
           for(const command of ['start','bootstrap'] as const){
             const profile='accepted-'+command;let ready!:(snapshot:{runtimeId:string;state:string})=>void;const entered=new Promise<{runtimeId:string;state:string}>(resolve=>{ready=resolve;});
             console.log=(value?:unknown)=>{try{const parsed=JSON.parse(String(value)) as {runtime?:{runtimeId:string;state:string}};if(parsed.runtime?.state==='ready')ready(parsed.runtime);}catch{/* Only controlled ready JSON resolves this gate. */}};
             process.env.PLAYWRIGHT_BROWSERS_PATH='/ambient/unaccepted-browser-cache';
-            running=f.invoke(['browser',command,profile]);
+            commandPhase='browser:'+command;running=f.invoke(['browser',command,profile]);
             const outcome=await Promise.race([entered.then(snapshot=>({kind:'ready' as const,snapshot})),running.then(code=>({kind:'early' as const,code}))]);
             assert.ok(outcome.kind==='ready',detail());const snapshot=outcome.snapshot;
             const call=spawns.at(-1)!;
@@ -149,15 +175,15 @@ describe('ManagedPlaywrightMcpRuntime', () => {
             const latest=records().filter(record=>record.phase==='spawn').at(-1)!;assert.equal(latest.selected,selected);assert.deepEqual(latest.execArgv,call.args.slice(0,2));
             assert.equal(records().filter(record=>record.phase==='dependency-loaded').at(-1)?.value,'manifested');
             if(command==='bootstrap'){assert.ok(records().some(record=>record.phase==='tool'&&record.name==='browser_navigate'));rmSync(selected!,{recursive:true});}
-            const stopping=f.invoke(['browser','stop',profile]);void stopping.catch(()=>undefined);assert.equal(await running,0,detail());running=undefined;assert.equal(await stopping,0,detail());
+            commandPhase='browser:stop';const stopping=f.invoke(['browser','stop',profile]);void stopping.catch(()=>undefined);assert.equal(await running,0,detail());running=undefined;assert.equal(await stopping,0,detail());
             assert.equal(existsSync(path.join(f.accountRoot,'browser/profiles',profile,'.tachiko-runtime-lock.json')),false);
           }
           assert.equal(spawns.length,2);
-          assert.equal(await f.invoke(['browser','start','missing-directory']),1,detail());assert.equal(errors.at(-1),'BROWSER_INVALID_CONFIG');assert.equal(spawns.length,2,'Missing selected directory cannot start a default-cache child');
+          commandPhase='browser:start:missing-directory';assert.equal(await f.invoke(['browser','start','missing-directory']),1,detail());assert.equal(errors.at(-1),'BROWSER_INVALID_CONFIG');assert.equal(spawns.length,2,'Missing selected directory cannot start a default-cache child');
         }else if(mode==='global-only'){
           const probe=spawnSync(f.record.node.path,['-e',"process.stdout.write(require('controlled-browser-dependency'))"],{cwd:f.objectRoot,env:{HOME:f.home,PATH:'/usr/bin:/bin'},encoding:'utf8',timeout:5000});
           assert.equal(probe.status,0,JSON.stringify({phase:'private-global-control',status:probe.status,signal:probe.signal,spawnFailed:probe.error!==undefined}));assert.equal(probe.stdout,'global-only');
-          assert.equal(await f.invoke(['browser','start','global-refused']),1,detail());
+          commandPhase='browser:start:global-refused';assert.equal(await f.invoke(['browser','start','global-refused']),1,detail());
           assert.equal(spawns.length,1);assert.equal(spawns[0]!.file,f.record.node.path);assert.equal(spawns[0]!.args[0],'--no-global-search-paths');
           assert.equal(errors.at(-1),'BROWSER_CHILD_EXITED',detail());
           assert.ok(records().some(record=>record.phase==='dependency-refused'&&record.code==='MODULE_NOT_FOUND'));assert.equal(records().some(record=>record.phase==='dependency-loaded'),false);
@@ -166,14 +192,19 @@ describe('ManagedPlaywrightMcpRuntime', () => {
           assert.equal(failed.state,'failed');assert.equal(failed.exitCode,23);
         }else{
           assert.equal(accepted.initiationPolicy.available,false);process.env.PLAYWRIGHT_BROWSERS_PATH='/ambient/unaccepted-browser-cache';
-          assert.equal(await f.invoke(['browser','start','missing-binding']),1,detail());assert.equal(errors.at(-1),'BROWSER_INVALID_CONFIG',detail());assert.equal(spawns.length,0);
+          commandPhase='browser:start:missing-binding';assert.equal(await f.invoke(['browser','start','missing-binding']),1,detail());assert.equal(errors.at(-1),'BROWSER_INVALID_CONFIG',detail());assert.equal(spawns.length,0);
           assert.equal(existsSync(path.join(f.accountRoot,'browser/profiles/missing-binding')),false);assert.equal(records().length,0);
           accepted.assertInstallation();accepted.assertRecoveryScope('acme','widgets');
         }
         process.stderr.write('STAGE10_BROWSER_BINDING '+JSON.stringify({mode,children:spawns.length,selectedBinding:mode==='missing-binding'?'unavailable':'accepted',closedLookup:spawns.length===0?null:spawns.every(call=>call.args[0]==='--no-global-search-paths'),dependency:mode==='global-only'?'refused':mode==='manifested'?'manifested':'not-started',locksReleased:true})+'\n');
       }finally{
-        ownedChild?.kill('SIGTERM');await running?.catch(()=>undefined);
-        childProcess.spawn=originalSpawn;syncBuiltinESMExports();console.log=originalLog;console.error=originalError;f.cleanup();
+        let cleanupSignalRequested=false, fixtureRemoved=false;
+        try { cleanupSignalRequested=ownedChild?.kill('SIGTERM')??false;await running?.catch(()=>undefined); }
+        finally {
+          childProcess.spawn=originalSpawn;childProcess.execFileSync=originalExec;syncBuiltinESMExports();console.log=originalLog;console.error=originalError;
+          try { f.cleanup();fixtureRemoved=!existsSync(f.home); }
+          finally { try { process.stderr.write('STAGE10_BROWSER_FIXTURE_CLEANUP '+JSON.stringify({mode,commandPhase,rootProbes,children:spawns.length,childExits,cleanupSignalRequested,fixtureRemoved,hooksRestored:childProcess.spawn===originalSpawn&&childProcess.execFileSync===originalExec})+'\n'); } catch { /* Preserve primary cleanup/command errors. */ } }
+        }
       }
     });
   });

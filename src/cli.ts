@@ -852,7 +852,7 @@ export interface RuntimeProjectionUpdate {
 }
 
 /** Publish one conservative account-wide projection from one strict registry read. */
-export function publishAdmissionRuntimeProjection(
+function prepareAdmissionRuntimeProjection(
   runsDir: string,
   registry: MissionAdmissionRegistry,
   store: RunStore,
@@ -947,6 +947,17 @@ export function publishAdmissionRuntimeProjection(
     durableLaneIds,
     reentryEvidenceComplete,
   });
+  return projection;
+}
+
+export function publishAdmissionRuntimeProjection(
+  runsDir: string,
+  registry: MissionAdmissionRegistry,
+  store: RunStore,
+  update: RuntimeProjectionUpdate,
+  ownedCleanup = false,
+): ReturnType<typeof composeOperationalRuntimeProjection> {
+  const projection = prepareAdmissionRuntimeProjection(runsDir, registry, store, update, ownedCleanup);
   writeOperationalRuntimeProjection(runsDir, projection);
   return projection;
 }
@@ -3003,12 +3014,29 @@ export async function main(argv: string[], native: CliNativeDependencies = {}): 
     if (subcommand === 'maintenance' && (rest[0] === 'hold' || rest[0] === 'release') && rest.length === 1) {
       const desired = rest[0] === 'hold';
       const { projection, wake } = await (desired ? withDispatchAdmissionLock : withCommandAdmissionLock)(() => {
-        const wasHeld = readOperationalRuntimeProjection(resolveRunsDir(commandEnvironment))?.maintenanceHold.active === true;
+        const assertReleaseAuthority = () => {
+          if (!desired && production !== undefined) {
+            production.assertInitiation();
+            resolveDispatchConfiguration(commandEnvironment);
+          }
+        };
+        assertReleaseAuthority();
+        const runsDir = resolveRunsDir(commandEnvironment);
+        const wasHeld = readOperationalRuntimeProjection(runsDir)?.maintenanceHold.active === true;
         const registry = desired ? createHostAdmissionRegistry() : commandAdmission();
-        const projection = (desired ? publishAdmissionRuntimeProjection : publishCommandRuntimeProjection)(resolveRunsDir(commandEnvironment), registry, store, {
+        const update: RuntimeProjectionUpdate = {
           stage: desired ? 'maintenance_hold' : 'idle', supervisor: desired ? 'parked' : 'stopped',
           maintenanceHold: desired ? { active: true, reason: 'Operator restart hold' } : { active: false },
-        });
+        };
+        const projection = desired
+          ? publishAdmissionRuntimeProjection(runsDir, registry, store, update)
+          : prepareAdmissionRuntimeProjection(runsDir, registry, store, update);
+        if (!desired) {
+          // All prior/registry/Run/owner evidence is prepared before the final
+          // captured authority check and the synchronous publication/wake.
+          assertReleaseAuthority();
+          writeOperationalRuntimeProjection(runsDir, projection);
+        }
         // A meaningful release wakes the already-singleton driver exactly once.
         // Repeating an already released command is deliberately a no-op at the
         // wake boundary; it cannot manufacture another reconciliation.
