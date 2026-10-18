@@ -17,6 +17,8 @@ import { bindNativeMergeFence, readMergeCandidate, validMergePolicy, type Native
 export const ACCEPTED_STATE_COMPATIBILITY = 'conductor-native-state-v1';
 export const PRODUCTION_ENTRY = 'dist/production-entry.js';
 export const WORKER_PNPM_ALIAS = 'worker-bin/pnpm';
+export const WORKER_NODE_ALIAS = 'worker-bin/node';
+export const WORKER_GIT_ALIAS = 'worker-bin/git';
 function assertWorkerInterpreter(node: string): void {
   // The kernel splits a shebang on whitespace; no shell or env fallback is supported.
   if (!path.isAbsolute(node) || path.normalize(node) !== node || /[\s\u0000-\u001f\u007f]/u.test(node) || Buffer.byteLength(`#!${node} --no-global-search-paths\n`, 'utf8') > 127) {
@@ -36,6 +38,15 @@ export function workerCommandPath(node: string, git: string, workerBin: string):
 export function workerPnpmAlias(node: string, pnpm: string): string {
   assertWorkerInterpreter(node);
   return `#!${node} --no-global-search-paths\nimport { spawnSync } from 'node:child_process';\nconst result = spawnSync(${JSON.stringify(pnpm)}, process.argv.slice(2), { stdio: 'inherit', env: process.env });\nprocess.exit(result.error ? 127 : result.status ?? 1);\n`;
+}
+/** Fixed bare Git command; shares only the exact-argv executable encoding. */
+export function workerGitAlias(node: string, git: string): string {
+  return workerPnpmAlias(node, git);
+}
+/** Fixed bare Node command; its child retains the closed global lookup option. */
+export function workerNodeAlias(node: string): string {
+  assertWorkerInterpreter(node);
+  return `#!${node} --no-global-search-paths\nimport { spawnSync } from 'node:child_process';\nconst result = spawnSync(${JSON.stringify(node)}, ['--no-global-search-paths', ...process.argv.slice(2)], { stdio: 'inherit', env: process.env });\nprocess.exit(result.error ? 127 : result.status ?? 1);\n`;
 }
 const SHA = /^[a-f0-9]{64}$/;
 const COMMIT = /^[a-f0-9]{40}$/;
@@ -263,33 +274,45 @@ export function resolveProductionHost(entryUrl: string, runner: ProcessRunner = 
       const acceptedWorkerPath = workerCommandPath(r.node.path, r.git.path, path.join(root, path.dirname(WORKER_PNPM_ALIAS)));
       // A missing/unsupported worker launcher removes initiation only. The
       // compatible immutable installation can still observe an issued attempt.
-      program(home, { path: path.join(root, WORKER_PNPM_ALIAS), sha256: digest(workerPnpmAlias(r.node.path, r.pnpm.path)) });
+      for (const [relative, bytes] of [
+        [WORKER_PNPM_ALIAS, workerPnpmAlias(r.node.path, r.pnpm.path)],
+        [WORKER_NODE_ALIAS, workerNodeAlias(r.node.path)],
+        [WORKER_GIT_ALIAS, workerGitAlias(r.node.path, r.git.path)],
+      ] as const) program(home, { path: path.join(root, relative), sha256: digest(bytes) });
       assertProductionPolicyConfiguration(r.environment); if(r.environment.TACHIKO_IMPLEMENTATION_AGENT!=='luna-isolated'||r.mergePolicy.localValidationRevision!==PRODUCTION_POLICY_REVISION||r.mergePolicy.hostedValidationRevision!==PRODUCTION_POLICY_REVISION)throw new Error('Accepted initiation policy contradicts the unchanged routine-only v7 Luna contract.'); workerPath = acceptedWorkerPath; }
     catch(error){policyReason=error instanceof Error?error.message:String(error);}
-    const initiationPolicy=Object.freeze({available:policyReason===undefined,reason:policyReason??'Exact routine-only v7 production configuration; held runtime/host qualification remains separate.'});
     const configFile = path.join(accountRoot, 'production/host.json'); const dispatchFile = path.join(accountRoot, 'production/dispatch.json');
     const readOptional = (file: string) => { try { return readProtected(home, file); } catch { return undefined; } };
     const hostRaw = readOptional(configFile); const dispatchRaw = readOptional(dispatchFile);
-    let revoked = false;
-    const assertInstallation = () => { if (readProtected(home, recordPath) !== recordRaw) throw new Error('Accepted installation changed; compatible accepted restart required.'); assertRuntime(r,entry);assertClosedNodeResolution(root);if(installationInventory(home,root,r)!==inventory)throw new Error('Accepted artifact/program filesystem identity changed; restart/requalification required.'); };
-    const assertInitiation = () => {
-      if (revoked) throw new Error('Production configuration drift latched; held restart/requalification required.');
-      try { assertInstallation(); if(policyReason!==undefined)throw new Error(`Production initiation policy unavailable: ${policyReason}`); if (readOptional(configFile) !== hostRaw || readOptional(dispatchFile) !== dispatchRaw) throw new Error('Current production descriptor changed.'); }
-      catch (e) { revoked = true; throw e; }
-    };
-    const assertRunInitiation=(run:Pick<Run,'execution'>)=>{assertInitiation();if(!isDeepStrictEqual(run.execution,{profile:'routine',revision:PRODUCTION_POLICY_REVISION,...PRODUCTION_EXECUTION_PROFILE_CONFIG.profiles.routine}))throw new Error('Run execution is not the current exact routine-only v7 Luna snapshot; new native initiation is unavailable.');};
-    let nativeMergeHost: NativeMergeHost | undefined; let reason = 'Merge opt-in absent or disabled.';
+    let descriptor: Record<string, unknown> | undefined;
+    let descriptorReason: string | undefined;
     try {
       const h = JSON.parse(hostRaw ?? 'null') as Record<string, unknown>;
       exact(h, h?.enabled === false ? 'schemaVersion,revision,releaseId,manifestDigest,enabled' : 'schemaVersion,revision,releaseId,manifestDigest,enabled,merge');
       if (h.schemaVersion !== 1 || typeof h.revision !== 'string' || !h.revision.trim() || h.releaseId !== r.releaseId || h.manifestDigest !== r.manifestDigest) throw new Error('Current descriptor does not bind this installation.');
-      if (h.enabled !== false) {
-        if(policyReason!==undefined)throw new Error(`Production initiation policy unavailable: ${policyReason}`);
-        if (h.enabled !== true || !validMergePolicy(h.merge) || !isDeepStrictEqual(h.merge, r.mergePolicy)) throw new Error('Current merge policy differs from accepted installation.');
+      if (h.enabled !== false && (h.enabled !== true || !validMergePolicy(h.merge) || !isDeepStrictEqual(h.merge, r.mergePolicy))) throw new Error('Current merge policy differs from accepted installation.');
+      descriptor = h;
+    } catch (error) {
+      descriptorReason = `Current production descriptor unavailable: ${error instanceof Error ? error.message : String(error)}`;
+    }
+    const initiationPolicy=Object.freeze({available:policyReason===undefined&&descriptorReason===undefined,reason:policyReason??descriptorReason??'Exact routine-only v7 production configuration; held runtime/host qualification remains separate.'});
+    let revoked = false;
+    const assertInstallation = () => { if (readProtected(home, recordPath) !== recordRaw) throw new Error('Accepted installation changed; compatible accepted restart required.'); assertRuntime(r,entry);assertClosedNodeResolution(root);if(installationInventory(home,root,r)!==inventory)throw new Error('Accepted artifact/program filesystem identity changed; restart/requalification required.'); };
+    const assertInitiation = () => {
+      if (revoked) throw new Error('Production configuration drift latched; held restart/requalification required.');
+      try { assertInstallation(); if(policyReason!==undefined)throw new Error(`Production initiation policy unavailable: ${policyReason}`); if(descriptorReason!==undefined)throw new Error(descriptorReason); if (readOptional(configFile) !== hostRaw || readOptional(dispatchFile) !== dispatchRaw) throw new Error('Current production descriptor changed.'); }
+      catch (e) { revoked = true; throw e; }
+    };
+    const assertRunInitiation=(run:Pick<Run,'execution'>)=>{assertInitiation();if(!isDeepStrictEqual(run.execution,{profile:'routine',revision:PRODUCTION_POLICY_REVISION,...PRODUCTION_EXECUTION_PROFILE_CONFIG.profiles.routine}))throw new Error('Run execution is not the current exact routine-only v7 Luna snapshot; new native initiation is unavailable.');};
+    let nativeMergeHost: NativeMergeHost | undefined; let reason = 'Merge opt-in absent or disabled.';
+    if (descriptorReason !== undefined) reason = `Merge unavailable: ${descriptorReason}`;
+    else if (descriptor?.enabled === true) {
+      if (policyReason !== undefined) reason = `Merge unavailable: Production initiation policy unavailable: ${policyReason}`;
+      else {
         nativeMergeHost = bindNativeMergeFence(Object.freeze({ policy: Object.freeze(structuredClone(r.mergePolicy)), candidate: (base: string, head: string) => { assertInitiation(); return readMergeCandidate(r.repository.objectRoot, base, head, r.git.path, hostEnv); } }), assertInitiation);
         reason = 'Accepted merge constructor configured; actual host/service qualification remains external.';
       }
-    } catch (e) { reason = `Merge unavailable: ${e instanceof Error ? e.message : String(e)}`; }
+    }
     const hostEnv: NodeJS.ProcessEnv = Object.freeze({ HOME: home, PATH: workerPath, LANG:'C', LC_ALL:'C', GH_CONFIG_DIR:r.github.configDirectory, GH_HOST:'github.com', GH_PROMPT_DISABLED:'1', GIT_CONFIG_NOSYSTEM:'1', GIT_CONFIG_GLOBAL:'/dev/null', GIT_CONFIG_COUNT:'0', GIT_TERMINAL_PROMPT:'0', GIT_NO_REPLACE_OBJECTS:'1' });
     const environment = Object.freeze({ ...hostEnv, ...r.environment, ...(dispatchRaw === undefined ? {} : { TACHIKO_DISPATCH_CONFIG: dispatchRaw }) });
     // Validate dispatch only on the ordinary CLI route. Malformed/absent current config must not suppress issued readback.

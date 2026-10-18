@@ -30,7 +30,9 @@ never HOME, cwd, package configuration, PATH discovery, or a data-root override:
     package.json
     dist/production-entry.js
     dist/production-host.js
-    worker-bin/pnpm                  # fixed regular accepted command launcher
+    worker-bin/pnpm                  # fixed regular accepted command launchers
+    worker-bin/node
+    worker-bin/git
     ...complete compiled distribution and flattened runtime dependencies...
     node_modules/...
     scripts/dispatch-driver.sh
@@ -55,6 +57,16 @@ Run/admission stores, and worker workspace root. Existing standalone bootstrap
 imports worker objects into this selected host repository; merge reads never fetch.
 
 ## Acceptance record versus current opt-in
+
+The initially captured current host descriptor must pass its closed schema, exact
+release/manifest binding and enabled-policy validation before any ordinary
+preflight, worker, dispatch or direct-run initiation. Both valid enabled and valid
+DISABLED descriptors permit ordinary initiation without live Oracle/Sol availability;
+DISABLED suppresses only new merge issuance. Missing, unreadable, malformed,
+unknown-shape, foreign-installation or invalid enabled-policy descriptors remove
+ordinary initiation while preserving compatible original issued observation and
+its original authentication. Stable invalid bytes never become initiation authority.
+The existing captured-byte drift latch remains removal-only and cannot hot-enable.
 
 `accepted-release.json` is created by the host/operator acceptance procedure only,
 after exact build/runtime/dependency and host evidence have been qualified. Builds
@@ -89,15 +101,17 @@ and workers cannot promote their own manifests. Its closed schema contains:
   hosted-policy and pinned runtime/artifact/Luna-home values allowed by the resolver.
 
 Before sealing the distribution manifest, the separately authorized held acceptance
-procedure must create the regular executable `worker-bin/pnpm` with the exact bytes
-returned by exported `workerPnpmAlias(record.node.path, record.pnpm.path)` in the
-compiled production-host module. This is a fixed single-purpose artifact: its
-shebang selects accepted Node with `--no-global-search-paths`, and its only child
-is the JSON-quoted accepted pnpm path with the original arguments, cwd and minimal
-worker environment. It imports only Node's builtin child-process module. Include
-the file in the complete manifest before calculating the content-derived release
+procedure must create three regular executables with exact source-owned bytes:
+`worker-bin/pnpm` from `workerPnpmAlias(record.node.path, record.pnpm.path)`,
+`worker-bin/git` from `workerGitAlias(record.node.path, record.git.path)`, and
+`worker-bin/node` from `workerNodeAlias(record.node.path)` in the compiled host module.
+Each is a fixed single-purpose artifact whose shebang selects accepted Node with
+`--no-global-search-paths`. Its only child is the JSON-quoted accepted program,
+with original arguments, cwd and minimal worker environment; the Node child also
+receives the mandatory `--no-global-search-paths` option. It imports only Node's builtin child-process module. Include
+all three files in the complete manifest before calculating the content-derived release
 ID; builds do not accept or install it. No mutable alias directory is created at
-runtime. The resolver validates its exact bytes/executable identity before enabling
+runtime. The resolver validates every alias's exact bytes/executable identity before enabling
 new work and puts its protected directory first in the worker PATH, ahead of Node,
 Git and system directories. Supported Node shebang paths must be canonical
 absolute paths without whitespace or control characters, and the complete header
@@ -107,8 +121,12 @@ be canonical absolute directories without colons or control characters; spaces
 in those directory segments remain literal. These representation checks affect
 initiation only; unavailable initiation uses a safe system PATH for compatible
 issued observation. The pnpm target is JSON-quoted and may contain spaces/colons.
-Arbitrary selected pnpm basenames are supported without
-exposing tool/config/credential variables to the isolated child. The independent
+Arbitrary selected pnpm, Node and Git basenames are supported without
+exposing tool/config/credential variables to the isolated child. Bare `node`, `git`
+and `pnpm` therefore select the exact accepted programs even when an earlier Node
+or Git directory contains a conflicting conventional basename. All three aliases
+are required before ordinary initiation; a missing or unsupported one removes
+initiation only. Current artifact/program drift still removes installation eligibility. The independent
 validator's existing protected aliases and seatbelt write-deny remain unchanged.
 A valid compatible installation without a supported launcher retains original
 issued observation but has unavailable initiation. Subsequent changes to manifested

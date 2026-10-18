@@ -131,6 +131,51 @@ describe('accepted production tool closure and placement',()=>{
     });
   });
 
+
+  it('requires initially valid current descriptors before preflight, worker, dispatch and direct-run initiation',async(t)=>{
+    for(const cut of ['enabled','disabled','absent','unreadable','malformed','shape','installation','enabled-value','policy'] as const)await t.test(cut,async()=>{
+      const f=await installedFixture(true,false,{}, {lunaHome:true});const originalRead=fs.readFileSync;let requests=0;
+      try{
+        const dependencies=f.record.environment.TACHIKO_PNPM_DEPENDENCY_ARTIFACT!;
+        mkdirSync(path.join(dependencies,'store'),{recursive:true,mode:0o700});writeFileSync(path.join(dependencies,'pnpm-lock.yaml.sha256'),'0'.repeat(64),{mode:0o600});
+        mkdirSync(f.record.environment.TACHIKO_PLAYWRIGHT_BROWSERS_PATH!,{recursive:true,mode:0o700});
+        const runtime=await import(new URL('./operational/runtime-projection.js',f.entryUrl).href) as typeof import('../src/operational/runtime-projection.js');
+        const policy=await import(new URL('./production-policy.js',f.entryUrl).href) as typeof import('../src/production-policy.js');
+        const cli=await import(new URL('./cli.js',f.entryUrl).href) as typeof import('../src/cli.js');
+        const runner={async run(){requests++;throw new Error('Invalid descriptor must stop before any process transport');}};
+        const healthy=f.resolve(runner);assert.equal(healthy.initiationPolicy.available,true,healthy.initiationPolicy.reason);
+        runtime.setMaintenanceHold(healthy.runsDirectory,true,'2026-10-18T00:00:00.000Z');
+        const probe=(env:NodeJS.ProcessEnv=healthy.environment)=>policy.preflightProductionPolicy(env,()=>true,()=>true);
+        const baseline=cli.productionPreflightReport(healthy.environment,healthy,probe);assert.equal(baseline.code,0,JSON.stringify(baseline.report));assert.equal(baseline.report.initiation.available,true);
+        const descriptor=JSON.parse(readFileSync(f.hostPath,'utf8')) as Record<string,unknown>;
+        if(cut==='disabled')f.enable(false);
+        if(cut==='absent')unlinkSync(f.hostPath);
+        if(cut==='unreadable'){Object.defineProperty(fs,'readFileSync',{value:(...args:unknown[])=>{if(args[0]===f.hostPath)throw new Error('Controlled descriptor read refusal');return Reflect.apply(originalRead,fs,args);}});syncBuiltinESMExports();}
+        if(cut==='malformed')writeFileSync(f.hostPath,'{broken');
+        if(cut==='shape')writeFileSync(f.hostPath,JSON.stringify({...descriptor,unexpected:true}));
+        if(cut==='installation')writeFileSync(f.hostPath,JSON.stringify({...descriptor,manifestDigest:'0'.repeat(64)}));
+        if(cut==='enabled-value')writeFileSync(f.hostPath,JSON.stringify({...descriptor,enabled:'true'}));
+        if(cut==='policy')writeFileSync(f.hostPath,JSON.stringify({...descriptor,merge:{...f.policy,baseBranch:'foreign'}}));
+        const s=f.resolve(runner);assert.equal(s.installation,'accepted',s.reason);s.assertInstallation();s.assertRecoveryScope('acme','widgets');
+        const result=cli.productionPreflightReport(s.environment,s,probe);
+        assert.deepEqual(result.report.preflight,baseline.report.preflight,'Full policy checks succeed before descriptor qualification');
+        if(cut==='enabled'||cut==='disabled'){
+          assert.equal(result.code,0,JSON.stringify(result.report));assert.equal(s.initiationPolicy.available,true);s.assertInitiation();
+          assert.equal(s.reviewer.available,false);assert.equal(s.lead.available,false);assert.equal(s.nativeMergeHost!==undefined,cut==='enabled');assert.equal(requests,0);return;
+        }
+        assert.equal(s.initiationPolicy.available,false);assert.match(s.initiationPolicy.reason,/Current production descriptor unavailable/);assert.equal(s.nativeMergeHost,undefined);
+        assert.equal(result.code,78);assert.equal(result.report.initiation.available,false);assert.equal(result.report.holdStatus,'active');assert.match(result.report.initiation.reason,/descriptor unavailable/);
+        await assert.rejects(()=>s.workerRunner!.run(s.codexExecutable!,[],{cwd:f.objectRoot,timeoutMs:1000}),/descriptor unavailable|latched/);
+        runtime.setMaintenanceHold(s.runsDirectory,false,'2026-10-18T00:00:01.000Z');
+        await assert.rejects(()=>f.invoke(['dispatch','once'],{runner}),/descriptor unavailable/);
+        await assert.rejects(()=>f.invoke(['run','acme/widgets#42','--execution-profile','routine','--repair-task-shape-authority','{"revision":"task-v1","shape":"bounded"}'],{runner}),/descriptor unavailable/);
+        assert.equal(requests,0,'No worker, GitHub, queue or model transport after an initially invalid descriptor');
+        const registry=JSON.parse(readFileSync(path.join(f.accountRoot,'mission-admission/registry.json'),'utf8')) as {lanes:unknown[]};assert.equal(registry.lanes.length,0);
+        const {JsonFileStore}=await import(new URL('./store/json-file-store.js',f.entryUrl).href) as typeof import('../src/store/json-file-store.js');assert.equal(new JsonFileStore({dir:s.runsDirectory}).list().length,0);
+      }finally{Object.defineProperty(fs,'readFileSync',{value:originalRead});syncBuiltinESMExports();f.cleanup();}
+    });
+  });
+
   it('validates supported worker shebang and PATH representations',async()=>{
     const node='/protected/node', git='/protected/git/bin/git', bin='/accepted/release/worker-bin';
     assert.equal(workerCommandPath(node,git,bin),bin+':/protected:/protected/git/bin:/usr/bin:/bin');
@@ -187,6 +232,44 @@ process.stdout.write(${JSON.stringify(jsonl)});
         if(cut==='alias-drift')writeFileSync(path.join(f.release,'worker-bin/pnpm'),'changed alias bytes');
         if(cut==='hold')f.enable(false);
         const refused=await adapter.run(request);assert.equal(refused.exitStatus,'failure');assert.equal(codexSpawns,1,'No subsequent Codex or pnpm process after accepted identity/configuration loss');assert.equal(fs.existsSync(marker),false);
+      }finally{f.cleanup();}
+    });
+  });
+
+
+  it('executes exact accepted bare node and git ahead of conventional and nonstandard sibling shadows',async(t)=>{
+    for(const layout of ['nonstandard','conventional'] as const)await t.test(layout,async()=>{
+      const jsonl=[{type:'thread.started',thread_id:'node-git-process-proof'},{type:'turn.started'},{type:'item.completed',item:{id:'message',type:'agent_message',text:'Controlled node/git selection completed'}},{type:'turn.completed'}].map(v=>JSON.stringify(v)).join('\n');
+      const f=await installedFixture(true,false,{}, {lunaHome:true,nodeBasename:layout==='nonstandard'?'node24':'node',gitBasename:layout==='nonstandard'?'git-v2':'git',gitNamespace:'private-vcs/bin',controlledGitIdentity:true,codexRuntime:({node,git})=>`const {spawnSync}=require('node:child_process');
+const nodeResult=spawnSync('node',['-p','process.execPath'],{encoding:'utf8',env:process.env});if(nodeResult.status!==0||nodeResult.stdout!==${JSON.stringify(node)}+'\\n')process.exit(42);
+const gitArgs=['--accepted-identity','space and "quoted" argument'];const gitResult=spawnSync('git',gitArgs,{encoding:'utf8',env:process.env});if(gitResult.status!==0||gitResult.stdout!==JSON.stringify({program:${JSON.stringify(git)},args:gitArgs})+'\\n')process.exit(43);
+for(const [command,args] of [['node',['-e','process.exit(23)']],['git',['--exit-23']]])if(spawnSync(command,args,{env:process.env}).status!==23)process.exit(44);
+process.stdout.write(${JSON.stringify(jsonl)});
+`});
+      try{
+        const marker=path.join(f.objectRoot,'shadow-executed');
+        const shadow=`#!${f.record.node.path} --no-global-search-paths\nrequire('node:fs').writeFileSync(${JSON.stringify(marker)},'shadow');process.exit(99);\n`;
+        for(const name of ['node','git'])writeFileSync(path.join(f.objectRoot,name),shadow,{mode:0o700});
+        // These siblings precede the accepted Git directory in production PATH.
+        writeFileSync(path.join(path.dirname(f.record.node.path),'git'),shadow,{mode:0o700});
+        if(layout==='nonstandard')writeFileSync(path.join(path.dirname(f.record.node.path),'node'),shadow,{mode:0o700});
+        process.env.PATH=f.objectRoot+path.delimiter+(process.env.PATH??'');
+        const actual=new NodeProcessRunner();let codexSpawns=0;
+        const s=f.resolve({async run(file,args,options){if(file===f.record.codex.path){codexSpawns++;return actual.run(file,args,options);}options.beforeSpawn?.();assert.equal(file,f.record.git.path);assert.deepEqual(args.slice(-2),['rev-parse','HEAD']);return{exitCode:0,stdout:'d'.repeat(40)+'\n',stderr:''};}});
+        assert.equal(s.initiationPolicy.available,true,s.initiationPolicy.reason);assert.equal(s.workerTransportSourceOwned,false);
+        const luna=await import(new URL('./agents/luna-isolated.js',f.entryUrl).href) as typeof import('../src/agents/luna-isolated.js');
+        const adapter=new luna.IsolatedLunaAdapter({production:s,path:f.objectRoot,codexHome:s.environment.TACHIKO_LUNA_CODEX_HOME!,timeoutMs:60000});
+        const request={target:{kind:'issue' as const,owner:'acme',repo:'widgets',issueNumber:42},baseSha:'a'.repeat(40),authority:'embedded' as const,instructions:'Controlled exact executable proof. No model.',workspacePath:f.objectRoot,branch:'candidate',execution:{profile:'routine' as const,revision:'issue-104-production-v7',...PRODUCTION_EXECUTION_PROFILE_CONFIG.profiles.routine}};
+        const result=await adapter.run(request);assert.equal(result.exitStatus,'success',JSON.stringify(result));assert.equal(result.headSha,'d'.repeat(40));assert.equal(codexSpawns,1);assert.equal(fs.existsSync(marker),false);
+        if(layout==='nonstandard')unlinkSync(path.join(f.release,'worker-bin/node'));else writeFileSync(path.join(f.release,'worker-bin/git'),'changed exact Git alias');
+        assert.equal((await adapter.run(request)).exitStatus,'failure');assert.equal(codexSpawns,1);assert.equal(fs.existsSync(marker),false);
+      }finally{f.cleanup();}
+    });
+  });
+  it('keeps compatible observation when a node or git alias is initially missing or unsupported',async(t)=>{
+    for(const name of ['node','git'] as const)for(const state of ['missing','unsupported'] as const)await t.test(name+'-'+state,async()=>{
+      const f=await installedFixture(false,false,{}, {workerCommandAlias:{name,state}});try{
+        const s=f.resolve();assert.equal(s.installation,'accepted',s.reason);assert.equal(s.initiationPolicy.available,false);assert.equal(s.nativeMergeHost,undefined);s.assertInstallation();s.assertRecoveryScope('acme','widgets');assert.throws(s.assertInitiation,/policy unavailable/);
       }finally{f.cleanup();}
     });
   });
