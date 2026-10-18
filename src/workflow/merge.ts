@@ -1,3 +1,4 @@
+import { GitHubMergeBindingError } from '../github/errors.js';
 import { nativeReviewCoherent, unresolvedNativeReview } from '../oracle/native-reviewer.js';
 import { unresolvedNativeLead, nativeLeadStopped } from '../oracle/native-lead.js';
 import { applyTransition } from '../domain/state-machine.js';
@@ -201,7 +202,7 @@ export async function observeNativeMerge(context: MergeContext): Promise<Run> {
   await context.assertClaim(run); context.assertCurrent();
   save({ ...run, mergeAttempt: { ...a, observations: a.observations + 1, nextObservationAt: new Date(Date.parse(context.now()) + MERGE_BACKOFF_MS).toISOString() } });
   let qualification: NativeMergeQualification | undefined;
-  let reason = 'Merge outcome unknown; original attempt retained without resubmission.';
+  let reason = a.reason ?? 'Merge outcome unknown; original attempt retained without resubmission.';
   try {
     const p = await context.github.readPullRequest?.(run.target.owner, run.target.repo, a.identity.pullRequestNumber);
     if (p?.state === 'merged' && SHA.test(p.mergeCommitSha ?? '')) {
@@ -254,7 +255,15 @@ export async function initiateNativeMerge(context: MergeContext, host: NativeMer
     initiationFences.get(host)?.(); await context.assertInitiation!(run); await context.assertClaim!(run); context.assertCurrent();
     if (context.store.updateIfUnchanged?.(run, run) !== true) throw new Error('Run changed at merge publication fence.');
     if (!hasMergeIssuanceCapabilities(context.github)) return run;
-    try { await context.github.squashPullRequest!(p.owner, p.repo, a.identity.pullRequestNumber, a.identity.headSha); } catch { /* Lost acknowledgement is uncertainty, never retry authority. */ }
+    try { await context.github.squashPullRequest!(p.owner, p.repo, a.identity.pullRequestNumber, a.identity.headSha); }
+    catch(error) {
+      if(error instanceof GitHubMergeBindingError) {
+        const reason=new GitHubMergeBindingError(error.stage).message;
+        save({...run,mergeAttempt:{...run.mergeAttempt!,reason}});
+        return run; // Preserve the possible-submission marker; never reselect/resubmit.
+      }
+      // Lost acknowledgement is uncertainty, never retry authority.
+    }
     return await observeNativeMerge({ ...context, run });
   });
 }

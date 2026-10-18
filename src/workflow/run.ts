@@ -256,9 +256,17 @@ function assertCapturedRunAtBoundary(store: RunStore, expected: Run): void {
 }
 
 function establishInitialPlanningAdmission(store: RunStore, expected: Run, options: WorkflowOptions): void {
-  // Planning is read-only. Still bind its result to the exact Run captured
-  // before awaiting the adapter so a later plan cannot replace authority.
+  // A first plan may legitimately precede workspace ownership. Check the
+  // exact live lane and captured Run/configuration here; physical mutation
+  // admission follows the existing explicit/planned workspace strengthening.
   assertCapturedRunAtBoundary(store, expected);
+  try {
+    options.admissionFence?.registry.assertCurrentOwner(options.admissionFence.token);
+    options.assertNormalInitiation?.(expected);
+  } catch (cause) {
+    if (isExecutionAdmissionRefusal(cause)) throw cause;
+    throw new ExecutionAdmissionRefusal('The final planning boundary could not confirm current ownership or production authority.', false, { cause });
+  }
 }
 
 function persistPlannedBootstrap(store: RunStore, expected: Run, next: Run): void {
@@ -895,7 +903,7 @@ export async function runWorkflow(
             assertCapturedRunAtBoundary(store, plannedFrom);
             assertPlannedBootstrapIdentity(bootstrap, bootstrapAdapter, target, authoritativeBaseBranch, authoritativeBaseSha, publicationBranch);
             const plannedRun = applyTransition(plannedFrom, { type: 'bootstrap_prepared', bootstrap }, now());
-            assertFinalExecutionAdmission(store, plannedFrom, options);
+            establishInitialPlanningAdmission(store, plannedFrom, options);
             persistPlannedBootstrap(store, plannedFrom, plannedRun);
             run = plannedRun;
             refusalRun = plannedRun;

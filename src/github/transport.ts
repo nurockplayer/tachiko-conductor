@@ -1,6 +1,6 @@
 import { execFile, type ExecFileException } from 'node:child_process';
 
-import { GitHubLiveStateError } from './errors.js';
+import { GitHubLiveStateError, GitHubMergeBindingError, type MergeBindingStage } from './errors.js';
 
 export interface GitHubApiTransport {
   get(path: string, query?: Readonly<Record<string, string>>): Promise<unknown>;
@@ -214,7 +214,8 @@ export class GhCliTransport implements GitHubApiTransport {
     return args;
   }
 
-  private async execute(path: string, args: readonly string[]): Promise<string> {
+  private async execute(path: string, args: readonly string[], privateEnv?: NodeJS.ProcessEnv, bindingStage: MergeBindingStage = 'actor'): Promise<string> {
+    let checkingAuthority=false;
     let result: ProcessResult;
     try {
       const scope = this.options.repository;
@@ -223,11 +224,12 @@ export class GhCliTransport implements GitHubApiTransport {
         const graphqlScope = path === 'graphql' && args.includes(`owner=${scope.owner}`) && args.includes(`repo=${scope.repo}`);
         if (path !== 'user' && path !== prefix && !path.startsWith(`${prefix}/`) && !graphqlScope) throw new Error('GitHub target is outside the accepted installation repository.');
       }
-      result = await this.runner.run(this.options.executable ?? 'gh', this.options.hostname ? [args[0]!, '--hostname', this.options.hostname, ...args.slice(1)] : args, { timeoutMs: this.timeoutMs, cwd: this.options.cwd, env: this.options.env, beforeSpawn: () => { this.options.beforeSpawn?.(); if (args.includes('PUT') && args.some(a => /\/pulls\/[0-9]+\/merge$/.test(a))) this.options.beforeMerge?.(); } });
+      result = await this.runner.run(this.options.executable ?? 'gh', this.options.hostname ? [args[0]!, '--hostname', this.options.hostname, ...args.slice(1)] : args, { timeoutMs: this.timeoutMs, cwd: this.options.cwd, env: privateEnv ?? this.options.env, beforeSpawn: () => { checkingAuthority=true; this.options.beforeSpawn?.(); if (privateEnv !== undefined || args.includes('PUT') && args.some(a => /\/pulls\/[0-9]+\/merge$/.test(a))) this.options.beforeMerge?.(); checkingAuthority=false; } });
     } catch (error) {
+      if(privateEnv !== undefined)throw new GitHubMergeBindingError(checkingAuthority?'authority':bindingStage);
       throw mapThrownError(error, path);
     }
-    if (result.exitCode !== 0) throw mapCommandFailure(result, path);
+    if (result.exitCode !== 0) { if(privateEnv !== undefined)throw new GitHubMergeBindingError(bindingStage);throw mapCommandFailure(result, path); }
     return result.stdout;
   }
 
@@ -288,15 +290,39 @@ export class GhCliTransport implements GitHubApiTransport {
     return await this.execute(path, this.args(path, {}, accept));
   }
 
+  /** One original-namespace selection, private to this single merge operation. */
+  private async boundMerge(path: string, args: readonly string[]): Promise<unknown> {
+    let token:string|undefined;let privateEnv:NodeJS.ProcessEnv|undefined;let captured:ProcessResult|undefined;
+    try {
+      const scope=this.options.repository;if(scope&&!path.startsWith(`repos/${scope.owner}/${scope.repo}/`))throw new GitHubMergeBindingError('authority');
+      if(this.options.hostname!=='github.com'||!this.options.env?.GH_CONFIG_DIR?.startsWith('/')||!(/^[1-9][0-9]*$/).test(this.options.acceptedActorId??''))throw new GitHubMergeBindingError('capture');
+      const keys=new Set(['HOME','PATH','LANG','LC_ALL','GH_CONFIG_DIR']);
+      const captureEnv=Object.freeze({...Object.fromEntries(Object.entries(this.options.env).filter(([key])=>keys.has(key))),GH_HOST:'github.com',GH_PROMPT_DISABLED:'1'});
+      let checkingAuthority=false;
+      try {
+        captured=await this.runner.run(this.options.executable??'gh',['auth','token','--hostname','github.com'],{timeoutMs:this.timeoutMs,cwd:this.options.cwd,env:captureEnv,beforeSpawn:()=>{checkingAuthority=true;this.options.beforeSpawn?.();this.options.beforeMerge?.();checkingAuthority=false;}});
+      }catch { throw new GitHubMergeBindingError(checkingAuthority?'authority':'capture'); }
+      if(captured.exitCode!==0)throw new GitHubMergeBindingError('capture');
+      token=typeof captured.stdout==='string'?captured.stdout.replace(/\r?\n$/,''):'';
+      captured=undefined;
+      if(token.length===0||token.length>8192||!(/^[A-Za-z0-9._~+/-]+=*$/).test(token))throw new GitHubMergeBindingError('capture-output');
+      privateEnv=Object.freeze({...captureEnv,GH_TOKEN:token});
+      const actorRaw=await this.execute('user',this.args('user'),privateEnv,'actor');
+      let actor:unknown;try{actor=JSON.parse(actorRaw);}catch{throw new GitHubMergeBindingError('actor-response');}
+      const id=typeof actor==='object'&&actor!==null?(actor as {id?:unknown}).id:undefined;
+      if(typeof id!=='number'||!Number.isSafeInteger(id)||id<=0)throw new GitHubMergeBindingError('actor-response');
+      if(String(id)!==this.options.acceptedActorId)throw new GitHubMergeBindingError('actor-mismatch');
+      const response=await this.execute(path,args,privateEnv,'merge-request');
+      try{return JSON.parse(response) as unknown;}catch{throw new GitHubMergeBindingError('merge-response');}
+    } finally { captured=undefined;token=undefined;privateEnv=undefined; }
+  }
+
   async write(path: string, method: 'POST' | 'PATCH' | 'PUT', body: Readonly<Record<string, unknown>>): Promise<unknown> {
-    if (method === 'PUT' && /\/pulls\/[0-9]+\/merge$/.test(path) && this.options.acceptedActorId !== undefined) {
-      const actor = await this.get('user') as { id?: unknown };
-      if (String(actor?.id) !== this.options.acceptedActorId) throw new Error('GitHub actor differs from the accepted host binding.');
-    }
     const args = this.args(path).map((arg) => arg === 'GET' ? method : arg);
     for (const [key, value] of Object.entries(body).sort(([a], [b]) => a.localeCompare(b))) {
       args.push('-f', `${key}=${typeof value === 'string' ? value : JSON.stringify(value)}`);
     }
+    if(method==='PUT'&&/\/pulls\/[0-9]+\/merge$/.test(path)&&this.options.acceptedActorId!==undefined)return await this.boundMerge(path,args);
     const raw = await this.execute(path, args);
     try {
       return JSON.parse(raw) as unknown;

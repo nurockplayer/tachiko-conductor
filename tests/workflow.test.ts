@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { installedFixture } from './production-host-fixture.js';
-import { existsSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { describe, it } from 'node:test';
@@ -3590,5 +3590,42 @@ describe('captured production repair bootstrap fence',()=>{
       assert.equal(store.read(run.id)!.history.filter(h=>h.type==='bootstrap_prepared').length,cut==='prepare-mutation'?1:0);
       assert.equal(store.read(run.id)!.history.filter(h=>h.type==='start_fix').length,1,'Existing repair ordinal is preserved');assert.throws(captured.assertInitiation,/latched/);
     }finally{f.cleanup();}
+  });
+});
+
+
+describe('initial planning before physical workspace admission',()=>{
+  for(const scenario of ['explicit-workspace','planned-workspace','conflicting-plan','tagged-strengthening','prepare-revocation','prepare-after-mkdir-revocation','plan-owner-revocation','plan-normal-revocation','plan-newer-run'] as const)it(`keeps phase-appropriate initial admission and final fences at ${scenario}`,async()=>{
+    const root=mkdtempSync(path.join(os.tmpdir(),'tachiko-planning-phase-'));
+    let releaseGate:()=>void=()=>{};let pending:Promise<Awaited<ReturnType<typeof runWorkflow>>>|undefined;
+    try {
+      const runId=`planning-${scenario}`;const workspace=path.join(root,'workspace');const store=new MemoryStore();store.create(createRun(TARGET,T0,runId));
+      const registry=new MissionAdmissionRegistry({filePath:path.join(root,'registry.json'),config:{schemaVersion:1,revision:'planning-phase-v1',limits:{maxCaptains:1,maxWriters:1,maxHighAutonomy:1}}});
+      const admitted=registry.admit({laneId:runId,role:'production_captain',evidence:{repository:'acme/widgets',issue:42,run:runId}});assert.equal(admitted.outcome,'admitted');if(admitted.outcome!=='admitted')return;
+      assert.equal(registry.readLane(runId)?.evidence.workspace,undefined,'The legitimate initial lane is not prefilled');
+      const primary=new ExecutionAdmissionRefusal('original planning admission refusal',false,{cause:new Error('controlled original cause'),authorityUnknown:true});
+      let strengthening=0;if(scenario==='tagged-strengthening')registry.strengthen=()=>{strengthening++;throw primary;};
+      let resolveEntered:()=>void=()=>{};const entered=new Promise<void>(r=>{resolveEntered=r;});const released=new Promise<void>(r=>{releaseGate=r;});
+      const identity={bootstrapKind:'linked-worktree' as const,owner:'acme',repo:'widgets',issueNumber:42,baseBranch:'main',baseSha:'base',branch:`tachiko/${runId}`,publicationBranch:`tachiko/${runId}`,workspacePath:scenario==='conflicting-plan'?path.join(root,'foreign-plan'):workspace};
+      let prepareCalls=0;let mutations=0;let workers=0;let normalRevoked=false;let newer:Run|undefined;
+      const bootstrap:ImplementationBootstrapAdapter={kind:'implementation-bootstrap',bootstrapKind:'linked-worktree',
+        async plan(){await Promise.resolve();if(scenario==='plan-owner-revocation')registry.release(admitted.token,true);if(scenario==='plan-normal-revocation')normalRevoked=true;if(scenario==='plan-newer-run'){newer={...store.read(runId)!,updatedAt:'2026-10-18T00:00:01.000Z'};store.update(newer);}return identity;},
+        async prepare(request){prepareCalls++;if(scenario==='prepare-after-mkdir-revocation'){request.beforeMutation?.();mkdirSync(workspace);mutations++;}if(scenario==='prepare-revocation'||scenario==='prepare-after-mkdir-revocation'){resolveEntered();await released;}request.beforeMutation?.();mutations++;return identity;},
+        guard(){return{assertValid(){}};},async verifyDurable(request){return{headSha:request.expectedHeadSha,branch:identity.branch};}};
+      const github=githubAdapter([]);github.readLiveSnapshot=async()=>({...snapshot(HEAD),pullRequest:null,headSha:null});
+      const invoke=()=>runWorkflow({store,github,bootstrap,implementation:{kind:'implementation-agent',async run(){workers++;return{exitStatus:'failure',summary:'Controlled stop after preparation',diagnostics:['TACHIKO_NEEDS_HUMAN: Controlled stop after workspace authority']};}},reviewer:new FakeReviewer([]),assertNormalInitiation:()=>{if(normalRevoked)throw new ExecutionAdmissionRefusal('Captured normal authority revoked',false);}},runId,{maxReviewAttempts:1,now:()=>T0,admissionFence:{registry,token:admitted.token,productionMissionId:admitted.missionId,...(scenario==='planned-workspace'?{}:{executionWorkspace:workspace})}});
+      if(scenario==='tagged-strengthening'){await assert.rejects(invoke(),error=>error===primary);assert.equal(strengthening,1);assert.equal(prepareCalls,0);assert.equal(registry.readLane(runId)?.evidence.workspace,undefined);return;}
+      pending=invoke();
+      if(scenario==='prepare-revocation'||scenario==='prepare-after-mkdir-revocation'){
+        const reached=await Promise.race([entered.then(()=>true),pending.then(()=>false)]);assert.equal(reached,true,'The intended preparation gate must be reached rather than an early parked result');
+        registry.release(admitted.token,true);releaseGate();
+      }
+      const result=await pending;
+      if(scenario==='explicit-workspace'||scenario==='planned-workspace'){assert.equal(prepareCalls,1);assert.equal(mutations,1);assert.equal(workers,0,'The controlled unqualified worker must remain fenced');assert.equal(result.outcome,'needs_human');if(result.outcome==='needs_human')assert.match(result.reason,/no source-qualified publication preflight/);assert.equal(registry.readLane(runId)?.evidence.workspace,workspace);}
+      else {assert.equal(workers,0);assert.equal(prepareCalls,scenario.startsWith('prepare-')?1:0);assert.equal(mutations,scenario==='prepare-after-mkdir-revocation'?1:0);assert.equal(result.outcome,'needs_human');}
+      if(scenario==='conflicting-plan'){assert.equal(registry.readLane(runId)?.evidence.workspace,workspace,'The explicit host workspace is retained before comparison');assert.notEqual(registry.readLane(runId)?.evidence.workspace,identity.workspacePath);}
+      if(scenario==='plan-owner-revocation'||scenario==='plan-normal-revocation')assert.equal(store.read(runId)!.history.some(h=>h.type==='bootstrap_prepared'),false,'No authority-bearing plan is persisted after revocation');
+      if(scenario==='plan-newer-run')assert.deepEqual(store.read(runId),newer,'The exact concurrent Run is retained');
+    }finally{releaseGate();await pending?.catch(()=>{});rmSync(root,{recursive:true,force:true});}
   });
 });

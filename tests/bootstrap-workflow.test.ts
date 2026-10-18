@@ -1551,7 +1551,11 @@ describe('bootstrap actual-spawn admission fences', () => {
         store: storeWithSwitchableCas, github: new QueueGithub(Array.from({ length: 12 }, () => live)), implementation,
         bootstrap, reviewer: new ApprovingReviewer(), validation: new PassingValidation(), hostedCheckPolicy: TEST_HOSTED_POLICY,
       }, runId, options);
-      await gate.entered;
+      const reachedPreparationGate = await Promise.race([
+        gate.entered.then(() => true),
+        pending.then(() => false),
+      ]);
+      assert.equal(reachedPreparationGate, true, 'The workflow must reach the intended real Git gate instead of returning early.');
       const atBoundary = store.read(runId)!;
       let newerRun: Run | undefined;
       if (boundary === 'initial-worktree-add-admission-revocation') {

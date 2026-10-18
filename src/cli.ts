@@ -1846,6 +1846,7 @@ export function printOutcome(outcome: WorkflowOutcome, browserProfile?: string):
     console.log(
       `Run ${run.id}: MERGE_READY — implementation passed independent review at ${run.headSha ?? '(no HEAD)'}.`,
     );
+    if(run.mergeAttempt?.reason)console.log(run.mergeAttempt.reason);
     return;
   }
   if (outcome.outcome === 'merged') {
@@ -3068,7 +3069,7 @@ export async function main(argv: string[], native: CliNativeDependencies = {}): 
     const hold = readOperationalRuntimeProjection(resolveRunsDir(commandEnvironment))?.maintenanceHold.active === true;
     let policy: unknown; let policyReady = false;
     try { policy = preflightProductionPolicy(commandEnvironment); policyReady = true; } catch (error) { policy = { unavailable: error instanceof Error ? error.message : String(error) }; }
-    const host = production === undefined ? { installation:'unavailable', reason:'Use the fixed accepted-release entry.' } : { installation:production.installation, reason:production.reason, releaseId:production.releaseId, manifestDigest:production.manifestDigest, artifactVerification:production.artifactVerification, initiationPolicy:production.initiationPolicy, repositoryRoot:production.repositoryRoot, runsDirectory:production.runsDirectory, mergeAvailable:production.nativeMergeHost !== undefined, reviewer:production.reviewer, lead:production.lead, historicalVerification:production.historicalVerification };
+    const host = production === undefined ? { installation:'unavailable', reason:'Use the fixed accepted-release entry.' } : { installation:production.installation, reason:production.reason, releaseId:production.releaseId, manifestDigest:production.manifestDigest, artifactVerification:production.artifactVerification, initiationPolicy:production.initiationPolicy, repositoryRoot:production.repositoryRoot, runsDirectory:production.runsDirectory, mergeAvailable:production.nativeMergeHost !== undefined, mergeAvailabilityMeaning:'configured/source-wired only; live actor not probed', actorBinding:production.actorBinding, reviewer:production.reviewer, lead:production.lead, historicalVerification:production.historicalVerification };
     const ok = policyReady && hold && production?.installation === 'accepted';
     console.log(JSON.stringify({ ok, hold, preflight:policy, host, bindingQualification:'external proof required; preflight is not native acceptance' }, null, 2));
     return ok ? 0 : 78;

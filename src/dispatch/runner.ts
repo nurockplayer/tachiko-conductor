@@ -27,6 +27,7 @@ export interface DispatchRuntimeApi extends DispatchClaimApi {
 }
 
 export interface DispatchExecution {
+  readonly reason?: string;
   readonly runId: string;
   readonly state: WorkflowState;
   readonly waitForPoll?: boolean;

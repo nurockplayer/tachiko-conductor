@@ -3,6 +3,7 @@ import { lstatSync, readFileSync, readdirSync, realpathSync } from 'node:fs';
 import path from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import type { Run } from './domain/types.js';
+import { readOperationalRuntimeProjection } from './operational/runtime-projection.js';
 import type { NativeCompletionHosts } from './oracle/completion-proof.js';
 import { JsonFileOracleReceiptStore } from './oracle/receipt-store.js';
 import { fileURLToPath } from 'node:url';
@@ -49,6 +50,7 @@ export interface ProductionHostSnapshot {
   readonly manifestDigest?: string;
   readonly initiationPolicy: { readonly available: boolean; readonly reason: string };
   readonly artifactVerification: 'initial-sha256/current-stat-inventory-v1';
+  readonly actorBinding: {readonly mechanism:'gh-auth-token-per-merge-v1';readonly configured:boolean;readonly state:'not_probed';readonly expectedActorId?:string;readonly reason:string};
   readonly repositoryRoot?: string;
   readonly runsDirectory: string;
   readonly environment: NodeJS.ProcessEnv;
@@ -225,7 +227,7 @@ export function resolveProductionHost(entryUrl: string, runner: ProcessRunner = 
   const runsDirectory = path.join(accountRoot, 'runs');
   const unavailable = (reason: string): ProductionHostSnapshot => {
     const refuse = () => { throw new Error(reason); };
-    const s: ProductionHostSnapshot = Object.freeze({ installation: 'unavailable', reason, runsDirectory, initiationPolicy:Object.freeze({available:false,reason}), artifactVerification:'initial-sha256/current-stat-inventory-v1' as const, historicalCompletionHosts, historicalVerification, environment: Object.freeze({ HOME: home }), reviewer: Object.freeze({available:false as const, reason:'Oracle service contract unavailable.'}), lead:Object.freeze({available:false as const,reason:'Sol service contract unavailable.'}), assertInstallation:refuse, assertInitiation:refuse, assertRunInitiation:refuse, assertRecoveryScope:refuse }); snapshots.add(s); return s;
+    const s: ProductionHostSnapshot = Object.freeze({ installation: 'unavailable', reason, runsDirectory, actorBinding:Object.freeze({mechanism:'gh-auth-token-per-merge-v1' as const,configured:false,state:'not_probed' as const,reason:'Installation unavailable; live actor not probed.'}), initiationPolicy:Object.freeze({available:false,reason}), artifactVerification:'initial-sha256/current-stat-inventory-v1' as const, historicalCompletionHosts, historicalVerification, environment: Object.freeze({ HOME: home }), reviewer: Object.freeze({available:false as const, reason:'Oracle service contract unavailable.'}), lead:Object.freeze({available:false as const,reason:'Sol service contract unavailable.'}), assertInstallation:refuse, assertInitiation:refuse, assertRunInitiation:refuse, assertRecoveryScope:refuse }); snapshots.add(s); return s;
   };
   try {
     const moduleFile = fileURLToPath(import.meta.url); const entry = fileURLToPath(entryUrl); const root = path.dirname(path.dirname(moduleFile));
@@ -273,8 +275,8 @@ export function resolveProductionHost(entryUrl: string, runner: ProcessRunner = 
       if(file!==r.git.path||args.length!==2||args[0]!=='rev-parse'||args[1]!=='HEAD')throw new Error('Worker HEAD read differs from the accepted exact Git command.');
       return gitRunner.run(file,args,{...options,beforeSpawn:()=>{assertInitiation();options.beforeSpawn?.();}});
     }});
-    const transport = new GhCliTransport({ runner, executable:r.gh.path, hostname:'github.com', acceptedActorId:r.github.actorId, cwd:r.repository.objectRoot, env:hostEnv, beforeSpawn:assertInstallation, beforeMerge:assertInitiation, repository:{owner:r.repository.owner,repo:r.repository.repo} });
-    const snapshot: ProductionHostSnapshot = Object.freeze({ installation:'accepted', reason, artifactVerification:'initial-sha256/current-stat-inventory-v1' as const, releaseId:r.releaseId, manifestDigest:r.manifestDigest, repositoryRoot:r.repository.objectRoot, codexExecutable:r.codex.path, gitExecutable:r.git.path, workerHeadReadRunner, workerRunner, workerTransportSourceOwned:sourceOwnedRunner, runsDirectory, initiationPolicy, environment, nativeMergeHost, transport, gitRunner, historicalCompletionHosts, historicalVerification,
+    const transport = new GhCliTransport({ runner, executable:r.gh.path, hostname:'github.com', acceptedActorId:r.github.actorId, cwd:r.repository.objectRoot, env:hostEnv, beforeSpawn:assertInstallation, beforeMerge:()=>{assertInitiation();if(readOperationalRuntimeProjection(runsDirectory)?.maintenanceHold.active)throw new Error('Maintenance HOLD prevents merge initiation.');}, repository:{owner:r.repository.owner,repo:r.repository.repo} });
+    const snapshot: ProductionHostSnapshot = Object.freeze({ installation:'accepted', reason, actorBinding:Object.freeze({mechanism:'gh-auth-token-per-merge-v1' as const,configured:nativeMergeHost!==undefined,state:'not_probed' as const,expectedActorId:r.github.actorId,reason:'Source-wired per-merge binding only; live credential and actor not probed or qualified.'}), artifactVerification:'initial-sha256/current-stat-inventory-v1' as const, releaseId:r.releaseId, manifestDigest:r.manifestDigest, repositoryRoot:r.repository.objectRoot, codexExecutable:r.codex.path, gitExecutable:r.git.path, workerHeadReadRunner, workerRunner, workerTransportSourceOwned:sourceOwnedRunner, runsDirectory, initiationPolicy, environment, nativeMergeHost, transport, gitRunner, historicalCompletionHosts, historicalVerification,
       reviewer:Object.freeze({available:false as const,reason:'Oracle service contract unavailable.'}), lead:Object.freeze({available:false as const,reason:'Sol service contract unavailable.'}), assertInstallation, assertInitiation, assertRunInitiation,
       assertRecoveryScope: (owner: string, repo: string) => { assertInstallation(); if (owner !== r.repository.owner || repo !== r.repository.repo) throw new Error('Issued recovery scope differs from the compatible accepted installation.'); },
     }); snapshots.add(snapshot); return snapshot;

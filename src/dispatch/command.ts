@@ -101,7 +101,7 @@ export async function dispatchOnceCommand(
           throw new Error(`Durable run ${existing.id} task-shape authority does not match the retained dispatch claim.`);
         }
         const outcome = await deps.resumeClaimedRun(existing, claim.claimId, deps.admission, deps.releaseAdmissionLock, deps.withAdmissionLock, assertReviewClaim, assertMergeInitiation, assertLeadInitiation, deps.maintenanceHold, leadRecoveryConfiguration);
-        return { runId: outcome.run.id, state: outcomeState(outcome), ...(outcome.run.state === 'MERGE_READY' && (outcome.run.nativeReview !== undefined || outcome.run.nativeLead !== undefined) ? { waitForPoll: true } : {}) };
+        return { runId: outcome.run.id, state: outcomeState(outcome), ...(outcome.run.mergeAttempt?.reason===undefined?{}:{reason:outcome.run.mergeAttempt.reason}), ...(outcome.run.state === 'MERGE_READY' && (outcome.run.nativeReview !== undefined || outcome.run.nativeLead !== undefined) ? { waitForPoll: true } : {}) };
       }
       if (!hasValidDispatchAuthority(entry)) {
         throw new Error(`Queue issue #${entry.issue} lacks explicit revisioned task-shape authority.`);
@@ -113,7 +113,7 @@ export async function dispatchOnceCommand(
       }
       const selected = deps.resolveExecutionProfile(entry.profile);
       const outcome = await deps.runIssue(`${config.owner}/${config.repo}#${entry.issue}`, selected, claim.claimId, entry.repairTaskShapeAuthority, deps.admission, deps.releaseAdmissionLock, deps.withAdmissionLock, assertReviewClaim, assertMergeInitiation, assertLeadInitiation, deps.maintenanceHold, leadRecoveryConfiguration);
-      return { runId: outcome.run.id, state: outcomeState(outcome), ...(outcome.run.state === 'MERGE_READY' && (outcome.run.nativeReview !== undefined || outcome.run.nativeLead !== undefined) ? { waitForPoll: true } : {}) };
+      return { runId: outcome.run.id, state: outcomeState(outcome), ...(outcome.run.mergeAttempt?.reason===undefined?{}:{reason:outcome.run.mergeAttempt.reason}), ...(outcome.run.state === 'MERGE_READY' && (outcome.run.nativeReview !== undefined || outcome.run.nativeLead !== undefined) ? { waitForPoll: true } : {}) };
     },
   });
 }
