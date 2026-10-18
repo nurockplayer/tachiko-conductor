@@ -11,7 +11,7 @@ import { createRun } from '../src/domain/run.js';
 import { applyTransition } from '../src/domain/state-machine.js';
 import { buildImplementationPacket } from '../src/agents/implementation-packet.js';
 import { activeNativeLead, nativeLeadCoherent, nativeLeadReentry, unresolvedNativeLead } from '../src/oracle/native-lead.js';
-import { nativeReviewCoherent, unresolvedNativeReview } from '../src/oracle/native-reviewer.js';
+import { nativeReviewCoherent, nativeReviewReentry, unresolvedNativeReview } from '../src/oracle/native-reviewer.js';
 import { hasAuthenticatedCompletion } from '../src/oracle/completion-proof.js';
 import { oracleDigest } from '../src/oracle/source-evidence.js';
 import { readRunOwnerReceipt, writeRunOwnerReceipt } from '../src/mission-admission/run-owner-receipt.js';
@@ -133,12 +133,60 @@ for (const role of ['lead', 'review'] as const) {
 }
 it('requires trusted authentication and the exact immutable request/evidence, then retains historical completion without old eligibility', async () => {
   const f = fixture(); try {
-    f.setLeadSubmit(async () => ({ outcome: 'pending' })); await f.poll(); const r = f.run(); const q = f.leadRequests[0]!; const e = f.terminal(q);
-    f.receipts.recordLead(e);
+    f.setLeadSubmit(async () => ({ outcome: 'pending' }));
+    let outcome=await f.poll();
+    const report=(phase:string)=>{
+      const rows=f.store().list(),run=rows.length===1?rows[0]:undefined,reason=run?.interrupt?.reason??'';
+      const category=/Worker result did not advance/.test(reason)?'worker-head-unchanged':/bootstrap/i.test(reason)?'bootstrap':/retired from active review/.test(reason)?'retired-review':/scope|initial implementation authority/i.test(reason)?'original-authority':/claim|owner|admission/i.test(reason)?'claim-owner-admission':/qualification|Governed|source-qualified/i.test(reason)?'qualification':/validation|checks/i.test(reason)?'validation':/lead/i.test(reason)?'lead':/worker|Codex|executor/i.test(reason)?'worker':reason?'other':'none';
+      const active=run?activeNativeLead(run):undefined,workspace=run?.bootstrap?.workspacePath;
+      const facts={phase,outcome:outcome.outcome,runCount:rows.length,state:run?.state??'absent-or-multiple',interruptedFrom:run?.interruptedFrom??null,reviewWait:run?.nativeReview?.wait?.kind??null,leadWait:run?.nativeLead?.wait?.kind??null,category,...f.counts(),leadStatus:active?.status??null,leadMarked:active?.submissionPossible??false,requestReceipt:active!==undefined&&f.receipts.readLead(`${active.identity.requestId}.request`)!==null,terminalReceipt:active!==undefined&&f.receipts.readLead(`${active.identity.requestId}.terminal`)!==null,leadProof:active?.completionProof!==undefined,reviewProof:run?.nativeReview?.requests.some(q=>q.completionProof!==undefined)??false,repairs:run?.repairAdmissions?.length??0,startFix:run?.history.filter(h=>h.type==='start_fix').length??0,lastEvent:run?.history.at(-1)?.type??null,workerStatus:run?.agentResult?.exitStatus??null,workerCode:['CODEX_EXIT_FAILURE','CODEX_EXEC_FAILURE','CODEX_TIMEOUT','CODEX_NOT_FOUND','HEAD_READ_FAILED','CODEX_INVALID_OUTPUT'].find(code=>run?.agentResult?.diagnostics?.some(value=>value.includes(code)))??null,initialFile:workspace!==undefined&&existsSync(path.join(workspace,'implementation.txt')),repairFile:workspace!==undefined&&existsSync(path.join(workspace,'repair.txt')),headPresent:run?.headSha!==undefined};
+      process.stderr.write('STAGE10_HISTORICAL_COMPLETION '+JSON.stringify(facts)+'\n');
+      return JSON.stringify(facts);
+    };
+    let diagnostic=report('initial-pending-baseline');
+    if(f.counts().leadCalls===0&&f.run().state==='WAITING_DEPENDENCY'&&f.run().interruptedFrom==='REVIEWING'){
+      const waiting=f.run(),due=waiting.nativeReview?.wait?.nextAttemptAt;
+      assert.ok(due&&Number.isFinite(Date.parse(due))&&Date.parse(due)>=Date.parse(f.now()),diagnostic);
+      assert.equal(nativeReviewReentry(waiting,due!),true,diagnostic);f.advanceTo(due!);
+      outcome=await f.poll();diagnostic=report('initial-review-due');
+    }
+    const r=f.run(),q=f.leadRequests[0];assert.ok(q,diagnostic);
+    assert.equal(f.counts().leadCalls,1,diagnostic);assert.equal(f.leadRequests.length,1,diagnostic);
+    assert.equal(r.state,'WAITING_DEPENDENCY',diagnostic);assert.equal(r.interruptedFrom,'CHANGES_REQUESTED',diagnostic);
+    assert.equal(activeNativeLead(r)?.status,'pending',diagnostic);assert.equal(activeNativeLead(r)?.submissionPossible,true,diagnostic);
+    assert.ok(f.receipts.readLead(`${q.identity.requestId}.request`),diagnostic);
+    const e=f.terminal(q);assert.equal(f.lead.authenticate(e),true,diagnostic);f.receipts.recordLead(e);
     assert.throws(() => f.receipts.recordAuthenticatedCompletion('lead', e, () => false), /authentication/);
     const wrong = { ...e, identity: { ...e.identity, requestId: 'foreign', correlationId: 'foreign' }, id: 'foreign.terminal' };
     assert.throws(() => f.receipts.recordAuthenticatedCompletion('lead', wrong, () => true), /authentication/);
-    f.tick(); await f.poll(); f.tick(); await f.poll(); const completed = f.run(); assert.equal(completed.state, 'MERGE_READY');
+    diagnostic=report('terminal-recorded-original-authenticator');
+    // Distinct, finite protocol phases. A completed phase is not polled again;
+    // a NEEDS_HUMAN refusal fails immediately and is never treated as retryable.
+    for(const phase of ['lead-observation','lead-consumption','fresh-review'] as const){
+      const current=f.run();if(current.state==='MERGE_READY')break;
+      assert.notEqual(current.state,'NEEDS_HUMAN',diagnostic);
+      assert.equal(current.state,'WAITING_DEPENDENCY',diagnostic);
+      const lead=activeNativeLead(current);
+      if(phase==='lead-observation'||phase==='lead-consumption'){
+        if(current.interruptedFrom==='REVIEWING')continue;
+        assert.equal(current.interruptedFrom,'CHANGES_REQUESTED',diagnostic);assert.ok(lead,diagnostic);
+        assert.equal(lead.status,phase==='lead-observation'?'pending':'qualified_complete',diagnostic);
+        if(phase==='lead-consumption')assert.equal(hasAuthenticatedCompletion(lead.identity,lead.terminalDigest,lead.completionProof,'lead'),true,diagnostic);
+        const wait=Date.parse(current.nativeLead?.wait?.nextAttemptAt??''),request=Date.parse(lead.nextObservationAt);
+        assert.ok(Number.isFinite(wait)&&Number.isFinite(request),diagnostic);
+        const due=new Date(Math.max(wait,request,Date.parse(f.now()))).toISOString();
+        assert.equal(nativeLeadReentry(current,due),true,diagnostic);f.advanceTo(due);
+      }else{
+        assert.equal(current.interruptedFrom,'REVIEWING',diagnostic);
+        const due=current.nativeReview?.wait?.nextAttemptAt;assert.ok(due&&Number.isFinite(Date.parse(due))&&Date.parse(due)>=Date.parse(f.now()),diagnostic);
+        assert.equal(nativeReviewReentry(current,due!),true,diagnostic);f.advanceTo(due!);
+      }
+      outcome=await f.poll();diagnostic=report(phase);
+    }
+    const completed=f.run();diagnostic=report('completed-before-historical-tail');
+    assert.equal(completed.state,'MERGE_READY',diagnostic);assert.equal(f.counts().leadCalls,1,diagnostic);
+    assert.equal(completed.repairAdmissions?.length,1,diagnostic);assert.equal(completed.history.filter(h=>h.type==='start_fix').length,1,diagnostic);
+    assert.notEqual(completed.headSha,r.headSha,diagnostic);assert.equal(f.reviewRequests.length,2,diagnostic);
     const lead = completed.nativeLead!.requests[0]!; const review = completed.nativeReview!.requests[0]!;
     assert.equal(hasAuthenticatedCompletion(lead.identity, lead.terminalDigest, lead.completionProof, 'lead'), true);
     assert.equal(hasAuthenticatedCompletion(review.identity, review.terminalDigest, review.completionProof, 'review'), true);

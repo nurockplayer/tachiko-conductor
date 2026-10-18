@@ -1,4 +1,5 @@
 export type GitHubLiveStateErrorCode =
+  | 'GH_MERGE_BINDING_UNAVAILABLE'
   | 'GH_NOT_FOUND'
   | 'GH_AUTH_REQUIRED'
   | 'GH_RATE_LIMITED'
@@ -29,3 +30,25 @@ export class GitHubLiveStateError extends Error {
   }
 }
 
+
+const MERGE_BINDING_REASONS = Object.freeze({
+  capture: 'supported original-namespace credential capture failed',
+  'capture-output': 'credential capture returned no single usable token',
+  actor: 'bound actor verification failed',
+  'actor-response': 'bound actor response was malformed',
+  'actor-mismatch': 'bound actor differs from the accepted numeric actor',
+  authority: 'final installation or current merge authority was refused',
+  'merge-request': 'bound merge request failed; submission outcome may be unknown',
+  'merge-response': 'bound merge response was malformed; submission outcome may be unknown',
+});
+export type MergeBindingStage = keyof typeof MERGE_BINDING_REASONS;
+/** Closed, nonsecret reasons only. Never retain raw capture/API errors or causes. */
+export class GitHubMergeBindingError extends GitHubLiveStateError {
+  readonly stage: MergeBindingStage;
+  constructor(stage: MergeBindingStage) {
+    const safe = Object.hasOwn(MERGE_BINDING_REASONS,stage) ? stage : 'capture';
+    super('GH_MERGE_BINDING_UNAVAILABLE', `Merge actor binding unavailable: ${MERGE_BINDING_REASONS[safe]}.`, {details:{stage:safe}});
+    this.stage=safe;
+    Object.freeze(this);
+  }
+}

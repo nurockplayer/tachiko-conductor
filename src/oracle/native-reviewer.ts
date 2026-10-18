@@ -336,6 +336,7 @@ export function resolveNativeReviewer(host?: NativeReviewerHost): ReviewerAdapte
         replacement = true;
       } else if (active && !['pending', 'terminal_unknown', 'qualified_complete'].includes(active.status)) return wait(`Native review ${active.status}: ${active.failure ?? 'requires attention'}.`);
       if (!active || replacement) {
+        context.assertInitiationCurrent?.();
         if ((run.nativeReview?.requests.length ?? 0) >= 20) return wait('Native review request history bound exhausted.');
         const requestId = randomUUID();
         const identity: NativeReviewIdentity = { requestId, correlationId: requestId, runId: run.id, claimId: run.dispatchClaimId, missionId: owner.missionId, laneId: owner.laneId, ownerGeneration: owner.generation,
@@ -368,16 +369,19 @@ export function resolveNativeReviewer(host?: NativeReviewerHost): ReviewerAdapte
           await context.assertInitiation?.();
           await context.assertLiveClaim!();
           context.assertCurrent();
+          context.assertInitiationCurrent?.();
           const marked = { ...active!, submissionPossible: true };
           if (!save({ ...run, nativeReview: { ...run.nativeReview!, requests: run.nativeReview!.requests.map((r) => r.identity.requestId === active!.identity.requestId ? marked : r) } })) return null;
           active = marked;
           await context.assertInitiation?.();
           await context.assertLiveClaim!();
           context.assertCurrent();
+          context.assertInitiationCurrent?.();
           if (!save(context.onSubmission(run))) return null;
           await context.assertInitiation?.();
           await context.assertLiveClaim!();
           context.assertCurrent();
+          context.assertInitiationCurrent?.();
           if (context.store.updateIfUnchanged?.(run, run) !== true) return null;
           let promise: Promise<NativeReviewObservation>;
           try { promise=host.submit(requestEvidence); } catch { promise=Promise.resolve({outcome:'terminal_unknown'}); }

@@ -7,6 +7,7 @@ import { readFileSync } from 'node:fs';
 import { describe, it } from 'node:test';
 
 import {
+  assertProductionPolicyConfiguration,
   PRODUCTION_EXECUTION_PROFILE_CONFIG,
   PRODUCTION_HOSTED_CHECK_POLICY_CONFIG,
   PRODUCTION_LOCAL_VALIDATION_CONFIG,
@@ -235,4 +236,11 @@ describe('#104 production policy', () => {
       assert.throws(() => preflightProductionPolicy(environment(path.join(root, 'luna')), supportedGitRuntime), /auth\.json/);
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
+});
+
+it('rejects a v7 label with contradictory ordinary model/configuration without starting runtime probes',()=>{
+  const env={TACHIKO_EXECUTION_PROFILE_CONFIG:JSON.stringify(PRODUCTION_EXECUTION_PROFILE_CONFIG),TACHIKO_LOCAL_VALIDATION_CONFIG:JSON.stringify(PRODUCTION_LOCAL_VALIDATION_CONFIG),TACHIKO_HOSTED_CHECK_POLICY_CONFIG:JSON.stringify(PRODUCTION_HOSTED_CHECK_POLICY_CONFIG)};
+  assert.doesNotThrow(()=>assertProductionPolicyConfiguration(env));
+  const changed=structuredClone(PRODUCTION_EXECUTION_PROFILE_CONFIG) as unknown as {profiles:{routine:{model:string}}};changed.profiles.routine.model='gpt-6';
+  assert.throws(()=>assertProductionPolicyConfiguration({...env,TACHIKO_EXECUTION_PROFILE_CONFIG:JSON.stringify(changed)}),/revisioned policy/);
 });

@@ -1,32 +1,17 @@
 #!/bin/sh
-# Held deployment/restart helper for #104.  It owns no queue policy and never
-# starts a model during preflight.
+# Held local verification only. No installation, acceptance, active supervisor
+# restart, secret copy, state rollback, or implicit HOLD release.
 set -eu
-
-ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-. "$ROOT/scripts/issue-104-production-policy.sh"
-: "${TACHIKO_NODE_PROGRAM:?TACHIKO_NODE_PROGRAM must name the stable absolute Node runtime}"
-if [ ! -x "$TACHIKO_NODE_PROGRAM" ]; then
-  echo "TACHIKO_NODE_PROGRAM is not executable: $TACHIKO_NODE_PROGRAM" >&2
-  exit 78
-fi
-: "${TACHIKO_PNPM_PROGRAM:?TACHIKO_PNPM_PROGRAM must name the host-provisioned absolute pnpm executable}"
-case "$TACHIKO_PNPM_PROGRAM" in /*) ;; *) echo "TACHIKO_PNPM_PROGRAM must be an absolute path" >&2; exit 78 ;; esac
-if [ ! -x "$TACHIKO_PNPM_PROGRAM" ]; then echo "TACHIKO_PNPM_PROGRAM is not executable: $TACHIKO_PNPM_PROGRAM" >&2; exit 78; fi
-
-preflight() {
-  "$TACHIKO_NODE_PROGRAM" "$ROOT/node_modules/tsx/dist/cli.mjs" "$ROOT/src/cli.ts" production preflight
-}
-
+ROOT=$(CDPATH= cd -P -- "$(dirname -- "$0")/.." && pwd -P)
+# Reject lexical aliases, including a current symlink or an aliased ancestor.
+[ "$0" = "$ROOT/scripts/issue-104-deploy.sh" ] || exit 78
+case "$ROOT" in */.tachiko-conductor/releases/current) exit 78 ;; esac
+cd -P -- "$ROOT"
+: "${TACHIKO_NODE_PROGRAM:?use the accepted absolute Node runtime}"
+case "$TACHIKO_NODE_PROGRAM" in /*) ;; *) exit 78 ;; esac
+unset NODE_OPTIONS NODE_PATH LD_PRELOAD DYLD_INSERT_LIBRARIES
 case "${1:-preflight}" in
-  preflight) preflight ;;
-  restart)
-    # Hold before supervisor re-entry.  The durable hold is preserved across
-    # reboot and release is an explicit operator action after verification.
-    "$TACHIKO_NODE_PROGRAM" "$ROOT/node_modules/tsx/dist/cli.mjs" "$ROOT/src/cli.ts" dispatch maintenance hold
-    preflight
-    : "${TACHIKO_LAUNCHD_LABEL:=io.tachiko.conductor.dispatch-driver}"
-    launchctl kickstart -k "gui/$(id -u)/$TACHIKO_LAUNCHD_LABEL"
-    ;;
-  *) echo "usage: $0 [preflight|restart]" >&2; exit 64 ;;
+  preflight|held-check) exec "$TACHIKO_NODE_PROGRAM" --no-global-search-paths "$ROOT/dist/production-entry.js" production preflight ;;
+  restart) echo 'Restart requires HOLD, independent drain/quiescence proof, held release selection, then held-check. This helper does not restart a supervisor.' >&2; exit 78 ;;
+  *) echo "usage: $0 [preflight|held-check]" >&2; exit 64 ;;
 esac

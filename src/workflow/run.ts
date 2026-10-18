@@ -124,6 +124,7 @@ function lunaPacketInput(
 }
 
 export interface WorkflowDependencies {
+  readonly assertNormalInitiation?: (run:Run)=>void;
   readonly nativeMergeHost?: NativeMergeHost;
   readonly nativeLead?: NativeLeadBoundary;
   readonly store: RunStore;
@@ -143,6 +144,7 @@ export interface WorkflowDependencies {
 }
 
 export interface WorkflowOptions {
+  readonly assertNormalInitiation?: (run:Run)=>void;
   readonly admittedRun?: Run;
   /** Bounded review attempts before the loop escalates to NEEDS_HUMAN. */
   readonly maxReviewAttempts: number;
@@ -254,9 +256,17 @@ function assertCapturedRunAtBoundary(store: RunStore, expected: Run): void {
 }
 
 function establishInitialPlanningAdmission(store: RunStore, expected: Run, options: WorkflowOptions): void {
-  // Planning is read-only. Still bind its result to the exact Run captured
-  // before awaiting the adapter so a later plan cannot replace authority.
+  // A first plan may legitimately precede workspace ownership. Check the
+  // exact live lane and captured Run/configuration here; physical mutation
+  // admission follows the existing explicit/planned workspace strengthening.
   assertCapturedRunAtBoundary(store, expected);
+  try {
+    options.admissionFence?.registry.assertCurrentOwner(options.admissionFence.token);
+    options.assertNormalInitiation?.(expected);
+  } catch (cause) {
+    if (isExecutionAdmissionRefusal(cause)) throw cause;
+    throw new ExecutionAdmissionRefusal('The final planning boundary could not confirm current ownership or production authority.', false, { cause });
+  }
 }
 
 function persistPlannedBootstrap(store: RunStore, expected: Run, next: Run): void {
@@ -288,6 +298,7 @@ function assertFinalExecutionAdmission(
   try {
     assertCurrentMutationAdmission(options);
     if (checkPublication) assertPublicationAdmission(options);
+    options.assertNormalInitiation?.(expected);
   } catch (cause) {
     if (isExecutionAdmissionRefusal(cause)) throw cause;
     throw new ExecutionAdmissionRefusal('The final host boundary could not confirm current mission admission.', false, { cause });
@@ -518,7 +529,8 @@ async function validateExactHead(
   if (local === undefined) {
     onExecutionStart?.();
     beforeValidation?.();
-    local = await validation!.validate({ target, headSha: run.headSha, ...(run.bootstrap === undefined ? {} : { workspacePath: run.bootstrap.workspacePath }) });
+    local = await validation!.validate({ target, headSha: run.headSha, beforeExecution:beforeValidation, ...(run.bootstrap === undefined ? {} : { workspacePath: run.bootstrap.workspacePath }) });
+    beforeValidation?.();
   }
   return combineValidation(run.headSha, local, hostedValidation(snapshot, hostedPolicy));
 }
@@ -593,6 +605,9 @@ export async function runWorkflow(
   runId: string,
   options: WorkflowOptions,
 ): Promise<WorkflowOutcome> {
+  options={...options,assertNormalInitiation:deps.assertNormalInitiation??options.assertNormalInitiation};
+  const initiate=options.assertLeadInitiation;
+  if(initiate&&options.assertNormalInitiation)options={...options,assertLeadInitiation:async(run)=>{await initiate(run);options.assertNormalInitiation?.(run);}};
   const { store, github, implementation, reviewer } = deps;
   const now = options.now ?? (() => new Date().toISOString());
 
@@ -636,7 +651,7 @@ export async function runWorkflow(
     const snapshot=await github.readLiveSnapshot(target);
     const context={run,snapshot,store,now,assertCurrent:()=>assertPublicationAdmission(options),assertLiveClaim:options.assertReviewClaim===undefined?undefined:()=>options.assertReviewClaim!(store.read(run.id)??run),
       ...(options.admissionFence===undefined?{}:{owner:{missionId:options.admissionFence.productionMissionId,laneId:options.admissionFence.token.laneId,generation:options.admissionFence.token.generation}}),
-      withIssueBoundary:options.withMergeBoundary,assertInitiation:options.assertLeadInitiation===undefined?undefined:()=>options.assertLeadInitiation!(store.read(run.id)??run),recoveryConfiguration:options.leadRecoveryConfiguration,
+      withIssueBoundary:options.withMergeBoundary,assertInitiationCurrent:()=>options.assertNormalInitiation?.(store.read(run.id)??run),assertInitiation:options.assertLeadInitiation===undefined?undefined:()=>options.assertLeadInitiation!(store.read(run.id)??run),recoveryConfiguration:options.leadRecoveryConfiguration,
       onSubmission:(current:Run)=>{
         options.onExecutionStart?.();
         if(!unresolvedNativeLead(current))return recordSpawnTelemetry(current,{role:'reviewer',attemptKind:'review',headSha:current.headSha,contextMode:'bounded',contextJustification:'live-target-bounded'},now()).run;
@@ -889,6 +904,7 @@ export async function runWorkflow(
             assertCapturedRunAtBoundary(store, plannedFrom);
             assertPlannedBootstrapIdentity(bootstrap, bootstrapAdapter, target, authoritativeBaseBranch, authoritativeBaseSha, publicationBranch);
             const plannedRun = applyTransition(plannedFrom, { type: 'bootstrap_prepared', bootstrap }, now());
+            establishInitialPlanningAdmission(store, plannedFrom, options);
             persistPlannedBootstrap(store, plannedFrom, plannedRun);
             run = plannedRun;
             refusalRun = plannedRun;
@@ -1164,6 +1180,7 @@ export async function runWorkflow(
               [GOVERNED_PUBLICATION_REENTRY_ACTION, CANCEL_RUN_DECISION],
             );
           }
+          options.assertNormalInitiation?.(workerHandoff);
           result = await (qualifiedGovernedAgent !== undefined
             ? qualifiedGovernedAgent.run(implementationRequest)
             : implementation.run(implementationRequest));
@@ -1313,6 +1330,7 @@ export async function runWorkflow(
               options.onExecutionStart?.();
               if (!updateIfCurrent(store, run, run)) return staleWorkflowOutcome(run.id, run, store, 'Run changed before implementation publication; preserving the newer Run.');
               assertPublicationAdmission(options);
+              options.assertNormalInitiation?.(run);
               await deps.github.createImplementationPullRequest({
                 target,
                 headBranch: bootstrap.branch,
@@ -1505,7 +1523,21 @@ export async function runWorkflow(
         let postValidationSnapshot: GitHubLiveSnapshot;
         try {
           postValidationSnapshot = await github.readLiveSnapshot(target);
+          assertFinalExecutionAdmission(store, validationExpected, options, true);
         } catch (error) {
+          if (isExecutionAdmissionRefusal(error)) {
+            if (error.authorityUnknown) throw error;
+            try {
+              const compareAndSwap = store.updateIfUnchanged;
+              if (compareAndSwap === undefined) throw new Error('Strict Run compare-and-swap is unavailable during post-validation refusal reconciliation.');
+              if (!compareAndSwap.call(store, validationExpected, validationExpected) || error.runSuperseded) {
+                return staleWorkflowOutcome(run.id, validationExpected, store, 'Run changed during the post-validation admission check; preserving the newer Run.');
+              }
+              return park(validationExpected, `Post-validation evidence was refused at the current host admission boundary: ${error.message}`, store, now, [CANCEL_RUN_DECISION]);
+            } catch {
+              throw error;
+            }
+          }
           return githubFailureOutcome(run, error, store, now);
         }
         if (!updateIfCurrent(store, validationExpected, validationExpected)) return staleWorkflowOutcome(run.id, validationExpected, store, 'Run changed during the post-validation live read; preserving the newer Run.');
@@ -1634,7 +1666,7 @@ export async function runWorkflow(
             github,
             implementation,
             reviewer,
-            nativeLead: deps.nativeLead, withNativeEffectBoundary:options.withNativeEffectBoundary, withLeadBoundary: options.withMergeBoundary, assertLeadInitiation: options.assertLeadInitiation === undefined ? undefined : () => options.assertLeadInitiation!(run), leadObservationOnly: options.leadObservationOnly, leadRecoveryConfiguration:options.leadRecoveryConfiguration,
+            assertNormalInitiation:deps.assertNormalInitiation, nativeLead: deps.nativeLead, withNativeEffectBoundary:options.withNativeEffectBoundary, withLeadBoundary: options.withMergeBoundary, assertLeadInitiation: options.assertLeadInitiation === undefined ? undefined : () => options.assertLeadInitiation!(run), leadObservationOnly: options.leadObservationOnly, leadRecoveryConfiguration:options.leadRecoveryConfiguration,
             assertReviewClaim: options.assertReviewClaim,
             ...(options.admissionFence === undefined ? {} : { reviewOwner: { missionId: options.admissionFence.productionMissionId, laneId: options.admissionFence.token.laneId, generation: options.admissionFence.token.generation } }),
             bootstrap: deps.bootstrapForExecution?.(bootstrapExecution(run)) ?? deps.bootstrap,
@@ -1651,6 +1683,7 @@ export async function runWorkflow(
               strengthenAdmissionEvidence(options, reviewRun, executionWorkspace === undefined ? {} : { workspace: executionWorkspace });
               assertCurrentMutationAdmission(options);
             },
+            assertCurrentPlanning: () => options.admissionFence?.registry.assertCurrentOwner(options.admissionFence.token),
             assertCurrentMutation: () => assertCurrentMutationAdmission(options),
             assertCanPublish: () => assertPublicationAdmission(options),
           },

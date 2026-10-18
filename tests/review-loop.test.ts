@@ -29,6 +29,7 @@ import { StandaloneGitBootstrap } from '../src/workspace/standalone-git-bootstra
 import { GitWorktreeBootstrap } from '../src/workspace/git-worktree-bootstrap.js';
 import { ImplementationAgentRegistry } from '../src/agents/implementation-router.js';
 import { createGenuineLunaFixture } from './support/genuine-luna.js';
+import { awaitGateEntry, releaseAndSettle, traceCut } from './stage10-diagnostics.js';
 
 const T0 = '2026-08-14T00:00:00.000Z';
 const HEAD = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
@@ -289,7 +290,8 @@ describe('runReviewLoop', () => {
     const reviewer = new FakeReviewer([approve(HEAD)]);
     const pending = runReviewLoop({ store, github, implementation: new FakeImplementation([]), reviewer, resolveValidationAuthority: reviewAuthority }, initial.id, { maxAttempts: 3, now: () => T0 });
 
-    await entered.promise;
+    try {
+    await awaitGateEntry(entered.promise,pending,'review-snapshot-race');
     store.update(concurrent);
     resultSnapshot.resolve(snapshot(HEAD));
     const result = await pending;
@@ -297,6 +299,7 @@ describe('runReviewLoop', () => {
     assert.equal(result.outcome, 'superseded');
     assert.deepEqual(store.read(initial.id), concurrent, 'a stale snapshot result cannot overwrite the newer Run');
     assert.equal(reviewer.requests.length, 0, 'the reviewer is not invoked after its Run snapshot becomes stale');
+    } finally { await releaseAndSettle(()=>resultSnapshot.resolve(snapshot(HEAD)),pending); }
   });
 
   it('preserves a concurrent durable Run change while the reviewer is pending', async () => {
@@ -311,7 +314,8 @@ describe('runReviewLoop', () => {
     };
     const pending = runReviewLoop({ store, github: githubAdapter([HEAD, HEAD]), implementation: new FakeImplementation([]), reviewer, resolveValidationAuthority: reviewAuthority }, initial.id, { maxAttempts: 3, now: () => T0 });
 
-    await entered.promise;
+    try {
+    await awaitGateEntry(entered.promise,pending,'review-result-race');
     const current = store.read(initial.id)!;
     const concurrent = applyTransition(current, {
       type: 'escalate', reason: 'Operator cancellation during independent review',
@@ -323,6 +327,7 @@ describe('runReviewLoop', () => {
 
     assert.equal(result.outcome, 'superseded', 'a stale approval returns the explicit CAS-winner outcome');
     assert.deepEqual(store.read(initial.id), concurrent, 'review completion telemetry and verdict cannot overwrite the newer Run');
+    } finally { await releaseAndSettle(()=>reviewResult.resolve(approve(HEAD)),pending); }
   });
 
   it('does not persist stale reviewer failure telemetry over a concurrent Run change', async () => {
@@ -337,7 +342,8 @@ describe('runReviewLoop', () => {
     };
     const pending = runReviewLoop({ store, github: githubAdapter([HEAD, HEAD]), implementation: new FakeImplementation([]), reviewer, resolveValidationAuthority: reviewAuthority }, initial.id, { maxAttempts: 3, now: () => T0 });
 
-    await entered.promise;
+    try {
+    await awaitGateEntry(entered.promise,pending,'review-failure-race');
     const current = store.read(initial.id)!;
     const concurrent = applyTransition(current, {
       type: 'escalate', reason: 'Operator cancellation during failed review',
@@ -349,6 +355,7 @@ describe('runReviewLoop', () => {
 
     assert.equal(result.outcome, 'superseded');
     assert.deepEqual(store.read(initial.id), concurrent, 'failure telemetry and escalation cannot overwrite the newer Run');
+    } finally { await releaseAndSettle(()=>finish.resolve(undefined),pending); }
   });
 
   it('requires an authority resolver for direct public review-loop entry', async () => {
@@ -1137,6 +1144,7 @@ describe('runReviewLoop', () => {
           });
           registry.assertCanMutate(admitted.token);
         },
+        assertCurrentPlanning: () => registry.assertCurrentOwner(admitted.token),
         assertCurrentMutation: () => registry.assertCanMutate(admitted.token),
       }, id, { maxAttempts: 2, now: () => T0 });
 
@@ -1156,7 +1164,9 @@ describe('runReviewLoop', () => {
   for (const boundary of [
     'repair-plan-run-supersession',
     'repair-plan-admission-revocation',
+    'repair-plan-config-revocation',
     'repair-prepare-admission-revocation',
+    'repair-prepare-config-revocation',
     'repair-prepare-run-supersession',
     'repair-prepare-entry-run-supersession',
     'repair-prepare-tagged-admission-callback',
@@ -1193,8 +1203,11 @@ describe('runReviewLoop', () => {
       const store = new CasMemoryStore();
       store.create(expected);
       const originalCas = store.updateIfUnchanged.bind(store);
-      let reconciliationMode: 'available' | 'missing' | 'throws' | 'second-throws' | 'third-throws' = 'available';
+      let reconciliationMode: 'available' | 'missing' | 'throws' | 'reconcile-read-throws' | 'reconcile-write-throws' = 'available';
       let reconciliationCalls = 0;
+      let reconciliationArmed = false;
+      let ownerRefusal: unknown;
+      let configCurrent = true;
       const primaryCause = new Error('original final repair admission cause');
       const primaryRefusal = new ExecutionAdmissionRefusal('original final repair admission refusal', false, {
         cause: primaryCause, authorityUnknown: true,
@@ -1205,8 +1218,13 @@ describe('runReviewLoop', () => {
           ? undefined
           : (prior: Run, next: Run) => {
               if (reconciliationMode === 'throws') throw new Error('strict repair Run CAS unavailable');
-              if (reconciliationMode === 'second-throws' && ++reconciliationCalls === 2) throw new Error('repair refusal reconciliation CAS failed');
-              if (reconciliationMode === 'third-throws' && ++reconciliationCalls === 3) throw new Error('repair refusal reconciliation write failed');
+              // Arm only after the real owner check refuses. Earlier exact-Run
+              // checks must never be mistaken for refusal reconciliation.
+              if (reconciliationArmed) {
+                reconciliationCalls += 1;
+                if (reconciliationMode === 'reconcile-read-throws' && prior === next) throw new Error('repair refusal reconciliation CAS failed');
+                if (reconciliationMode === 'reconcile-write-throws' && prior !== next) throw new Error('repair refusal reconciliation write failed');
+              }
               return originalCas(prior, next);
             },
       });
@@ -1220,7 +1238,7 @@ describe('runReviewLoop', () => {
           // existing repair identity reach the real immutable-base fetch as
           // the first preparation effect.
           const matches = args.includes('fetch');
-          if (!blocked && file === 'git' && matches) {
+          if (!boundary.startsWith('repair-plan-') && !blocked && file === 'git' && matches) {
             blocked = true;
             entered.resolve();
             await release.promise;
@@ -1230,6 +1248,16 @@ describe('runReviewLoop', () => {
         },
       };
       const bootstrap = new StandaloneGitBootstrap({ repositoryRoot: fixture.source, workspaceRoot: fixture.workspaceRoot, runner });
+      // Plan cuts stop after the actual read-only plan, before persistence;
+      // preparation cuts stop at the actual runner's first immutable-base fetch.
+      const originalPlan = bootstrap.plan.bind(bootstrap);
+      bootstrap.plan = async (request) => {
+        const identity = await originalPlan(request);
+        if (boundary.startsWith('repair-plan-')) {
+          blocked = true; entered.resolve(); await release.promise;
+        }
+        return identity;
+      };
       const github = githubAdapter(Array.from({ length: 12 }, () => fixture.baseSha));
       const readLiveSnapshot = github.readLiveSnapshot.bind(github);
       github.readLiveSnapshot = async (target) => {
@@ -1255,9 +1283,19 @@ describe('runReviewLoop', () => {
             store.update(newerRun);
           }
         },
+        assertCurrentPlanning: () => {
+          try { registry.assertCurrentOwner(admitted.token); }
+          catch (error) {
+            ownerRefusal = error;
+            reconciliationArmed = true;
+            throw error;
+          }
+        },
+        assertNormalInitiation: () => { if (!configCurrent) throw new Error('Captured production configuration changed'); },
         assertCurrentMutation: () => registry.assertCanMutate(admitted.token),
       }, id, { maxAttempts: 2, now: () => T0 });
-      if (boundary !== 'repair-prepare-entry-run-supersession') await entered.promise;
+      try {
+      if (boundary !== 'repair-prepare-entry-run-supersession') await awaitGateEntry(entered.promise,pending,boundary);
       const atBoundary = store.read(id)!;
       if (boundary === 'repair-plan-run-supersession') {
         newerRun = { ...atBoundary, updatedAt: '2026-09-28T00:00:03.000Z' };
@@ -1268,12 +1306,14 @@ describe('runReviewLoop', () => {
       } else if (boundary === 'repair-prepare-entry-run-supersession') {
         // The actual entry callback above changes the full Run between its
         // first exact check and the final pre-prepare check.
+      } else if (boundary === 'repair-plan-config-revocation' || boundary === 'repair-prepare-config-revocation') {
+        configCurrent = false;
       } else if (boundary === 'repair-plan-cas-missing') {
         reconciliationMode = 'missing';
       } else if (boundary === 'repair-plan-cas-throws') {
         reconciliationMode = 'throws';
       } else if (boundary === 'repair-plan-reconciliation-cas-throws' || boundary === 'repair-plan-reconciliation-write-throws') {
-        reconciliationMode = boundary.endsWith('write-throws') ? 'third-throws' : 'second-throws';
+        reconciliationMode = boundary.endsWith('write-throws') ? 'reconcile-write-throws' : 'reconcile-read-throws';
         reconciliationCalls = 0;
         registry.release(admitted.token, true);
       } else if (boundary === 'repair-prepare-tagged-admission-callback') {
@@ -1300,6 +1340,10 @@ describe('runReviewLoop', () => {
             assert.match(String((error as Error).cause), /strict repair Run CAS unavailable|Strict Run compare-and-swap/);
           } else {
             assert.equal((error as { authorityUnknown?: boolean }).authorityUnknown, false);
+            assert.ok(ownerRefusal, 'the real owner read rejected before reconciliation was armed');
+            assert.strictEqual((error as Error).cause, ownerRefusal, 'reconciliation failure preserves the exact original owner-refusal cause');
+            assert.equal(reconciliationCalls, boundary.endsWith('write-throws') ? 2 : 1,
+              'only the intended reconciliation self-CAS or changed parking write reaches the fault');
             assert.match(String((error as Error).cause), /Admission generation token is stale/);
           }
           return true;
@@ -1315,16 +1359,21 @@ describe('runReviewLoop', () => {
         assert.equal(result.outcome, 'superseded');
         assert.ok(newerRun);
         assert.deepEqual(store.read(id), newerRun, 'the exact newer repair Run remains intact');
-      } else if (boundary === 'repair-plan-admission-revocation' || boundary === 'repair-prepare-admission-revocation') {
+      } else if (boundary === 'repair-plan-admission-revocation' || boundary === 'repair-prepare-admission-revocation' || boundary === 'repair-plan-config-revocation' || boundary === 'repair-prepare-config-revocation') {
         assert.ok(result);
         assert.equal(result.outcome, 'needs_human');
-        assert.match(result.reason, /current mission admission/);
+        assert.match(result.reason, boundary==='repair-prepare-config-revocation' ? /Captured production configuration changed/ : /current mission admission/);
         assert.equal(store.read(id)?.state, 'NEEDS_HUMAN');
       } else {
         assert.deepEqual(store.read(id), atBoundary, 'uncertain refusal reconciliation does not overwrite the captured Run');
       }
-      rmSync(directory, { recursive: true, force: true });
-      fixture.cleanup();
+      if (boundary.startsWith('repair-plan-')) assert.equal(store.read(id)?.bootstrap,undefined,'A revoked or superseded plan never persists workspace authority');
+      } finally {
+        await releaseAndSettle(()=>release.resolve(),pending);
+        traceCut(boundary,'cleanup','finished');
+        rmSync(directory, { recursive: true, force: true });
+        fixture.cleanup();
+      }
     });
   }
 
@@ -1501,6 +1550,7 @@ describe('runReviewLoop', () => {
           store, github, implementation: new FakeImplementation([successResult(fixture.baseSha)]), reviewer: new FakeReviewer([]),
           resolveValidationAuthority: reviewAuthority, bootstrapForExecution: () => bootstrap, resolveRepairExecutionProfile: () => luna,
           governedPublicationRequired: true,
+          assertCurrentPlanning: () => registry.assertCurrentOwner(admitted.token),
           ...(mode === 'missing-governed-callback' ? {
             assertCurrentMutation: () => registry.assertCanMutate(admitted.token),
           } : {
@@ -2545,7 +2595,8 @@ describe('runReviewLoop', () => {
       resolveValidationAuthority: reviewAuthority,
       resolveRepairExecutionProfile: () => ROUTINE_REPAIR_EXECUTION,
     }, original.id, { maxAttempts: 3, now: () => T0 });
-    await ready;
+    try {
+    await awaitGateEntry(ready,operation,'repair-execution-boundary-run-race');
     const winner = applyTransition(store.read(original.id)!, {
       type: 'escalate', reason: 'Concurrent cancellation after repair preparation',
       interrupt: { evidence: 'operator cancellation', choices: ['Cancel the run'] },
@@ -2556,6 +2607,7 @@ describe('runReviewLoop', () => {
     assert.equal(result.outcome, 'superseded');
     assert.deepEqual(store.read(original.id), winner, 'repair refusal leaves the exact concurrent Run untouched');
     assert.equal(entered, 0, 'the final synchronous boundary refuses repair provider entry after the CAS loses');
+    } finally { await releaseAndSettle(allowBoundary,operation); }
   });
 
   it('preserves unknown repair CAS and the primary admission refusal if reconciliation fails', async (t) => {

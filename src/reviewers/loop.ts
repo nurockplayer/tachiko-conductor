@@ -39,6 +39,7 @@ import { acceptedScopeFromHandoff, buildImplementationPacket, preflightImplement
 import { parkNativeReview, unresolvedNativeReview, nativeReviewWaitKind } from '../oracle/native-reviewer.js';
 
 export interface ReviewLoopDependencies {
+  readonly assertNormalInitiation?: (run:Run)=>void;
   readonly store: RunStore;
   readonly github: GitHubAdapter;
   readonly implementation: ImplementationAgent;
@@ -62,6 +63,8 @@ export interface ReviewLoopDependencies {
   readonly resolveImplementationCapabilities?: ImplementationCapabilityResolver;
   /** Provider-neutral mutation fence rechecked immediately before a repair worker starts. */
   readonly assertCanMutate?: (workspacePath?: string) => void;
+  /** Current lane ownership before workspace identity exists; never grants mutation rights. */
+  readonly assertCurrentPlanning?: () => void;
   /** Generation-only recheck after uncertainty is marked; must not strengthen evidence. */
   readonly assertCurrentMutation?: () => void;
   /** Rechecks publication authority immediately before standalone host push. */
@@ -268,13 +271,16 @@ function assertFinalRepairAdmission(run: Run, store: RunStore, assertCurrentMuta
 function establishRepairPlanningAdmission(run: Run, store: RunStore, deps: ReviewLoopDependencies): void {
   // Planning is read-only, but its eventual identity remains bound to this
   // exact Run. Production mutation admission is established after persistence.
-  assertFinalRepairAdmission(run, store);
-  if (deps.governedPublicationRequired === true &&
-      (deps.assertCanMutate === undefined || deps.assertCurrentMutation === undefined)) {
-    throw new ExecutionAdmissionRefusal('Governed repair planning is missing a host admission callback.', false, {
-      cause: new Error('Current repair planning admission callback is unavailable.'),
-    });
-  }
+  assertFinalRepairAdmission(run, store, () => {
+    if (deps.governedPublicationRequired === true &&
+        (deps.assertCanMutate === undefined || deps.assertCurrentMutation === undefined)) {
+      throw new ExecutionAdmissionRefusal('Governed repair planning is missing a host admission callback.', false, {
+        cause: new Error('Current repair planning admission callback is unavailable.'),
+      });
+    }
+    (deps.assertCurrentPlanning ?? deps.assertCurrentMutation)?.();
+    deps.assertNormalInitiation?.(run);
+  });
 }
 
 function assertRepairPlanIdentity(
@@ -319,6 +325,7 @@ function assertFinalRepairPublicationAdmission(run: Run, store: RunStore, deps: 
       throw new Error('Governed repair publication admission is unavailable.');
     }
     deps.assertCanPublish?.();
+    deps.assertNormalInitiation?.(run);
   } catch (cause) {
     if (isExecutionAdmissionRefusal(cause)) throw cause;
     throw new ExecutionAdmissionRefusal('The final repair boundary could not confirm publication admission.', false, { cause });
@@ -647,7 +654,7 @@ export async function runReviewLoop(
           if(!deps.assertLeadInitiation || !deps.withLeadBoundary || !deps.withNativeEffectBoundary) return parkRepairAuthority(run,'Native repair requires current serialized claim/owner/HOLD issue and process boundaries.',store,now);
           const leadContext = (): NativeLeadContext => ({ run, snapshot: repairSnapshot!, owner: deps.reviewOwner, execution: repairExecution!, maxAttempts, store, now,
             assertCurrent: () => deps.assertCurrentMutation?.(), assertLiveClaim: deps.assertReviewClaim === undefined ? undefined : () => deps.assertReviewClaim!(run),
-            withIssueBoundary: deps.withLeadBoundary, assertInitiation: deps.assertLeadInitiation, observationOnly: deps.leadObservationOnly, recoveryConfiguration: deps.leadRecoveryConfiguration,
+            withIssueBoundary: deps.withLeadBoundary, assertInitiationCurrent:()=>deps.assertNormalInitiation?.(run), assertInitiation:deps.assertLeadInitiation===undefined?undefined:async()=>{await deps.assertLeadInitiation!();deps.assertNormalInitiation?.(run);}, observationOnly: deps.leadObservationOnly, recoveryConfiguration: deps.leadRecoveryConfiguration,
             onSubmission: (current) => {
               options.onExecutionStart?.();const identity=activeNativeLead(current)!.identity;
               const invocationId=`spawn:lead:${identity.requestId}`;
@@ -708,7 +715,7 @@ export async function runReviewLoop(
         // An authority snapshot is useful only if it was appended against the
         // exact durable Run that was preflighted. Never invoke a worker after a
         // stale CAS, because another writer may have replaced its HEAD or PR.
-        const commit = async () => { if (nativeRepair) { const current=deps.resolveRepairExecutionProfile?.('routine'); if(!current || oracleDigest(current)!==oracleDigest(repairExecution)) throw new ExecutionAdmissionRefusal('Native repair execution authority changed at consumption CAS.',false); await deps.assertLeadInitiation?.(); await deps.assertReviewClaim?.(run); deps.assertCurrentMutation?.(); } return updateReviewRun(store,run,startedFix); };
+        const commit = async () => { if (nativeRepair) { const current=deps.resolveRepairExecutionProfile?.('routine'); if(!current || oracleDigest(current)!==oracleDigest(repairExecution)) throw new ExecutionAdmissionRefusal('Native repair execution authority changed at consumption CAS.',false); await deps.assertLeadInitiation?.(); await deps.assertReviewClaim?.(run); deps.assertCurrentMutation?.(); deps.assertNormalInitiation?.(run); } return updateReviewRun(store,run,startedFix); };
         if (!await (deps.withLeadBoundary ? deps.withLeadBoundary(commit) : commit())) {
           return supersededRepairAdmission(run.id, run, store);
         }
@@ -773,12 +780,13 @@ export async function runReviewLoop(
           establishRepairPlanningAdmission(expected, store, deps);
           const bootstrap = await repairBootstrap.plan({
             runId: run.id, target, baseBranch, baseSha, publicationBranch,
-            beforeMutation: () => assertFinalRepairAdmission(expected, store, deps.assertCurrentMutation,
-              deps.governedPublicationRequired === true),
+            beforeMutation: () => { assertFinalRepairAdmission(expected, store, deps.assertCurrentMutation,
+              deps.governedPublicationRequired === true); deps.assertNormalInitiation?.(expected); },
           });
           assertFinalRepairAdmission(expected, store);
           assertRepairPlanIdentity(bootstrap, repairBootstrap, target, baseBranch, baseSha, publicationBranch);
           const prepared = applyTransition(run, { type: 'bootstrap_prepared', bootstrap }, now());
+          establishRepairPlanningAdmission(expected, store, deps);
           persistRepairBootstrap(store, expected, prepared);
           run = prepared;
           deps.assertCanMutate?.(bootstrap.workspacePath);
@@ -805,8 +813,8 @@ export async function runReviewLoop(
           await repairBootstrap.prepare({
             runId: repairRun.id, target, baseBranch: repairIdentity.baseBranch, baseSha: repairIdentity.baseSha,
             existing: repairIdentity, recoveryAuthority: { expectedHeadSha: progressBaseSha },
-            beforeMutation: () => assertFinalRepairAdmission(repairRun, store, deps.assertCurrentMutation,
-              deps.governedPublicationRequired === true),
+            beforeMutation: () => { assertFinalRepairAdmission(repairRun, store, deps.assertCurrentMutation,
+              deps.governedPublicationRequired === true); deps.assertNormalInitiation?.(repairRun); },
           });
           workspaceGuard = repairBootstrap.guard(repairIdentity);
         } catch (error) {
@@ -962,6 +970,7 @@ export async function runReviewLoop(
       }
       let fixResult;
       try {
+        deps.assertNormalInitiation?.(workerHandoff);
         fixResult = await (governedRepairAgent ?? implementation).run({
           target, baseSha: progressBaseSha ?? '', authority: isolatedLuna ? 'embedded' : 'live-target',
           instructions: implementationPacket?.rendered ?? repairInstructions,
@@ -971,6 +980,7 @@ export async function runReviewLoop(
           ...(capabilities === undefined ? {} : { capabilities }),
           ...(repairAttempt?.snapshot.leadDisposition===undefined?{}:{withExecutionBoundary:deps.withNativeEffectBoundary}),
           beforeExecution: () => {
+            deps.assertNormalInitiation?.(workerHandoff);
             assertNativeRepairExecution(workerHandoff,deps,repairSnapshot);
             assertFinalRepairAdmission(workerHandoff, store, () => {
               if (deps.governedPublicationRequired === true && deps.assertCurrentMutation === undefined) {
@@ -980,6 +990,7 @@ export async function runReviewLoop(
             });
           },
           beforePublish: () => {
+            deps.assertNormalInitiation?.(workerHandoff);
             assertFinalRepairPublicationAdmission(workerHandoff, store, deps);
           },
           ...(repairStartsWithFreshExecutor || isolatedLuna || run.agentResult?.sessionId === undefined ? {} : { sessionId: run.agentResult.sessionId }),
@@ -1096,14 +1107,14 @@ export async function runReviewLoop(
         try {
           await repairBootstrap.verifyDurable({
             identity: run.bootstrap, expectedHeadSha: fixResult.headSha, progressBaseSha, workspaceGuard,
-            beforeMutation: () => assertFinalRepairAdmission(publicationRun, store, deps.assertCurrentMutation,
-              deps.governedPublicationRequired === true),
-            beforePublish: () => {assertNativeRepairExecution(publicationRun,deps,repairSnapshot);assertFinalRepairPublicationAdmission(publicationRun, store, deps);},
+            beforeMutation: () => {deps.assertNormalInitiation?.(publicationRun);assertFinalRepairAdmission(publicationRun, store, deps.assertCurrentMutation,
+              deps.governedPublicationRequired === true);},
+            beforePublish: () => {deps.assertNormalInitiation?.(publicationRun);assertNativeRepairExecution(publicationRun,deps,repairSnapshot);assertFinalRepairPublicationAdmission(publicationRun, store, deps);},
             ...(repairAttempt?.snapshot.leadDisposition===undefined?{}:{withPublicationBoundary:deps.withNativeEffectBoundary,recheckPublication:async()=>{
               const live=await github.readLiveSnapshot(target);await deps.assertReviewClaim?.(publicationRun);
               const packet=buildImplementationPacket(lunaRepairPacketInput(publicationRun,target,live,repairExecution,validationFailure,pendingReview));
               if(pullRequestIdentityConflict(publicationRun,live,{allowHeadAdvance:true})!==null || live.headSha!==publicationRun.headSha || packet.kind!=='packet' || oracleDigest(packet.packet)!==repairAttempt!.snapshot.packetSha256)throw new ExecutionAdmissionRefusal('Native repair live authority changed at final publication read.',false);
-              repairSnapshot=live;assertNativeRepairExecution(publicationRun,deps,live);
+              repairSnapshot=live;assertNativeRepairExecution(publicationRun,deps,live);deps.assertNormalInitiation?.(publicationRun);
             }}),
           });
         } catch (error) {
@@ -1272,7 +1283,7 @@ export async function runReviewLoop(
         run, snapshot: liveSnapshot, store, now, owner: deps.reviewOwner, recoveryConfiguration: deps.leadRecoveryConfiguration,
         ...(deps.assertReviewClaim === undefined ? {} : { assertLiveClaim: async () => await deps.assertReviewClaim!(store.read(run.id) ?? run) }),
         assertCurrent: () => deps.assertCurrentMutation?.(),
-        withIssueBoundary:deps.withLeadBoundary, assertInitiation:deps.assertLeadInitiation,
+        withIssueBoundary:deps.withLeadBoundary, assertInitiationCurrent:()=>deps.assertNormalInitiation?.(run), assertInitiation:deps.assertLeadInitiation===undefined?undefined:async()=>{await deps.assertLeadInitiation!();deps.assertNormalInitiation?.(run);},
         onSubmission: (markedRun) => {
           deps.assertCurrentMutation?.();
           options.onExecutionStart?.();

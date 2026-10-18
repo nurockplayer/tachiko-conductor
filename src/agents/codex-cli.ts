@@ -58,7 +58,12 @@ export const CODEX_ERROR_CODE = {
 export type CodexErrorCode = (typeof CODEX_ERROR_CODE)[keyof typeof CODEX_ERROR_CODE];
 
 export interface CodexCliAdapterOptions {
+  /** Explicit trusted executable; bare command remains the development default. */
+  readonly executable?: string;
   readonly runner?: ProcessRunner;
+  /** Separate selected transport for the exact post-completion HEAD read. */
+  readonly headReadRunner?: ProcessRunner;
+  readonly gitExecutable?: string;
   readonly cwd?: string;
   readonly timeoutMs?: number;
   readonly model?: string;
@@ -92,6 +97,8 @@ type ParsedCodexOutput =
 export class CodexCliAdapter implements ImplementationAgent {
   readonly kind: 'implementation-agent' = 'implementation-agent';
   private readonly runner: ProcessRunner;
+  private readonly headReadRunner: ProcessRunner;
+  private readonly gitExecutable: string;
   private readonly cwd: string;
   private readonly timeoutMs: number;
   private readonly model: string | undefined;
@@ -101,9 +108,12 @@ export class CodexCliAdapter implements ImplementationAgent {
   private readonly capabilityCatalog: ModelCapabilityCatalog;
   private readonly env: NodeJS.ProcessEnv | undefined;
   private readonly requiredConfig: readonly string[];
+  private readonly executable: string;
 
   constructor(options: CodexCliAdapterOptions = {}) {
     this.runner = options.runner ?? new NodeProcessRunner();
+    this.headReadRunner = options.headReadRunner ?? this.runner;
+    this.gitExecutable = options.gitExecutable ?? 'git';
     this.cwd = options.cwd ?? process.cwd();
     this.timeoutMs = options.timeoutMs ?? 10 * 60_000;
     this.model = options.model;
@@ -113,6 +123,7 @@ export class CodexCliAdapter implements ImplementationAgent {
     this.capabilityCatalog = options.capabilityCatalog ?? codexFallbackCapabilityCatalog();
     this.env = options.env;
     this.requiredConfig = options.requiredConfig ?? [];
+    this.executable = options.executable ?? 'codex';
   }
 
   async run(request: ImplementationRequest): Promise<AgentResult> {
@@ -152,7 +163,7 @@ export class CodexCliAdapter implements ImplementationAgent {
     let result: ProcessResult;
     try {
       result = await this.runner.run(
-        'codex',
+        this.executable,
         this.buildArgs(prompt, request.capabilities ?? [], executor, preflight.reasoningEffort),
         {...this.processOptions(request.signal, cwd, request.beforeExecution), ...(request.withExecutionBoundary===undefined?{}:{withSpawnBoundary:request.withExecutionBoundary})},
       );
@@ -294,10 +305,11 @@ export class CodexCliAdapter implements ImplementationAgent {
 
   private async readHead(signal: AbortSignal | undefined, cwd: string): Promise<string | null> {
     try {
-      const result = await this.runner.run('git', ['rev-parse', 'HEAD'], this.processOptions(signal, cwd));
+      const result = await this.headReadRunner.run(this.gitExecutable, ['rev-parse', 'HEAD'], this.processOptions(signal, cwd));
       const sha = result.stdout.trim();
       return result.exitCode === 0 && FULL_SHA.test(sha) ? sha : null;
-    } catch {
+    } catch (error) {
+      if (isExecutionAdmissionRefusal(error)) throw error;
       return null;
     }
   }

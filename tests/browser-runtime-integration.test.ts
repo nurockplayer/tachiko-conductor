@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
+import childProcess from 'node:child_process';
+import { createRequire, syncBuiltinESMExports } from 'node:module';
 import http from 'node:http';
 import net from 'node:net';
 import os from 'node:os';
@@ -19,6 +21,26 @@ import {
 import { openBrowserForBootstrap } from '../src/browser/mcp-client.js';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+
+function pinnedShutdownContract(): { pinnedVersion: boolean; watchdogFound: boolean; stdinClose: boolean; sigterm: boolean; awaitedGracefulClose: boolean } {
+  // Inspect only the selected installed library, never browser/profile data.
+  const absent = { pinnedVersion: false, watchdogFound: false, stdinClose: false, sigterm: false, awaitedGracefulClose: false };
+  try {
+    const require = createRequire(import.meta.url);
+    const mcp = createRequire(require.resolve('@playwright/mcp/package.json'));
+    const version = JSON.parse(readFileSync(mcp.resolve('playwright-core/package.json'), 'utf8')).version;
+    const bundle = mcp.resolve('playwright-core/lib/coreBundle');
+    if (statSync(bundle).size > 32 * 1024 * 1024) return absent;
+    const source = readFileSync(bundle, 'utf8');
+    const at = source.indexOf('function setupExitWatchdog(');
+    const watchdog = at < 0 ? '' : source.slice(at, at + 4_000);
+    return { pinnedVersion: version === '1.63.0-alpha-2026-08-05', watchdogFound: at >= 0,
+      stdinClose: /process\.stdin\.on\(["']close["']/.test(watchdog),
+      sigterm: /process\.on\(["']SIGTERM["']/.test(watchdog),
+      awaitedGracefulClose: /await gracefullyCloseAll\(/.test(watchdog) };
+  } catch { return absent; }
+}
+
 
 async function freePort(): Promise<number> {
   return await new Promise<number>((resolve, reject) => {
@@ -164,6 +186,46 @@ describe('managed Playwright MCP integration', () => {
     });
     let first: BrowserRuntimeHandle | undefined;
     let second: BrowserRuntimeHandle | undefined;
+    const contract = pinnedShutdownContract();
+    const lifecycle: { profileDir: string | null; signals: string[]; stdinEnded: boolean; exited: boolean; exitCode: number | null; exitSignal: string | null }[] = [];
+    const selectedCli = path.join(path.dirname(createRequire(import.meta.url).resolve('@playwright/mcp')), 'cli.js');
+    const originalSpawn = childProcess.spawn;
+    childProcess.spawn = ((...args: Parameters<typeof originalSpawn>) => {
+      const argv = Array.isArray(args[1]) ? args[1] : [];
+      const child = originalSpawn(...args);
+      if (args[0] === process.execPath && argv[0] === '--no-global-search-paths' &&
+          typeof argv[1] === 'string' && argv[1].startsWith('--title=tachiko-browser-runtime-') && argv[2] === selectedCli) {
+        const profileIndex = argv.indexOf('--user-data-dir');
+        const record = { profileDir: typeof argv[profileIndex + 1] === 'string' ? argv[profileIndex + 1] as string : null,
+          signals: [] as string[], stdinEnded: false, exited: false, exitCode: null as number | null, exitSignal: null as string | null };
+        lifecycle.push(record);
+        const kill = child.kill.bind(child);
+        child.kill = signal => { if (signal === 'SIGTERM' || signal === 'SIGKILL') record.signals.push(signal); return kill(signal); };
+        child.stdin?.once('finish', () => { record.stdinEnded = true; });
+        child.once('exit', (code, signal) => { record.exited = true; record.exitCode = code; record.exitSignal = signal; });
+      }
+      return child;
+    }) as typeof originalSpawn;
+    syncBuiltinESMExports();
+    let firstWriteSentinel = false;
+    let firstOriginMatches = false;
+    let secondOriginMatches = false;
+    let secondReadSentinel = false;
+    let stopped: Awaited<ReturnType<BrowserRuntimeHandle['stop']>> | undefined;
+    const report = (phase: 'first-written' | 'first-stopped' | 'second-read' | 'cleanup') => {
+      const owned = lifecycle[0];
+      process.stderr.write('STAGE10_BROWSER_PERSISTENCE ' + JSON.stringify({
+        phase, contract, firstWriteSentinel, firstOriginMatches, secondOriginMatches, secondReadSentinel,
+        firstProfileMatches: owned?.profileDir === path.join(root, 'profiles', 'persistent'),
+        sameProfile: lifecycle.length >= 2 ? owned?.profileDir !== null && owned?.profileDir === lifecycle[1]!.profileDir : null,
+        freshRuntime: first !== undefined && second !== undefined ? first.snapshot.runtimeId !== second.snapshot.runtimeId : null,
+        stopState: stopped?.state ?? 'not_observed', stopHealth: stopped?.health ?? 'not_observed',
+        stopExitCode: stopped?.exitCode ?? null, stopExitSignal: stopped?.exitSignal ?? null,
+        wrapperExitObserved: owned?.exited ?? false, wrapperExitCode: owned?.exitCode ?? null, wrapperExitSignal: owned?.exitSignal ?? null,
+        sigtermRequested: owned?.signals.includes('SIGTERM') ?? false, sigkillRequested: owned?.signals.includes('SIGKILL') ?? false,
+        stdinEnded: owned?.stdinEnded ?? false, browserContextClose: 'not_observed',
+      }) + '\n');
+    };
     try {
       first = await runtime.start({ profile: 'persistent', port: await freePort(), headless: true });
       assert.equal(first.snapshot.host, '127.0.0.1');
@@ -193,10 +255,16 @@ describe('managed Playwright MCP integration', () => {
           },
         });
         assert.notEqual(written.isError, true);
+        firstWriteSentinel = /state-from-first-session/.test(contentText(written));
         assert.match(contentText(written), /state-from-first-session/);
+        const origin = await client.callTool({ name: 'browser_evaluate', arguments: { function: `() => location.origin === ${JSON.stringify(new URL(fixtureUrl).origin)}` } });
+        assert.notEqual(origin.isError, true);
+        firstOriginMatches = /^### Result\s+true(?:\s|$)/m.test(contentText(origin));
+        report('first-written');
+        assert.equal(firstOriginMatches, true, 'first session uses the synthetic fixture origin');
       });
-      await first.stop();
-      first = undefined;
+      stopped = await first.stop();
+      report('first-stopped');
 
       second = await runtime.start({ profile: 'persistent', port: await freePort(), headless: true });
       await withClient(second.snapshot.endpoint, async (client) => {
@@ -207,13 +275,47 @@ describe('managed Playwright MCP integration', () => {
           arguments: { function: "() => localStorage.getItem('tachiko-persistent')" },
         });
         assert.notEqual(read.isError, true);
+        secondReadSentinel = /state-from-first-session/.test(contentText(read));
+        const origin = await client.callTool({ name: 'browser_evaluate', arguments: { function: `() => location.origin === ${JSON.stringify(new URL(fixtureUrl).origin)}` } });
+        assert.notEqual(origin.isError, true);
+        secondOriginMatches = /^### Result\s+true(?:\s|$)/m.test(contentText(origin));
+        report('second-read');
         assert.match(contentText(read), /state-from-first-session/);
+        assert.equal(secondOriginMatches, true, 'second session uses the same synthetic fixture origin');
+        assert.equal(lifecycle.length, 2, 'a fresh owned MCP child is started for each session');
+        assert.equal(lifecycle[0]!.profileDir, lifecycle[1]!.profileDir);
+        assert.notEqual(first!.snapshot.runtimeId, second!.snapshot.runtimeId);
       });
     } finally {
-      await first?.stop().catch(() => undefined);
-      await second?.stop().catch(() => undefined);
-      await new Promise<void>((resolve) => fixture.close(() => resolve()));
-      rmSync(root, { recursive: true, force: true });
+      try {
+        await first?.stop().catch(() => undefined);
+        await second?.stop().catch(() => undefined);
+        report('cleanup');
+        await new Promise<void>((resolve) => fixture.close(() => resolve()));
+        rmSync(root, { recursive: true, force: true });
+      } finally { childProcess.spawn = originalSpawn; syncBuiltinESMExports(); }
     }
+  });
+  it('refuses new browser starts while permitting exact-owned cleanup after installation authority is revoked', { timeout: 60_000 }, async () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), 'tachiko-browser-authority-integration-'));
+    const runtime = new ManagedPlaywrightMcpRuntime({
+      profileRoot: path.join(root, 'profiles'), runtimeRoot: path.join(root, 'runtimes'), repositoryRoot: REPO_ROOT,
+    });
+    let allowed = true;
+    const refusal = new Error('Controlled current installation is unavailable.');
+    const beforeStart = () => { if (!allowed) throw refusal; };
+    let handle: BrowserRuntimeHandle | undefined;
+    try {
+      handle = await runtime.start({ profile: 'owned', port: await freePort(), headless: true, beforeStart });
+      assert.equal(handle.snapshot.state, 'ready');
+      allowed = false;
+      await assert.rejects(runtime.start({ profile: 'refused', port: await freePort(), headless: true, beforeStart }), error => error === refusal);
+      assert.equal(existsSync(path.join(root, 'profiles', 'refused')), false, 'refused service start creates no profile ownership');
+      const stopped = await handle.stop();
+      assert.equal(stopped.runtimeId, handle.snapshot.runtimeId);
+      assert.equal(stopped.state, 'stopped');
+      assert.equal((await runtime.status('owned'))?.runtimeId, handle.snapshot.runtimeId);
+      assert.equal((await runtime.status('owned'))?.state, 'stopped');
+    } finally { await handle?.stop().catch(() => undefined); rmSync(root, { recursive: true, force: true }); }
   });
 });

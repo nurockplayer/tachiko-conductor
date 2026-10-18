@@ -1,3 +1,4 @@
+import { awaitGateEntry, releaseAndSettle, traceCut } from './stage10-diagnostics.js';
 import assert from 'node:assert/strict';
 import { chmodSync, existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
@@ -1551,7 +1552,8 @@ describe('bootstrap actual-spawn admission fences', () => {
         store: storeWithSwitchableCas, github: new QueueGithub(Array.from({ length: 12 }, () => live)), implementation,
         bootstrap, reviewer: new ApprovingReviewer(), validation: new PassingValidation(), hostedCheckPolicy: TEST_HOSTED_POLICY,
       }, runId, options);
-      await gate.entered;
+      try {
+      await awaitGateEntry(gate.entered,pending,`bootstrap/${boundary}`);
       const atBoundary = store.read(runId)!;
       let newerRun: Run | undefined;
       if (boundary === 'initial-worktree-add-admission-revocation') {
@@ -1622,6 +1624,8 @@ describe('bootstrap actual-spawn admission fences', () => {
         assert.ok(planned);
         assert.equal(existsSync(planned.workspacePath), false, 'the workspace is absent at the blocked worktree-add boundary');
       }
+      traceCut('bootstrap',boundary,'completed');
+      } finally { await releaseAndSettle(gate.release,pending); }
     });
   }
 
@@ -1699,7 +1703,8 @@ describe('bootstrap actual-spawn admission fences', () => {
           : {}),
       });
       const commandsBeforeFence = fixture.commands.length;
-      await gated.entered;
+      try {
+      await awaitGateEntry(gated.entered,pending,`validation/${mode}`);
       const atBoundary = store.read(runId)!;
       let newerRun: Run | undefined;
       if (mode === 'run-superseded') {
@@ -1754,6 +1759,8 @@ describe('bootstrap actual-spawn admission fences', () => {
       } else {
         assert.deepEqual(store.read(runId), atBoundary, 'failed reconciliation preserves the complete pre-effect Run value');
       }
+      traceCut('owned-validation',mode,'completed');
+      } finally { await releaseAndSettle(gated.release,pending); }
     });
   }
 });
@@ -1986,3 +1993,107 @@ for (const drift of ['head', 'number'] as const) {
     assert.equal(f.commands.slice(before).some((c) => ['reset', 'push', 'update-ref', 'merge'].includes(c.args[0]!)), false);
   });
 }
+
+describe('validation evidence authority after awaited completion', () => {
+  for (const phase of ['adapter-return', 'post-live-read'] as const) {
+    for (const mode of ['positive', 'revoked', 'superseded', 'unknown', 'reconcile-cas-missing', 'reconcile-cas-throws', 'reconcile-read-throws', 'reconcile-write-throws'] as const) {
+      it(`rechecks exact validation authority at ${phase} with ${mode}`, async () => {
+        const runId = `validation-evidence-${phase}-${mode}`;
+        let initial = applyTransition(createRun(TARGET, T0, runId), { type: 'start' }, T0);
+        initial = applyTransition(initial, { type: 'bootstrap_prepared', bootstrap: identity }, T0);
+        initial = applyTransition(initial, { type: 'agent_succeeded', headSha: OLD, pullRequest: { number: 7, headSha: OLD }, agentResult: successResult(OLD) }, T0);
+        const store = memoryStore(initial);
+        const originalCas = store.updateIfUnchanged.bind(store);
+        const originalRead = store.read.bind(store);
+        let atCut = false;
+        let refused = false;
+        let validations = 0;
+        let liveReads = 0;
+        let currentChecks = 0;
+        let newer: Run | undefined;
+        let capturedAtCut: Run | undefined;
+        const cause = new Error('Controlled current validation authority changed.');
+        const primary = new ExecutionAdmissionRefusal('Controlled validation evidence authority refused.', false, { cause, authorityUnknown: mode === 'unknown' });
+        const protectedStore = Object.create(store) as typeof store;
+        Object.defineProperty(protectedStore, 'updateIfUnchanged', { get: () => {
+          if (refused && mode === 'reconcile-cas-missing') return undefined;
+          return (expected: Run, next: Run) => {
+            if (refused && mode === 'reconcile-cas-throws') throw new Error('Controlled reconciliation CAS failure.');
+            if (refused && mode === 'reconcile-read-throws') return false;
+            if (refused && mode === 'reconcile-write-throws' && expected !== next) throw new Error('Controlled refusal-write failure.');
+            return originalCas(expected, next);
+          };
+        } });
+        Object.defineProperty(protectedStore, 'read', { get: () => refused && mode === 'reconcile-read-throws'
+          ? () => { throw new Error('Controlled reconciliation read failure.'); } : originalRead });
+        const reachCut = () => {
+          if (mode === 'positive') return;
+          atCut = true;
+          capturedAtCut = store.read(runId)!;
+          if (mode === 'superseded') {
+            newer = { ...store.read(runId)!, updatedAt: '2026-09-28T00:00:02.000Z' };
+            store.update(newer);
+          }
+        };
+        let validationReturned = false;
+        const github = new QueueGithub([]);
+        github.readLiveSnapshot = async () => {
+          liveReads += 1;
+          await Promise.resolve();
+          if (validationReturned && phase === 'post-live-read') reachCut();
+          return snapshot(OLD);
+        };
+        const validation: ValidationAdapter = {
+          kind: 'validation', configRevision: 'test-config-v1',
+          async validate(input) {
+            validations += 1;
+            input.beforeExecution?.();
+            await Promise.resolve();
+            validationReturned = true;
+            if (phase === 'adapter-return') reachCut();
+            return validationPassed(input.headSha).local;
+          },
+        };
+        const implementation = new NoopImplementation();
+        let outcome: Awaited<ReturnType<typeof runWorkflow>> | undefined;
+        let thrown: unknown;
+        try {
+          outcome = await runWorkflow({
+            store: protectedStore, github, implementation, reviewer: new ApprovingReviewer(), validation, hostedCheckPolicy: TEST_HOSTED_POLICY,
+          }, runId, { maxReviewAttempts: 1, now: () => T0, assertNormalInitiation() {
+            currentChecks += 1;
+            if (atCut && mode !== 'superseded') { refused = true; throw primary; }
+          } });
+        } catch (error) { thrown = error; }
+        const current = store.read(runId)!;
+        const validationPasses = current.history.filter(entry => entry.type === 'validation_passed').length;
+        process.stderr.write('STAGE10_VALIDATION_FENCE ' + JSON.stringify({ phase, mode, state: current.state, validationPasses, validations, liveReads, currentChecks }) + '\n');
+        assert.equal(validations, 1, 'the baseline reaches the actual asynchronous validation adapter');
+        assert.equal(implementation.requests.length, 0);
+        if (mode === 'positive') {
+          assert.equal(thrown, undefined);
+          assert.equal(validationPasses, 1, 'current authority permits the exact successful validation transition');
+          assert.ok(currentChecks > 0);
+        } else {
+          assert.equal(atCut, true);
+          assert.equal(validationPasses, 0, 'revoked or superseded authority never records validation_passed');
+          assert.equal(current.validationResult, undefined, 'newly computed successful evidence is not persisted');
+          if (mode === 'superseded') {
+            assert.equal(thrown, undefined);
+            assert.strictEqual(current, newer);
+            assert.strictEqual(outcome?.run, newer);
+          } else if (mode === 'revoked') {
+            assert.equal(thrown, undefined);
+            assert.equal(outcome?.outcome, 'needs_human');
+            assert.match(current.interrupt!.reason, /validation.*refused/i);
+          } else {
+            assert.strictEqual(thrown, primary, 'unknown/reconciliation failures preserve the exact primary refusal');
+            assert.strictEqual((thrown as Error).cause, cause);
+            assert.ok(capturedAtCut);
+            assert.strictEqual(current, capturedAtCut, 'uncertain authority cannot write a refusal or evidence after the cut');
+          }
+        }
+      });
+    }
+  }
+});

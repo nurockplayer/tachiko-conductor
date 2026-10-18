@@ -1,5 +1,7 @@
+import { awaitGateEntry, releaseAndSettle, traceCut } from './stage10-diagnostics.js';
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { installedFixture } from './production-host-fixture.js';
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { describe, it } from 'node:test';
@@ -1330,7 +1332,8 @@ describe('runWorkflow', { concurrency: false }, () => {
         };
         const operation = runWorkflow({ store, github: githubAdapter([HEAD]), implementation, reviewer: new FakeReviewer([]) }, run.id,
           { maxReviewAttempts: 2, now: () => T0 });
-        await ready;
+        try {
+        await awaitGateEntry(ready,operation,`worker/${phase}`);
         const winner = applyTransition(store.read(run.id)!, {
           type: 'escalate', reason: 'Concurrent cancellation after worker preparation',
           interrupt: { evidence: 'operator cancellation', choices: ['Cancel the run'] },
@@ -1341,6 +1344,7 @@ describe('runWorkflow', { concurrency: false }, () => {
         assert.equal(result.outcome, 'needs_human');
         assert.deepEqual(store.read(run.id), winner, 'the newer Run remains byte-for-byte authoritative');
         assert.equal(entered, 0, 'the final synchronous boundary refuses provider entry after the CAS loses');
+        } finally { await releaseAndSettle(allowBoundary,operation); }
       });
     }
   });
@@ -1483,7 +1487,8 @@ describe('runWorkflow', { concurrency: false }, () => {
     };
     const operation = runWorkflow({ store, github: githubAdapter([HEAD]), implementation, reviewer: new FakeReviewer([]) }, run.id,
       { maxReviewAttempts: 1, now: () => T0 });
-    await ready;
+    try {
+    await awaitGateEntry(ready,operation,`missing-worker-cas`);
     const handoff = store.read(run.id)!;
     allowBoundary();
     await assert.rejects(operation, (error) => {
@@ -1496,6 +1501,7 @@ describe('runWorkflow', { concurrency: false }, () => {
     });
     assert.deepEqual(store.read(run.id), handoff, 'missing CAS cannot rewrite the persisted handoff');
     assert.equal(entered, 0, 'missing strict CAS fails closed before provider entry');
+    } finally { await releaseAndSettle(allowBoundary,operation); }
   });
 
   it('keeps thrown Run-store authority errors tagged and primary when refusal reconciliation also fails', async () => {
@@ -1991,7 +1997,8 @@ describe('runWorkflow', { concurrency: false }, () => {
       run.id,
       { maxReviewAttempts: 1, now: () => T0 },
     );
-    await readEntered;
+    try {
+    await awaitGateEntry(readEntered,pending,`final-gate-live-read`);
     const concurrent = store.read(run.id)!;
     store.update(applyTransition(concurrent, { type: 'escalate', reason: 'operator cancellation won during live read' }, T0));
     finish(snapshot(HEAD));
@@ -2000,6 +2007,7 @@ describe('runWorkflow', { concurrency: false }, () => {
     assert.equal(outcome.run.state, 'NEEDS_HUMAN');
     assert.equal(store.read(run.id)?.state, 'NEEDS_HUMAN');
     assert.equal(store.read(run.id)?.history.some((entry) => entry.type === 'final_gate_verified'), false);
+    } finally { await releaseAndSettle(()=>finish(snapshot(HEAD)),pending); }
   });
 
   it('does not proceed to a worker when the Run changes during awaited bootstrap planning', async () => {
@@ -2023,7 +2031,8 @@ describe('runWorkflow', { concurrency: false }, () => {
       run.id,
       { maxReviewAttempts: 1, now: () => T0 },
     );
-    await planEntered;
+    try {
+    await awaitGateEntry(planEntered,pending,`bootstrap-plan`);
     const concurrent = store.read(run.id)!;
     store.update(applyTransition(concurrent, { type: 'escalate', reason: 'operator cancellation won during plan' }, T0));
     finish();
@@ -2033,6 +2042,7 @@ describe('runWorkflow', { concurrency: false }, () => {
     assert.equal(store.read(run.id)?.state, 'NEEDS_HUMAN');
     assert.equal(store.read(run.id)?.bootstrap, undefined);
     assert.equal(implementation.requests.length, 0);
+    } finally { await releaseAndSettle(finish,pending); }
   });
 
   it('does not proceed to a worker when the Run changes during awaited bootstrap preparation', async () => {
@@ -2056,7 +2066,8 @@ describe('runWorkflow', { concurrency: false }, () => {
       run.id,
       { maxReviewAttempts: 1, now: () => T0 },
     );
-    await prepareEntered;
+    try {
+    await awaitGateEntry(prepareEntered,pending,`bootstrap-prepare`);
     const concurrent = store.read(run.id)!;
     store.update(applyTransition(concurrent, { type: 'escalate', reason: 'operator cancellation won during prepare' }, T0));
     finish();
@@ -2065,6 +2076,7 @@ describe('runWorkflow', { concurrency: false }, () => {
     assert.equal(outcome.run.state, 'NEEDS_HUMAN');
     assert.equal(store.read(run.id)?.state, 'NEEDS_HUMAN');
     assert.equal(implementation.requests.length, 0);
+    } finally { await releaseAndSettle(finish,pending); }
   });
 
   it('does not record recovered durable output when the Run changes during awaited recovery verification', async () => {
@@ -2094,7 +2106,8 @@ describe('runWorkflow', { concurrency: false }, () => {
       run.id,
       { maxReviewAttempts: 1, now: () => T0 },
     );
-    await verifyEntered;
+    try {
+    await awaitGateEntry(verifyEntered,pending,`durable-verification`);
     const concurrent = store.read(run.id)!;
     store.update(applyTransition(concurrent, { type: 'escalate', reason: 'operator cancellation won during recovery' }, T0));
     finish();
@@ -2103,6 +2116,7 @@ describe('runWorkflow', { concurrency: false }, () => {
     assert.equal(outcome.run.state, 'NEEDS_HUMAN');
     assert.equal(store.read(run.id)?.headSha, undefined);
     assert.equal(implementation.requests.length, 0);
+    } finally { await releaseAndSettle(finish,pending); }
   });
 
   it('rechecks the exact durable Run immediately before standalone publication', async () => {
@@ -3555,5 +3569,76 @@ describe('runWorkflow', { concurrency: false }, () => {
 
     assert.equal(result.outcome, 'needs_human');
     assert.match(result.reason, /merge state is BLOCKED/);
+  });
+});
+
+
+describe('captured production normal effect fence',()=>{
+  for(const cut of ['initial-worker','resumed-worker','publication','validation'] as const)it(`removes initiation after awaited ${cut} preparation at the actual workflow callback`,async()=>{
+    traceCut('normal-effect',cut,'entered');const f=await installedFixture();try{const captured=f.resolve();const store=new MemoryStore();let run=createRun(TARGET,T0,`production-final-${cut}`);if(cut==='resumed-worker')run=applyTransition(run,{type:'start'},T0);if(cut==='validation'){run=applyTransition(run,{type:'start'},T0);run=applyTransition(run,{type:'agent_succeeded',agentResult:successResult(HEAD),headSha:HEAD,pullRequest:{number:7,headSha:HEAD}},T0);}store.create(run);let effects=0;const revoke=async()=>{await Promise.resolve();f.enable(false);};const implementation:ImplementationAgent={kind:'implementation-agent',async run(request){if(cut==='initial-worker'||cut==='resumed-worker'){await revoke();request.beforeExecution?.();effects++;}return successResult(HEAD);}};const bootstrap=new class extends FakeBootstrap{override async verifyDurable(request:VerifyDurableRequest){if(cut==='publication'){await revoke();request.beforePublish?.();effects++;}return{headSha:request.expectedHeadSha,branch:this.identity.branch};}}();const validation:ValidationAdapter={kind:'validation',configRevision:'test-config-v1',async validate(request){await revoke();request.beforeExecution?.();effects++;return validationPassed(request.headSha).local;}};const outcome=await runWorkflow({store,github:githubAdapter(cut==='publication'?[null,null,HEAD]:[HEAD]),implementation,reviewer:new FakeReviewer([]),...(cut==='publication'?{bootstrap}:{}),...(cut==='validation'?{validation,hostedCheckPolicy:TEST_HOSTED_POLICY}:{}),assertNormalInitiation:()=>captured.assertInitiation()},run.id,{maxReviewAttempts:1,now:()=>T0});assert.equal(effects,0);assert.equal(outcome.outcome,'needs_human');assert.throws(captured.assertInitiation,/latched/);}finally{f.cleanup();}
+  });
+});
+
+
+describe('captured production repair bootstrap fence',()=>{
+  for(const route of ['promotion','resume'] as const)for(const cut of ['plan-mutation','post-plan-persistence','prepare-mutation'] as const)it(`removes initiation at actual repair ${route} ${cut} after awaited authority`,async()=>{
+    traceCut('repair-effect',`${route}/${cut}`,'entered');const f=await installedFixture();
+    try {
+      const captured=f.resolve();const store=new MemoryStore();
+      const execution:ResolvedExecutionConfiguration={profile:'routine',revision:'luna-v1',executor:'luna-isolated',model:'gpt-5.6-luna',timeoutMs:60000};
+      let run=reviewingRun(store,`repair-final-${cut}`,HEAD);
+      run=applyTransition(run,{type:'changes_requested',reviewResult:requestChanges(HEAD)},T0,TEST_VALIDATION_AUTHORITY);
+      run={...run,repairTaskShapeAuthority:{revision:'task-shape-v1',shape:'bounded'},repairAdmissions:[{authorityRevision:'task-shape-v1',taskShape:'bounded',taxonomyRevision:'repair-finding-taxonomy-v1',finding:'review_blocking',headSha:HEAD,pullRequestNumber:7,executionProfile:'routine',executionRevision:execution.revision,execution,admittedAt:T0}],state:'IMPLEMENTING',history:[...run.history,{type:'start_fix',from:'CHANGES_REQUESTED',to:'IMPLEMENTING',at:T0}]};
+      if(route==='promotion')run={...run,state:'CHANGES_REQUESTED',repairAdmissions:[],history:run.history.filter(h=>h.type!=='start_fix')};
+      store.update(run);
+      const identity={bootstrapKind:'standalone-isolated' as const,owner:'acme',repo:'widgets',issueNumber:42,baseBranch:'main',baseSha:'base',branch:`tachiko/${run.id}`,publicationBranch:'existing-pr',workspacePath:`/tmp/${run.id}`};
+      let planCalls=0;let prepareCalls=0;let mutations=0;let workers=0;
+      const bootstrap:ImplementationBootstrapAdapter={kind:'implementation-bootstrap',bootstrapKind:'standalone-isolated',
+        async plan(request){planCalls++;await Promise.resolve();if(cut==='plan-mutation'||cut==='post-plan-persistence')f.enable(false);if(cut==='plan-mutation'){request.beforeMutation?.();mutations++;}return identity;},
+        async prepare(request){prepareCalls++;await Promise.resolve();f.enable(false);request.beforeMutation?.();mutations++;return identity;},
+        guard(){return{assertValid(){}};},async verifyDurable(request){return{headSha:request.expectedHeadSha,branch:identity.branch};}};
+      const github=githubAdapter([HEAD]);const read=github.readLiveSnapshot.bind(github);github.readLiveSnapshot=async target=>{const live=await read(target);return{...live,pullRequest:{...live.pullRequest!,headRef:'existing-pr',baseRef:'main',headRepository:{owner:'acme',repo:'widgets'}}};};
+      const result=await runWorkflow({store,github,implementation:{kind:'implementation-agent',async run(){workers++;return successResult(HEAD2);}},reviewer:new FakeReviewer([]),validation:new FakeValidation(),hostedCheckPolicy:TEST_HOSTED_POLICY,bootstrapForExecution:()=>bootstrap,resolveRepairExecutionProfile:()=>execution,assertNormalInitiation:()=>captured.assertInitiation()},run.id,{maxReviewAttempts:2,now:()=>T0});
+      assert.equal(result.outcome,'needs_human');assert.equal(planCalls,1);assert.equal(prepareCalls,cut==='prepare-mutation'?1:0);assert.equal(mutations,0);assert.equal(workers,0);
+      assert.equal(store.read(run.id)!.history.filter(h=>h.type==='bootstrap_prepared').length,cut==='prepare-mutation'?1:0);
+      assert.equal(store.read(run.id)!.history.filter(h=>h.type==='start_fix').length,1,'Existing repair ordinal is preserved');assert.throws(captured.assertInitiation,/latched/);
+    }finally{f.cleanup();}
+  });
+});
+
+
+describe('initial planning before physical workspace admission',()=>{
+  for(const scenario of ['explicit-workspace','planned-workspace','conflicting-plan','tagged-strengthening','prepare-revocation','prepare-after-mkdir-revocation','plan-owner-revocation','plan-normal-revocation','plan-newer-run'] as const)it(`keeps phase-appropriate initial admission and final fences at ${scenario}`,async()=>{
+    traceCut('initial-planning',scenario,'entered');const root=mkdtempSync(path.join(os.tmpdir(),'tachiko-planning-phase-'));
+    let releaseGate:()=>void=()=>{};let pending:Promise<Awaited<ReturnType<typeof runWorkflow>>>|undefined;
+    try {
+      const runId=`planning-${scenario}`;const workspace=path.join(root,'workspace');const store=new MemoryStore();store.create(createRun(TARGET,T0,runId));
+      const registry=new MissionAdmissionRegistry({filePath:path.join(root,'registry.json'),config:{schemaVersion:1,revision:'planning-phase-v1',limits:{maxCaptains:1,maxWriters:1,maxHighAutonomy:1}}});
+      const admitted=registry.admit({laneId:runId,role:'production_captain',evidence:{repository:'acme/widgets',issue:42,run:runId}});assert.equal(admitted.outcome,'admitted');if(admitted.outcome!=='admitted')return;
+      assert.equal(registry.readLane(runId)?.evidence.workspace,undefined,'The legitimate initial lane is not prefilled');
+      const primary=new ExecutionAdmissionRefusal('original planning admission refusal',false,{cause:new Error('controlled original cause'),authorityUnknown:true});
+      let strengthening=0;if(scenario==='tagged-strengthening')registry.strengthen=()=>{strengthening++;throw primary;};
+      let resolveEntered:()=>void=()=>{};const entered=new Promise<void>(r=>{resolveEntered=r;});const released=new Promise<void>(r=>{releaseGate=r;});
+      const identity={bootstrapKind:'linked-worktree' as const,owner:'acme',repo:'widgets',issueNumber:42,baseBranch:'main',baseSha:'base',branch:`tachiko/${runId}`,publicationBranch:`tachiko/${runId}`,workspacePath:scenario==='conflicting-plan'?path.join(root,'foreign-plan'):workspace};
+      let prepareCalls=0;let mutations=0;let workers=0;let normalRevoked=false;let newer:Run|undefined;
+      const bootstrap:ImplementationBootstrapAdapter={kind:'implementation-bootstrap',bootstrapKind:'linked-worktree',
+        async plan(){await Promise.resolve();if(scenario==='plan-owner-revocation')registry.release(admitted.token,true);if(scenario==='plan-normal-revocation')normalRevoked=true;if(scenario==='plan-newer-run'){newer={...store.read(runId)!,updatedAt:'2026-10-18T00:00:01.000Z'};store.update(newer);}return identity;},
+        async prepare(request){prepareCalls++;if(scenario==='prepare-after-mkdir-revocation'){request.beforeMutation?.();mkdirSync(workspace);mutations++;}if(scenario==='prepare-revocation'||scenario==='prepare-after-mkdir-revocation'){resolveEntered();await released;}request.beforeMutation?.();mutations++;return identity;},
+        guard(){return{assertValid(){}};},async verifyDurable(request){return{headSha:request.expectedHeadSha,branch:identity.branch};}};
+      const github=githubAdapter([]);github.readLiveSnapshot=async()=>({...snapshot(HEAD),pullRequest:null,headSha:null});
+      const invoke=()=>runWorkflow({store,github,bootstrap,implementation:{kind:'implementation-agent',async run(){workers++;return{exitStatus:'failure',summary:'Controlled stop after preparation',diagnostics:['TACHIKO_NEEDS_HUMAN: Controlled stop after workspace authority']};}},reviewer:new FakeReviewer([]),assertNormalInitiation:()=>{if(normalRevoked)throw new ExecutionAdmissionRefusal('Captured normal authority revoked',false);}},runId,{maxReviewAttempts:1,now:()=>T0,admissionFence:{registry,token:admitted.token,productionMissionId:admitted.missionId,...(scenario==='planned-workspace'?{}:{executionWorkspace:workspace})}});
+      if(scenario==='tagged-strengthening'){await assert.rejects(invoke(),error=>error===primary);assert.equal(strengthening,1);assert.equal(prepareCalls,0);assert.equal(registry.readLane(runId)?.evidence.workspace,undefined);return;}
+      pending=invoke();
+      if(scenario==='prepare-revocation'||scenario==='prepare-after-mkdir-revocation'){
+        await awaitGateEntry(entered,pending,`initial-planning/${scenario}`);
+        registry.release(admitted.token,true);releaseGate();
+      }
+      const result=await pending;
+      if(scenario==='explicit-workspace'||scenario==='planned-workspace'){assert.equal(prepareCalls,1);assert.equal(mutations,1);assert.equal(workers,0,'The controlled unqualified worker must remain fenced');assert.equal(result.outcome,'needs_human');if(result.outcome==='needs_human')assert.match(result.reason,/no source-qualified publication preflight/);assert.equal(registry.readLane(runId)?.evidence.workspace,workspace);}
+      else {assert.equal(workers,0);assert.equal(prepareCalls,scenario.startsWith('prepare-')?1:0);assert.equal(mutations,scenario==='prepare-after-mkdir-revocation'?1:0);assert.equal(result.outcome,'needs_human');}
+      if(scenario==='conflicting-plan'){assert.equal(registry.readLane(runId)?.evidence.workspace,workspace,'The explicit host workspace is retained before comparison');assert.notEqual(registry.readLane(runId)?.evidence.workspace,identity.workspacePath);}
+      if(scenario==='plan-owner-revocation'||scenario==='plan-normal-revocation')assert.equal(store.read(runId)!.history.some(h=>h.type==='bootstrap_prepared'),false,'No authority-bearing plan is persisted after revocation');
+      if(scenario==='plan-newer-run')assert.deepEqual(store.read(runId),newer,'The exact concurrent Run is retained');
+    }finally{releaseGate();await pending?.catch(()=>{});rmSync(root,{recursive:true,force:true});}
   });
 });
