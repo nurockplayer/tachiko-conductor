@@ -3008,13 +3008,15 @@ export async function main(argv: string[], native: CliNativeDependencies = {}): 
           publishRuntime('maintenance_hold', 'parked', nextPollAt());
           return { outcome: 'maintenance_hold' as const, reason: 'Typed restart hold prevents new dispatch admission.' };
         }
+        // Refuse ordinary initiation while still admission-locked, before advertising a running scanner.
+        // Issued observation and not-due/HOLD classifications above retain their independent paths.
+        if (production && recovering === undefined) production.assertInitiation();
         publishRuntime('scanning', 'running', nextPollAt());
         const config = recovering === undefined ? processConfig ??= resolveDispatchConfiguration(commandEnvironment) : recovering.mergeAttempt?.submissionPossible ? issuedMergeRecoveryConfiguration(recovering) : leadObservable(recovering) || leadRecoverable(recovering) ? issuedLeadRecoveryConfiguration(recovering) : issuedReviewRecoveryConfiguration(recovering);
         const recoveryDecision=recovering!==undefined && !recovering.mergeAttempt?.submissionPossible && (leadRecoverable(recovering)||reviewRecoverable(recovering));
         const transport = transportForCommand();
         const runtime = new GitHubDispatchRuntime(transport, config);
         if (production && recovering?.mergeAttempt?.submissionPossible) { production.assertRecoveryScope(recovering.target.owner, recovering.target.repo); }
-        if (production && recovering === undefined) production.assertInitiation();
         const workflow = recovering === undefined ? processWorkflow ??= makeWorkflow(store, undefined, commandEnvironment, transport) : makeWorkflow(store, undefined, recoveryDecision ? commandEnvironment : {}, transport, recovering.mergeAttempt?.submissionPossible === true);
         return await dispatchOnceCommand(config, {
           workflow,

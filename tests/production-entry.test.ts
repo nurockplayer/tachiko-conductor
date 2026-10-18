@@ -17,7 +17,7 @@ import { applyTransition } from '../src/domain/state-machine.js';
 import { DISPATCH_QUEUE_MARKER, renderDispatchRuntime, selectDispatchRuntime } from '../src/dispatch/queue.js';
 import { readRunOwnerReceipt } from '../src/mission-admission/run-owner-receipt.js';
 import { resolveRunOwnerReceiptPath } from '../src/mission-admission/host-registry.js';
-import { readOperationalRuntimeProjection } from '../src/operational/runtime-projection.js';
+import { operationalRuntimeProjectionPath, readOperationalRuntimeProjection, setMaintenanceHold } from '../src/operational/runtime-projection.js';
 import { pathToFileURL } from 'node:url';
 import { acquireDispatchInvocationLock } from '../src/dispatch/invocation-lock.js';
 import { hasAuthenticatedCompletion, type NativeCompletionHosts } from '../src/oracle/completion-proof.js';
@@ -164,6 +164,75 @@ describe('fixed production entry through real parser and canonical dispatcher',(
     const f=await installedFixture(true);const log=console.log;const output:string[]=[];console.log=(v?:unknown)=>output.push(String(v));try{let calls=0;const runner:ProcessRunner={async run(){calls++;throw new Error('Held entry must not spawn a process');}};process.env.TACHIKO_DATA_DIR='/candidate/empty';assert.equal(await f.invoke(['dispatch','maintenance','hold'],{runner}),0);writeFileSync(f.hostPath,'{malformed');writeFileSync(f.dispatchPath,'{malformed');assert.equal(await f.invoke(['dispatch','once'],{runner}),0);assert.equal(await f.invoke(['dispatch','serve','--max-cycles','1','--idle-poll-ms','1'],{runner}),0);assert.equal(calls,0);assert.equal(await f.invoke(['production','preflight'],{runner}),78);assert.ok(output.some(v=>v.includes('maintenance_hold')));assert.equal(readOperationalRuntimeProjection(path.join(f.accountRoot,'runs'))!.maintenanceHold.active,true);assert.equal(process.env.TACHIKO_DATA_DIR,undefined);}finally{console.log=log;f.cleanup();}
   });
 
+
+  it('checks ordinary initiation before scanner publication in installed once and bounded serve',async(t)=>{
+    for(const mode of ['once','serve'] as const)await t.test(mode,async()=>{
+      const f=await installedFixture(true,false,{}, {lunaHome:true});
+      const originalRead=fs.readFileSync,originalRename=fs.renameSync,log=console.log;
+      const runs=path.join(f.accountRoot,'runs'),projection=operationalRuntimeProjectionPath(runs);
+      const command=mode==='once'?['dispatch','once']:['dispatch','serve','--max-cycles','1','--idle-poll-ms','1'];
+      const publications:{stage:string;supervisor:string}[]=[];let queueReads=0,apiCalls=0;
+      const runner:ProcessRunner={async run(_file,args,options){
+        options.beforeSpawn?.();apiCalls++;
+        assert.equal(args[0],'api','Scanner must not start a model, Git, or actor capture');
+        const i=args.indexOf('--method'),method=args[i+1],endpoint=args[i+2];
+        assert.equal(method,'GET','Empty queue cannot create or change a claim');
+        let value:unknown;
+        if(endpoint==='repos/acme/widgets/issues/comments/2'){
+          queueReads++;const current=readOperationalRuntimeProjection(runs)!;
+          assert.equal(current.stage,'scanning');assert.equal(current.supervisor,'running');
+          value={id:2,body:DISPATCH_QUEUE_MARKER+'\nready:'};
+        }else if(endpoint==='repos/acme/widgets/issues/1/comments')value=[];
+        else throw new Error('Uncontrolled scanner endpoint');
+        return{exitCode:0,stdout:JSON.stringify(args.includes('--slurp')?[value]:value),stderr:''};
+      }};
+      const authority=()=>{
+        const files:string[]=[];
+        const walk=(directory:string)=>{if(!existsSync(directory))return;for(const name of readdirSync(directory).sort()){const file=path.join(directory,name);if(lstatSync(file).isDirectory())walk(file);else files.push(file);}};
+        walk(runs);walk(path.join(f.accountRoot,'mission-admission'));
+        return JSON.stringify(files.map(file=>[path.relative(f.accountRoot,file),originalRead(file,'utf8')]));
+      };
+      console.log=()=>{};
+      try{
+        // A real direct admission supplies an existing Run/owner to preserve. Its
+        // mandatory native-claim park precedes all Git/model/API effects.
+        assert.equal(await f.invoke(['run','acme/widgets#42','--execution-profile','routine','--repair-task-shape-authority','{"revision":"task-v1","shape":"bounded"}'],{runner}),0);
+        const {JsonFileStore:InstalledStore}=await import(new URL('./store/json-file-store.js',f.entryUrl).href) as typeof import('../src/store/json-file-store.js');
+        const parked=new InstalledStore({dir:runs}).list()[0]!;
+        assert.equal(parked.state,'WAITING_DEPENDENCY');assert.equal(parked.interruptedFrom,'READY');assert.equal(parked.nativeReview!.wait!.kind,'binding');assert.equal(apiCalls,0);
+        f.enable(mode==='once');setMaintenanceHold(runs,false,T0);
+        fs.renameSync=((from:fs.PathLike,to:fs.PathLike)=>{
+          if(String(to)===projection){const value=JSON.parse(originalRead(from,'utf8')) as {stage:string;supervisor:string};publications.push({stage:value.stage,supervisor:value.supervisor});}
+          return originalRename(from,to);
+        }) as typeof fs.renameSync;syncBuiltinESMExports();
+        assert.equal(await f.invoke(command,{runner}),0);
+        assert.ok(queueReads>0,'Positive must cross the actual queue-read boundary');
+        assert.ok(publications.some(p=>p.stage==='scanning'&&p.supervisor==='running'));
+        assert.notEqual(readOperationalRuntimeProjection(runs)!.supervisor,'running','Completed scanner settles truthfully');
+        assert.equal(readOperationalRuntimeProjection(runs)!.maintenanceHold.active,false);
+        const positiveCalls=apiCalls,positiveQueueReads=queueReads;
+        for(const refusal of ['initial-invalid','captured-drift'] as const){
+          f.enable(mode==='once');let captured=false;
+          if(refusal==='initial-invalid')writeFileSync(f.hostPath,'{malformed');
+          else{
+            fs.readFileSync=((file:fs.PathOrFileDescriptor,...args:unknown[])=>{
+              const value=Reflect.apply(originalRead,fs,[file,...args]);
+              if(String(file)===f.dispatchPath&&!captured){captured=true;const descriptor=JSON.parse(originalRead(f.hostPath,'utf8'));descriptor.revision='changed-after-capture';writeFileSync(f.hostPath,JSON.stringify(descriptor));}
+              return value;
+            }) as typeof fs.readFileSync;syncBuiltinESMExports();
+          }
+          const before=authority(),projectionBefore=originalRead(projection,'utf8'),publicationCount=publications.length;
+          try{await assert.rejects(f.invoke(command,{runner}),refusal==='captured-drift'?/descriptor changed/:/descriptor|host/i);}
+          finally{fs.readFileSync=originalRead;syncBuiltinESMExports();}
+          assert.equal(captured,refusal==='captured-drift');
+          assert.equal(publications.length,publicationCount,'Refusal cannot advertise a new running scanner');
+          assert.equal(originalRead(projection,'utf8')===projectionBefore,true,'Typed projection including HOLD remains unchanged');
+          assert.equal(authority()===before,true,'Run, owner, generation and canonical authority bytes remain unchanged');
+          assert.equal(apiCalls,positiveCalls);assert.equal(queueReads,positiveQueueReads);
+        }
+      }finally{fs.readFileSync=originalRead;fs.renameSync=originalRename;syncBuiltinESMExports();console.log=log;f.cleanup();}
+    });
+  });
 
   it('holds direct durable admission and native-binding resume before owner or transition changes',async(t)=>{
     for(const entry of ['issue','resume'] as const)await t.test(entry,async()=>{

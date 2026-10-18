@@ -14,6 +14,7 @@ import { JsonFileStore } from '../src/store/json-file-store.js';
 import { JsonFileOracleReceiptStore } from '../src/oracle/receipt-store.js';
 import { readNativeSourceManifest, oracleDigest } from '../src/oracle/source-evidence.js';
 import { hasAuthenticatedCompletion } from '../src/oracle/completion-proof.js';
+import { nativeReviewReentry } from '../src/oracle/native-reviewer.js';
 import { activeNativeLead, acceptedNativeLead, nativeLeadCoherent, unresolvedNativeLead, validLeadEvidence, resolveNativeLead, type NativeLeadHost, type NativeLeadEvidence, type NativeLeadObservation, issuedLeadRecoveryConfiguration, leadPayloadDigest } from '../src/oracle/native-lead.js';
 import type { NativeOracleEvidence, NativeReviewerHost } from '../src/oracle/types.js';
 import { MissionAdmissionRegistry } from '../src/mission-admission/registry.js';
@@ -407,8 +408,44 @@ describe('bounded native lead through real persistence / dispatch / isolated rep
       const f = fixture();
       try {
         f.setLeadSubmit(async () => ({ outcome: 'pending' }));
-        await f.poll();
-        const request = f.leadRequests[0]!;
+        let outcome = await f.poll();
+        const report = (phase: string) => {
+          const runs=f.store().list(),current=runs.length===1?runs[0]:undefined,reason=current?.interrupt?.reason??'';
+          const category=/Native review unavailable/i.test(reason)?'review-binding':/bootstrap|workspace/i.test(reason)?'bootstrap-workspace':/claim|owner|admission/i.test(reason)?'claim-owner-admission':/lead/i.test(reason)?'lead-wait':reason?'other':'none';
+          // Only fixed categories, public state enums and controlled counters;
+          // never serialize the Run, receipt, environment or private cause.
+          const facts={drift,phase,outcome:outcome.outcome,runCount:runs.length,state:current?.state??'absent-or-multiple',interruptedFrom:current?.interruptedFrom??null,reviewWait:current?.nativeReview?.wait?.kind??null,leadWait:current?.nativeLead?.wait?.kind??null,category,...f.counts(),requests:f.leadRequests.length,repairs:current?.repairAdmissions?.length??0,startFix:current?.history.filter(h=>h.type==='start_fix').length??0};
+          process.stderr.write('STAGE10_PENDING_LEAD '+JSON.stringify(facts)+'\n');
+          return JSON.stringify(facts);
+        };
+        let diagnostic=report('initial-poll');
+        const earlier=f.run();
+        if(f.counts().leadCalls===0&&earlier.state==='WAITING_DEPENDENCY'&&earlier.interruptedFrom==='REVIEWING'){
+          // One observation is permitted only by the existing persisted review
+          // reentry policy, at its real due time. Unsupported parks fail below.
+          const due=earlier.nativeReview?.wait?.nextAttemptAt;
+          assert.equal(typeof due,'string',diagnostic);
+          assert.ok(Number.isFinite(Date.parse(due!))&&Date.parse(due!)>=Date.parse(f.now()),diagnostic);
+          assert.equal(nativeReviewReentry(earlier,due!),true,diagnostic);
+          f.advanceTo(due!);
+          outcome=await f.poll();
+          diagnostic=report('persisted-review-due');
+        }
+        assert.equal(f.counts().leadCalls,1,diagnostic);
+        assert.equal(f.leadRequests.length,1,diagnostic);
+        const request=f.leadRequests[0];assert.ok(request,diagnostic);
+        const pending=f.run(),active=activeNativeLead(pending);
+        assert.equal(pending.state,'WAITING_DEPENDENCY',diagnostic);
+        assert.equal(pending.interruptedFrom,'CHANGES_REQUESTED',diagnostic);
+        assert.ok(active,diagnostic);assert.equal(active.status,'pending',diagnostic);
+        assert.equal(active.submissionPossible,true,diagnostic);
+        assert.equal(JSON.stringify(active.identity)===JSON.stringify(request.identity),true,diagnostic);
+        const receiptId=`${request.identity.requestId}.request`;
+        const originalReceipt=f.receipts.readLead(receiptId);assert.ok(originalReceipt,diagnostic);
+        const receiptPath=path.join(f.root,'oracle','native','lead',`${receiptId}.json`);
+        const originalBytes=readFileSync(receiptPath,'utf8');
+        assert.equal(pending.repairAdmissions?.length??0,0,diagnostic);
+        assert.equal(pending.history.filter(h=>h.type==='start_fix').length,0,diagnostic);
         f.setLeadObserve(async () => ({ outcome: 'complete', evidence: f.terminal(request) }));
         if (drift === 'head' || drift === 'base' || drift === 'scope')
           f.setLiveOverride(s => drift === 'head' ? { ...s, headSha: 'e'.repeat(40), pullRequest: { ...s.pullRequest!, headSha: 'e'.repeat(40) } } : drift === 'base' ? { ...s, pullRequest: { ...s.pullRequest!, baseSha: 'f'.repeat(40) } } : { ...s, handoff: { ...s.handoff!, sections: { scope: 'Expanded scope is not admitted' } } });
@@ -422,12 +459,22 @@ describe('bounded native lead through real persistence / dispatch / isolated rep
           assert.equal(resolveNativeLead(host).validate({ run: altered, snapshot: await f.github.readLiveSnapshot(TARGET), owner: { missionId: owner.missionId, laneId: owner.laneId, generation: owner.generation }, assertCurrent: () => { }, store: durable, now: f.now, execution: f.execution, maxAttempts: 1, onSubmission: r => r }), null);
         }
         else {
-          f.tick();
-          await f.poll(host);
-          assert.equal(f.run().repairAdmissions, undefined);
-          assert.equal(f.counts().leadCalls, 1);
+          const before=f.run(),active=activeNativeLead(before)!;
+          const waitDue=Date.parse(before.nativeLead?.wait?.nextAttemptAt??''),requestDue=Date.parse(active.nextObservationAt);
+          assert.ok(Number.isFinite(waitDue)&&Number.isFinite(requestDue),diagnostic);
+          const due=new Date(Math.max(waitDue,requestDue)).toISOString();
+          assert.ok(Date.parse(due)>=Date.parse(f.now()),diagnostic);
+          f.advanceTo(due);
+          outcome=await f.poll(host);
+          diagnostic=report('drift-observation');
         }
-        assert.ok(f.receipts.readLead(`${request.identity.requestId}.request`));
+        diagnostic=report('drift-verified');
+        assert.equal(f.run().repairAdmissions?.length??0,0,diagnostic);
+        assert.equal(f.run().history.filter(h=>h.type==='start_fix').length,0,diagnostic);
+        assert.equal(f.counts().leadCalls,1,diagnostic);
+        assert.equal(f.leadRequests.length,1,diagnostic);
+        assert.equal(readFileSync(receiptPath,'utf8')===originalBytes,true,'Original private request receipt bytes remain unchanged');
+        assert.equal(JSON.stringify(f.receipts.readLead(receiptId))===JSON.stringify(originalReceipt),true,'Original private request evidence remains unchanged');
       }
       finally {
         f.cleanup();
