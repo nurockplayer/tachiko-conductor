@@ -127,9 +127,10 @@ describe('ManagedPlaywrightMcpRuntime', () => {
         const accepted=f.resolve();assert.equal(accepted.installation,'accepted',accepted.reason);accepted.assertRecoveryScope('acme','widgets');
         const selected=f.record.environment.TACHIKO_PLAYWRIGHT_BROWSERS_PATH;
         assert.equal(accepted.environment.PLAYWRIGHT_BROWSERS_PATH,selected);
-        childProcess.spawn=((file:string,args:readonly string[],options?:import('node:child_process').SpawnOptions)=>{
-          const child=originalSpawn(file,args,options);
-          if(args.includes(path.join(f.release,'node_modules/@playwright/mcp/cli.js'))){spawns.push({file,args:[...args],selected:options?.env?.PLAYWRIGHT_BROWSERS_PATH});ownedChild=child;}
+        childProcess.spawn=((...invocation:Parameters<typeof originalSpawn>)=>{
+          const child=originalSpawn(...invocation);
+          const [file,args,options]=invocation;
+          if(Array.isArray(args)&&args.includes(path.join(f.release,'node_modules/@playwright/mcp/cli.js'))){spawns.push({file,args:[...args],selected:options?.env?.PLAYWRIGHT_BROWSERS_PATH});ownedChild=child;}
           return child;
         }) as typeof originalSpawn;syncBuiltinESMExports();
         console.error=(value?:unknown)=>{try{const parsed=JSON.parse(String(value)) as {error?:{code?:string}};errors.push(parsed.error?.code??'OTHER');}catch{errors.push('NON_JSON');}};
