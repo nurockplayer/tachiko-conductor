@@ -246,6 +246,15 @@ access can replace acceptance records or programs; in-process hashing cannot
 retroactively authenticate already executed malicious code. Activation remains
 blocked until the actual host boundary and service facts have attributable proof.
 
+Production direct issue execution and ordinary parked implementation resume also read the
+typed canonical operational projection inside the existing admission lock, before Run/owner
+admission or an execution-resuming transition. Active maintenance HOLD and unreadable or
+malformed projection state refuse new execution without changing those durable records.
+A fresh missing projection retains the existing initial-admission semantics. The same check
+runs at normal bootstrap/final worker effect callbacks after awaited authority reads.
+Original issued/cached observation, authenticated settlement and permitted cancellation or
+cleanup keep their existing routes under HOLD; healthy held preflight remains positive.
+
 Normal workflow effects carry the captured production Run fence through final review/lead
 preparation, marker and request cuts, worker/repair creation, validation probes/commands
 and governed publication. Synchronous issue checks run after the last awaited claim read.

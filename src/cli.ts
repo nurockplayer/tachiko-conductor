@@ -1660,6 +1660,13 @@ export async function runIssueCommand(
 }
 
 
+/** New execution only; observation, settlement and cancellation keep their existing routes. */
+function assertOperationalExecutionAdmission(runsDirectory: string): void {
+  const current = readOperationalRuntimeProjectionState(runsDirectory);
+  if (current.status === 'invalid') throw new ExecutionAdmissionRefusal('Operational runtime projection is unreadable or malformed; new execution is unavailable.', false);
+  if (current.status === 'valid' && current.projection.maintenanceHold.active) throw new ExecutionAdmissionRefusal('Maintenance HOLD prevents new execution admission.', false);
+}
+
 function withNativeEffectBoundary<T>(operation:()=>T):T {
   const lockPath=dispatchAdmissionLockPath();
   assertSafeAccountOwnedPath(resolveAccountHomeDirectory(),lockPath,'file');
@@ -1992,7 +1999,7 @@ export function buildWorkflowDeps(
     reviewer: resolveNativeReviewer(nativeReviewerHost),
     nativeLead: resolveNativeLead(nativeLeadHost),
     nativeMergeHost: resolveNativeMergeHost(nativeMergeHost),
-    assertNormalInitiation:production?.assertRunInitiation,
+    assertNormalInitiation:production===undefined?undefined:(run)=>{production.assertRunInitiation(run);assertOperationalExecutionAdmission(production.runsDirectory);},
     bootstrap: lazyBootstrap,
     bootstrapForExecution: (execution) => {
       if (execution?.executor !== LUNA_ISOLATED_PROVIDER) return lazyBootstrap;
@@ -3268,11 +3275,14 @@ export async function main(argv: string[], native: CliNativeDependencies = {}): 
       const run = store.read(id);
       if (run === null) throw new Error(`No run with id "${id}" found.`);
       const admissionWorkspace = persistedRunWorkspace(run);
-      if(production&&!unresolvedNativeWork(run))production.assertRunInitiation(run);
+      const attentionObservation = unresolvedNativeLead(run) || unresolvedNativeReview(run);
+      if(production&&!unresolvedNativeWork(run)){
+        if(values.decision!.trim()!==CANCEL_RUN_DECISION)assertOperationalExecutionAdmission(production.runsDirectory);
+        production.assertRunInitiation(run);
+      }
       const withLock = async <T>(operation: () => Promise<T> | T) => await withDispatchAdmissionLock(operation);
       let commitDispatchResumeTransition: WorkflowCommandOptions['commitDispatchResumeTransition'];
       let assertReviewClaim: WorkflowCommandOptions['assertReviewClaim'];
-      const attentionObservation = unresolvedNativeLead(run) || unresolvedNativeReview(run);
       const historicalGateResume = !unresolvedNativeWork(run) && settledHistoricalReviewGate(run);
       if(historicalGateResume && readOperationalRuntimeProjection(resolveRunsDir(commandEnvironment))?.maintenanceHold.active)throw new Error('Maintenance HOLD permits cached native evidence only; fresh gate scheduling must wait.');
       if (run.dispatchClaimId !== undefined) {
@@ -3353,6 +3363,7 @@ export async function main(argv: string[], native: CliNativeDependencies = {}): 
     const repairTaskShapeAuthority = values['repair-task-shape-authority'] === undefined
       ? undefined
       : parseRepairTaskShapeAuthority(values['repair-task-shape-authority']);
+    if(production&&(existing===null||!unresolvedNativeWork(existing)))assertOperationalExecutionAdmission(production.runsDirectory);
     production?.assertRunInitiation({execution:existing?.execution??execution});
     return runIssueCommand(makeWorkflow(store, resolveCapabilities, commandEnvironment, transportForCommand()), ref, {
       execution, repairTaskShapeAuthority, admission: createHostAdmissionRegistry(),

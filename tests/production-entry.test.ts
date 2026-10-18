@@ -1,9 +1,12 @@
 import assert from 'node:assert/strict';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { cpSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
+import fs, { cpSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { syncBuiltinESMExports } from 'node:module';
 import path from 'node:path';
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import { traceCut } from './stage10-diagnostics.js';
+import { NodeProcessRunner } from '../src/github/transport.js';
 import type { ProcessRunner, ProcessResult } from '../src/github/transport.js';
 import type { NativeOracleEvidence, NativeReviewerHost } from '../src/oracle/types.js';
 import { readNativeSourceManifest, oracleDigest } from '../src/oracle/source-evidence.js';
@@ -86,6 +89,50 @@ async function commandFixture(imported?: ImportedHistory) {
   } catch(error) { globalThis.Date=RealDate;try{f.cleanup();}catch{/* Preserve the original setup assertion. */}throw error; }
 }
 
+
+/** Actual installed direct admission with real private Git and a no-model concrete Luna. */
+async function directExecutionFixture() {
+  const jsonl=[{type:'thread.started',thread_id:'direct-hold-proof'},{type:'turn.started'},{type:'item.completed',item:{id:'message',type:'agent_message',text:'Controlled execution completed without a model'}},{type:'turn.completed'}].map(v=>JSON.stringify(v)).join('\n');
+  const codexRuntime="const fs=require('node:fs'),path=require('node:path');const counter=path.resolve(__dirname,'../../controlled-worker-count');fs.writeFileSync(counter,String(Number(fs.existsSync(counter)?fs.readFileSync(counter,'utf8'):'0')+1));process.stdout.write("+JSON.stringify(jsonl)+");\n";
+  const f=await installedFixture(true,false,{}, {lunaHome:true,codexRuntime});
+  try {
+    const git=(cwd:string,args:readonly string[])=>execFileSync(f.record.git.path,['-c','user.name=Controlled fixture','-c','user.email=fixture@example.invalid',...args],{cwd,encoding:'utf8',stdio:['ignore','pipe','pipe']}).trim();
+    const remote=path.join(f.accountRoot,'controlled-remote.git');git(f.objectRoot,['init','--bare',remote]);git(f.objectRoot,['init','--initial-branch','main']);
+    writeFileSync(path.join(f.objectRoot,'README.md'),'base\n');git(f.objectRoot,['add','.']);git(f.objectRoot,['commit','--quiet','-m','base']);git(f.objectRoot,['remote','add','origin','file://'+remote]);git(f.objectRoot,['push','--quiet','origin','main']);const base=git(f.objectRoot,['rev-parse','HEAD']);
+    let gitCalls=0,apiCalls=0;let onGit:((args:readonly string[])=>void)|undefined;
+    const actual=new NodeProcessRunner();
+    const runner:ProcessRunner={async run(file,args,options){
+      options.beforeSpawn?.();
+      if(args[0]!=='api'){
+        onGit?.(args);options.beforeSpawn?.();gitCalls++;
+        if(args.includes('get-url'))return{exitCode:0,stdout:'git@github.com:acme/widgets.git\n',stderr:''};
+        return actual.run(file,args,options);
+      }
+      apiCalls++;const methodIndex=args.indexOf('--method');const endpoint=args[methodIndex+2]!;let result:unknown;
+      if(endpoint==='repos/acme/widgets/issues/42')result=ORIGINAL_ISSUE;
+      else if(endpoint==='repos/acme/widgets/issues/42/comments')result=[originalHandoffComment(null)];
+      else if(endpoint==='repos/acme/widgets/issues/42/timeline')result=[];
+      else if(endpoint==='repos/acme/widgets')result={default_branch:'main'};
+      else if(endpoint==='repos/acme/widgets/commits/main')result={sha:base};
+      else throw new Error('Uncontrolled direct-entry request '+endpoint);
+      return{exitCode:0,stdout:JSON.stringify(args.includes('--slurp')?[result]:result),stderr:''};
+    }};
+    const snapshot=f.resolve(runner);assert.equal(snapshot.installation,'accepted',snapshot.reason);assert.equal(snapshot.initiationPolicy.available,true);
+    const {IsolatedLunaAdapter,hasGovernedPublicationConfinement}=await import(new URL('./agents/luna-isolated.js',f.entryUrl).href) as typeof import('../src/agents/luna-isolated.js');
+    // The internal implementation seam selects an actual concrete, original
+    // process transport, not a fake qualification flag or replacement runner.
+    const implementation=new IsolatedLunaAdapter({codexHome:snapshot.environment.TACHIKO_LUNA_CODEX_HOME!,timeoutMs:900000,path:snapshot.environment.PATH!,executable:f.record.codex.path,gitExecutable:f.record.git.path});
+    assert.equal(hasGovernedPublicationConfinement(implementation),true);
+    const {JsonFileStore:InstalledStore}=await import(new URL('./store/json-file-store.js',f.entryUrl).href) as typeof import('../src/store/json-file-store.js');
+    const runtime=await import(new URL('./operational/runtime-projection.js',f.entryUrl).href) as typeof import('../src/operational/runtime-projection.js');
+    const store=()=>new InstalledStore({dir:snapshot.runsDirectory});
+    const counter=path.join(f.accountRoot,'controlled-worker-count');
+    const workers=()=>existsSync(counter)?Number(readFileSync(counter,'utf8')):0;
+    const invoke=async(argv:string[])=>{const log=console.log;console.log=()=>{};try{return await f.invoke(argv,{runner,implementation});}finally{console.log=log;}};
+    return{...f,runner,snapshot,runtime,store,invoke,workers,stats:()=>({gitCalls,apiCalls,workers:workers()}),onGit:(hook:typeof onGit)=>{onGit=hook;}};
+  } catch(error){f.cleanup();throw error;}
+}
+
 describe('fixed production entry through real parser and canonical dispatcher',()=>{
   beforeEach(t=>traceCut(t.name,'case','entered'));
   afterEach(t=>traceCut(t.name,'case','finished'));
@@ -107,6 +154,61 @@ describe('fixed production entry through real parser and canonical dispatcher',(
   });
   it('uses the actual accepted entry for model-free held once/serve and local diagnostics',async()=>{
     const f=await installedFixture(true);const log=console.log;const output:string[]=[];console.log=(v?:unknown)=>output.push(String(v));try{let calls=0;const runner:ProcessRunner={async run(){calls++;throw new Error('Held entry must not spawn a process');}};process.env.TACHIKO_DATA_DIR='/candidate/empty';assert.equal(await f.invoke(['dispatch','maintenance','hold'],{runner}),0);writeFileSync(f.hostPath,'{malformed');writeFileSync(f.dispatchPath,'{malformed');assert.equal(await f.invoke(['dispatch','once'],{runner}),0);assert.equal(await f.invoke(['dispatch','serve','--max-cycles','1','--idle-poll-ms','1'],{runner}),0);assert.equal(calls,0);assert.equal(await f.invoke(['production','preflight'],{runner}),78);assert.ok(output.some(v=>v.includes('maintenance_hold')));assert.equal(readOperationalRuntimeProjection(path.join(f.accountRoot,'runs'))!.maintenanceHold.active,true);assert.equal(process.env.TACHIKO_DATA_DIR,undefined);}finally{console.log=log;f.cleanup();}
+  });
+
+
+  it('holds direct issue and parked implementation resume before any durable admission or execution effect',async(t)=>{
+    for(const entry of ['issue','resume'] as const)await t.test(entry,async()=>{
+      const f=await directExecutionFixture();const originalRead=fs.readFileSync;
+      const issue=['run','acme/widgets#42','--execution-profile','routine','--repair-task-shape-authority','{"revision":"task-v1","shape":"bounded"}'];
+      try{
+        f.runtime.setMaintenanceHold(f.snapshot.runsDirectory,false,T0);
+        assert.equal(await f.invoke(issue),0);assert.equal(f.workers(),1,'Inactive HOLD must reach the actual no-model worker');
+        let parked=f.store().list()[0]!;assert.equal(parked.state,'NEEDS_HUMAN');assert.equal(parked.interruptedFrom,'IMPLEMENTING');assert.ok(parked.bootstrap);assert.match(parked.interrupt!.reason,/bootstrap/i);
+        const retry=parked.interrupt!.choices!.find(choice=>choice!=='Cancel the run')!;assert.ok(retry);
+        assert.equal(await f.invoke(['run','resume',parked.id,'--decision',retry]),0);assert.equal(f.workers(),2,'The legitimate inactive-HOLD parked resume must execute');
+        parked=f.store().read(parked.id)!;assert.equal(parked.state,'NEEDS_HUMAN');assert.equal(parked.interruptedFrom,'IMPLEMENTING');
+        if(entry==='issue')assert.equal(await f.invoke(['run','resume',parked.id,'--decision','Cancel the run']),1);
+        const command=entry==='issue'?issue:['run','resume',parked.id,'--decision',retry];
+        const projection=f.runtime.operationalRuntimeProjectionPath(f.snapshot.runsDirectory);
+        const durable=()=>{
+          const result:Record<string,string>={};
+          const walk=(directory:string)=>{if(!existsSync(directory))return;for(const name of readdirSync(directory).sort()){const file=path.join(directory,name);const stat=lstatSync(file);if(stat.isDirectory())walk(file);else{assert.equal(stat.isFile(),true);result[path.relative(f.accountRoot,file)]=createHash('sha256').update(Reflect.apply(originalRead,fs,[file])).digest('hex');}}};
+          for(const directory of [f.snapshot.runsDirectory,path.join(f.accountRoot,'mission-admission'),path.join(f.accountRoot,'workspaces'),f.objectRoot])walk(directory);
+          return result;
+        };
+        for(const cut of ['hold','malformed','unreadable'] as const){
+          f.runtime.setMaintenanceHold(f.snapshot.runsDirectory,cut==='hold',T0);
+          if(cut==='malformed')writeFileSync(projection,'{broken');
+          const before=durable(),effects=f.stats();
+          if(cut==='unreadable'){Object.defineProperty(fs,'readFileSync',{value:(...args:unknown[])=>{if(args[0]===projection)throw new Error('Controlled projection read refusal');return Reflect.apply(originalRead,fs,args);}});syncBuiltinESMExports();}
+          try{
+            await assert.rejects(()=>f.invoke(command),error=>{assert.equal((error as {code?:string}).code,'EXECUTION_ADMISSION_REFUSED');assert.match(String(error),cut==='hold'?/Maintenance HOLD/:/unreadable or malformed/);return true;});
+          }finally{Object.defineProperty(fs,'readFileSync',{value:originalRead});syncBuiltinESMExports();}
+          assert.deepEqual(f.stats(),effects,'No Git, API, model or worker effect after '+cut);
+          assert.deepEqual(durable(),before,'Run/history, owner receipt, registry generations, workspace and object bytes unchanged at '+cut);
+          if(cut==='hold')assert.equal(f.runtime.readOperationalRuntimeProjection(f.snapshot.runsDirectory)!.maintenanceHold.active,true);
+        }
+        // Cancellation is a bounded non-executing decision and remains usable under HOLD.
+        f.runtime.setMaintenanceHold(f.snapshot.runsDirectory,true,T0);
+        if(entry==='resume'){const before=f.stats();assert.equal(await f.invoke(['run','resume',parked.id,'--decision','Cancel the run']),1);assert.equal(f.store().read(parked.id)!.state,'FAILED');assert.deepEqual(f.stats(),before);}
+        assert.equal(f.runtime.readOperationalRuntimeProjection(f.snapshot.runsDirectory)!.maintenanceHold.active,true);
+      }finally{Object.defineProperty(fs,'readFileSync',{value:originalRead});syncBuiltinESMExports();f.cleanup();}
+    });
+  });
+
+  it('rechecks operational HOLD at the normal bootstrap mutation callback after direct resume admission',async()=>{
+    const f=await directExecutionFixture();try{
+      f.runtime.setMaintenanceHold(f.snapshot.runsDirectory,false,T0);
+      const args=['run','acme/widgets#42','--execution-profile','routine','--repair-task-shape-authority','{"revision":"task-v1","shape":"bounded"}'];
+      assert.equal(await f.invoke(args),0);assert.equal(f.workers(),1);
+      const parked=f.store().list()[0]!;assert.equal(parked.interruptedFrom,'IMPLEMENTING');const retry=parked.interrupt!.choices!.find(choice=>choice!=='Cancel the run')!;assert.ok(retry);
+      let tripped=false,fetches=0;
+      f.onGit(args=>{if(args.includes('get-url')&&!tripped){tripped=true;f.runtime.setMaintenanceHold(f.snapshot.runsDirectory,true,T0);}if(args.includes('fetch'))fetches++;});
+      assert.equal(await f.invoke(['run','resume',parked.id,'--decision',retry]),0);
+      assert.equal(tripped,true);assert.equal(fetches,0,'No immutable-base fetch after the awaited authority cut activates HOLD');assert.equal(f.workers(),1);
+      const after=f.store().read(parked.id)!;assert.equal(after.state,'NEEDS_HUMAN');assert.match(after.interrupt!.reason,/Maintenance HOLD/);assert.equal(f.runtime.readOperationalRuntimeProjection(f.snapshot.runsDirectory)!.maintenanceHold.active,true);
+    }finally{f.cleanup();}
   });
 
   it('reports installed actor binding as not probed without an authentication or user request',async()=>{
