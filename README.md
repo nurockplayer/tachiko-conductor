@@ -81,8 +81,15 @@ an unreviewed SHA.
 pnpm install
 pnpm test        # deterministic unit and contract suite (node:test + tsx)
 pnpm typecheck   # type-check src and tests
-pnpm build       # emit dist/ for the `tachiko` bin
+pnpm build       # compile dist/; does not install or accept a release
 ```
+
+These are checkout/development commands. The `tachiko` package bin selects the
+fixed `dist/production-entry.js`, which requires a separately provisioned,
+accepted physical release and pinned runtime; an ordinary built checkout is
+intentionally unavailable for installed production execution. Build output alone
+never accepts or activates a release. See the [accepted-release host guide](docs/accepted-release-host.md)
+for the protected layout, runtime/manifest prerequisites and held verification.
 
 ## Test tiers
 
@@ -107,6 +114,15 @@ pnpm test:smoke:browser-agent
 
 ## CLI
 
+The following forms invoke the development/internal CLI directly; after a build,
+`node dist/cli.js` is its compiled equivalent. They construct no accepted native
+authority; existing profile, claim, ownership and execution gates still apply.
+These forms grant no authority to bypass installed production policy or HOLD. New runs
+also require explicit revisioned task-shape authority via
+`--repair-task-shape-authority '<strict-json>'` and the required profile/configuration.
+The broader adapter examples below are development/internal interfaces; accepted
+production retains the exact #104 routine-only policy.
+
 ```bash
 pnpm exec tsx src/cli.ts run owner/repo#123 --execution-profile standard
 pnpm exec tsx src/cli.ts run resume <id> --decision <choice>
@@ -130,9 +146,12 @@ pnpm exec tsx src/cli.ts run owner/repo#123 --browser-profile github-work --exec
 validation, independent review, and the final gate. It stops at `MERGE_READY`,
 `FAILED`, or a structured `NEEDS_HUMAN` interrupt (reason, evidence, bounded
 choices); resume a parked run with `run resume <id> --decision <choice>`.
-When choices are present, the decision must match one exactly. `Cancel the
-run` transitions to `FAILED`; adopting a drifted live HEAD always returns to
-independent review before the final gate.
+When choices are present, the decision must match one exactly. `Cancel the run`
+transitions to `FAILED` only when that choice is actually offered by the canonical
+interruption and existing ownership/uncertain-submission checks permit it. With
+absent or empty choices, the same text remains ordinary resume admission and is
+blocked by production maintenance HOLD. Adopting a drifted live HEAD always
+returns to independent review before the final gate.
 
 ## Queue dispatch (v0)
 
@@ -237,35 +256,39 @@ may alias those canonical physical paths; divergent values fail closed. A
 malformed or live lock fails closed; a lock for a provably absent PID is
 retried once.
 
-For macOS, use `launchd` to supervise the continuous driver. First create a
-private, absolute-path wrapper that supplies the explicitly selected dispatch,
-execution, validation, and hosted-check configurations, then ends with:
+For a separately qualified macOS installation, the renderer must select the exact
+existing physical accepted release's `scripts/dispatch-driver.sh` and that same
+release as WorkingDirectory. An arbitrary wrapper, checkout cwd or mutable
+`current`/symlink alias is refused. The fixed driver invokes the compiled production
+entry with the accepted Node runtime; current authority comes from protected
+records, not interactive shell exports.
 
-```sh
-exec /absolute/path/to/tachiko dispatch serve
-```
-
-Do not put credentials in the generated plist. The generated supervisor starts
-the wrapper on load and restarts it if it exits; it contains no queue,
-execution, or provider credentials and is not a calendar wake:
+The development/internal renderer can produce a plist for that existing release
+without installing or loading it. Substitute qualified absolute runtime/artifact
+paths and an actual release ID; the account's protected dispatch log directory
+must already exist outside immutable releases:
 
 ```bash
+RELEASE='/physical/account/home/.tachiko-conductor/releases/<releaseId>'
 pnpm exec tsx src/cli.ts dispatch launchd render \
-  --program '/absolute/path/to/run-dispatch-driver.sh' \
-  --node-program '/stable/absolute/path/to/node' \
-  --pnpm-program '/stable/absolute/path/to/pnpm' \
-  --git-program '/stable/absolute/path/to/git' \
+  --program "$RELEASE/scripts/dispatch-driver.sh" \
+  --node-program '/accepted/absolute/path/to/node' \
+  --pnpm-program '/accepted/absolute/path/to/pnpm' \
+  --git-program '/accepted/absolute/path/to/git' \
   --dependency-artifact-path '/absolute/path/to/lockfile-bound-pnpm-artifact' \
   --luna-codex-home '/absolute/path/to/luna-codex-home' \
   --playwright-browsers-path '/absolute/path/to/playwright-artifacts' \
-  --working-directory "$PWD" \
-  > "$HOME/Library/LaunchAgents/io.tachiko.conductor.dispatch-driver.plist"
-launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/io.tachiko.conductor.dispatch-driver.plist"
+  --working-directory "$RELEASE" \
+  > '/physical/account/home/dispatch-driver.plist'
 ```
 
-Remove it with `launchctl bootout "gui/$(id -u)" <plist-path>` before deleting
-the plist. Restart/re-entry remains correct because each reconciliation first
-adopts the exact durable claim/run or fails closed. No launchd installation or
+Do not put credentials in the plist. Its RunAtLoad/KeepAlive settings describe
+supervision after a separately authorized installation; rendering does not accept
+a release or activate launchd. Host qualification, loading/restarting the supervisor
+and any HOLD release are separate operator actions under the
+[accepted-release procedure](docs/accepted-release-host.md#held-verification-and-launcher).
+Use the existing `launchctl bootout` procedure before removing a loaded plist.
+Re-entry still requires exact durable claim/Run/owner proof. No actual launchd or
 real GitHub/Codex invocation occurs in CI. An opt-in local smoke requires a
 disposable control Issue and all normal
 explicit configuration, then uses:
@@ -488,20 +511,36 @@ fallback routes.
 
 The repository pins Node.js **24.21.0 LTS (Krypton)** in `.node-version` and supports the current Node 24 LTS line from 24.21.0 onward. Production preflight rejects older Node releases and non-24 majors.
 
-From a stable merged checkout, set `TACHIKO_NODE_PROGRAM`,
-`TACHIKO_PNPM_PROGRAM`, and `TACHIKO_GIT_PROGRAM` to the host-provisioned absolute Node, pnpm, and Git paths.
+For held verification, first select a separately provisioned accepted physical
+release with matching protected records, immutable runtime/dependency identities,
+qualified Luna configuration and an already active canonical maintenance HOLD.
+Independent drain/quiescence and host qualification remain separate prerequisites.
+The accepted record pins the host's absolute Node, pnpm and Git programs;
+interactive exports or a merged checkout do not grant that acceptance.
 Git must use the qualified Apple Command Line Tools runtime: its credential-free
 `--exec-path` probe must resolve exactly to `/Library/Developer/CommandLineTools/usr/libexec/git-core`.
 Direct CLT Git, `/usr/bin/git` selecting CLT, and wrappers selecting that same runtime are supported;
 Homebrew Git and other installations are rejected before production activation because their runtime dependencies are not qualified for this sandbox.
-Set `TACHIKO_PNPM_DEPENDENCY_ARTIFACT` to a private host-created directory
-containing `store/` and `pnpm-lock.yaml.sha256` (the SHA-256 of the candidate
-lockfile),
-then run `scripts/issue-104-deploy.sh preflight`. This reads local policy
-and the qualified Luna config and probes Git without credentials; it makes no GitHub request, pnpm install, or model turn. The
+The accepted `TACHIKO_PNPM_DEPENDENCY_ARTIFACT` must name a private host-created
+directory containing `store/` and `pnpm-lock.yaml.sha256` (the SHA-256 of the
+candidate lockfile);
+then invoke that selected release's helper by its absolute physical path, using
+its accepted Node program (no checkout-relative path or `current` alias):
+
+```bash
+TACHIKO_NODE_PROGRAM='/accepted/absolute/path/to/node' \
+  '/physical/account/home/.tachiko-conductor/releases/<releaseId>/scripts/issue-104-deploy.sh' preflight
+```
+
+`held-check` is the equivalent verification action. The helper changes cwd to its
+physical release and invokes the same fixed production entry. Preflight reads
+local accepted policy/artifacts and qualified Luna config, checks current initiation
+and typed HOLD, and probes the runtime without credentials; it makes no GitHub
+request, pnpm install or model turn. It neither creates HOLD nor proves independent
+quiescence or native acceptance. The
 offline hydration is host-owned and allows exactly `node_modules` and
 `apps/control-tower/node_modules` as dependency roots.
-production validator executes pnpm only by that explicit path, under macOS
+The production validator executes pnpm only by that explicit path, under macOS
 `sandbox-exec` with IP networking and default filesystem access denied. A fresh
 private copy of the lockfile-bound store permits pnpm's project metadata writes;
 the host artifact remains read-only and hydration is offline. Fixed macOS
@@ -510,9 +549,11 @@ root are admitted; host homes and sockets remain outside the boundary. Git
 uses the explicit configured executable, validation temp files stay under the
 private runtime root, and only the final build may create the configured
 non-authoritative `dist/` output. A missing, dirty, or
-lockfile-mismatched artifact makes validation unknown. `scripts/issue-104-deploy.sh restart` first persists the existing
-maintenance hold, preflights, and then restarts launchd; leave the hold in
-place until an operator explicitly verifies and releases it.
+lockfile-mismatched artifact makes validation unknown. The helper's `restart`
+action explicitly refuses with exit78; it does not install/accept a release,
+persist HOLD, restart/kickstart launchd or release HOLD. Restart/activation requires
+the separately authorized held-release procedure and independent quiescence proof;
+retain HOLD until the operator completes the required verification and release.
 
 The sandbox's fixed ancestor directory reads cover the canonical `/private/tmp`
 qualification route: read-only opens and entry names at `/private` and
@@ -697,7 +738,8 @@ pnpm exec tsx src/cli.ts run owner/repo#123 --execution-profile standard
 ```
 
 The adapter accepts resolved execution values without choosing a model or
-profile. The profile configuration above is the production path for new runs.
+profile. The profile configuration above describes the development/internal routing
+interface for new runs; accepted production keeps the exact #104 routine-only policy.
 The following direct Codex environment values remain available for legacy
 persisted runs that have no profile snapshot:
 
@@ -722,9 +764,17 @@ the injected browser capability. It is also skipped in the default suite:
 pnpm test:smoke:browser-agent
 ```
 
-After `pnpm build`, the same commands work through the `tachiko` bin
-(`node dist/cli.js`). Run state is stored under `$TACHIKO_DATA_DIR` (default
-`~/.tachiko-conductor/runs`), one `<id>.json` file per run.
+After `pnpm build`, `node dist/cli.js` exposes the same development/internal CLI
+forms and their existing gates. It is distinct from the package bin's fixed
+`dist/production-entry.js`; neither a build nor direct internal invocation creates
+accepted native authority.
+
+Development/internal Run state uses `$TACHIKO_DATA_DIR` (default
+`~/.tachiko-conductor/runs`), one `<id>.json` file per Run. Installed production
+instead selects the protected canonical runs directory under the physical OS
+account home; candidate HOME/data-directory overrides cannot redirect it. The
+persistence paths below use that canonical directory for installed production.
+See [accepted-release host setup and limits](docs/accepted-release-host.md).
 
 ## Persistence
 
