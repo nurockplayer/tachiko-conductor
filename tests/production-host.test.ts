@@ -84,7 +84,7 @@ describe('accepted production tool closure and placement',()=>{
         assert.equal(s.installation,'accepted',s.reason);
         runtime.setMaintenanceHold(s.runsDirectory,true,'2026-10-18T00:00:00.000Z');
         let nodeProbes=0,gitProbes=0;
-        const probe=(afterGit?:()=>void)=>(env:NodeJS.ProcessEnv)=>policy.preflightProductionPolicy(env,(program)=>{
+        const probe=(afterGit?:()=>void)=>(env:NodeJS.ProcessEnv=s.environment)=>policy.preflightProductionPolicy(env,(program)=>{
           gitProbes++;assert.equal(program,f.record.git.path);afterGit?.();return true;
         },(program)=>{nodeProbes++;assert.equal(program,f.record.node.path);return true;});
         const baseline=cli.productionPreflightReport(s.environment,s,probe());
