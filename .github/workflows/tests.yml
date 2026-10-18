@@ -45,9 +45,6 @@ jobs:
       - name: Install lockfile Playwright Chromium and system dependencies
         run: pnpm exec playwright install --with-deps chromium
 
-      - name: Diagnose production tools, repair planning and held preflight
-        run: timeout --signal=TERM --kill-after=5s 890s /bin/sh -c 'pnpm typecheck && pnpm test:stage10-diagnostic'
-
       - name: Run unit and contract tests
         run: pnpm test
 

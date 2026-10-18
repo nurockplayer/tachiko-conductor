@@ -11,14 +11,12 @@ GitHub actor qualification, Oracle/Sol service contract, launchd/reboot proof,
 runtime activation, or native delivery. V1 remains unaccepted, with 0/3 native
 deliveries. #101 remains empty/HOLD and #115 unloaded/HOLD. Held PR93 remains held.
 
-The current H1/H2/I1 author-validation checkpoint first runs the existing
-typecheck, then the retained diagnostic script on Ubuntu CI with fixed affected
-files/titles and builtin immediate TAP. Both commands share the existing outer
-890-second timeout plus 5-second kill grace; the diagnostic child retains its
-880-second limit and can be stopped earlier by the shared outer deadline. This
-is not normal acceptance. After affected proof, remove only that temporary
-workflow step for the final ordinary candidate. All ordinary test/browser/type/
-build commands and the 30-minute job budget remain unchanged.
+The H1/H2/I1 author-validation checkpoint used a temporary Ubuntu step running
+the existing typecheck, then the retained diagnostic with fixed files/titles and
+builtin TAP, under a shared 890-second bound plus 5-second kill grace. This
+ordinary candidate omits that temporary step. The optional retained diagnostic
+still has its 880-second child limit; it is not normal acceptance. All full
+ordinary test/browser/type/build commands and the 30-minute job budget remain.
 
 ## Fixed local layout
 
@@ -249,7 +247,7 @@ A first bootstrap plan may precede physical workspace admission. The planning fe
 
 The launchd renderer requires an existing physical accepted release (driver, compiled entry and record), rejects lexical/symlink aliases including `current`, and requires WorkingDirectory to equal that selected physical release. The driver and held helper likewise reject alias spellings and explicitly change to their physical release before invoking the compiled entry. Log parents must already exist with safe physical ancestry; existing log files must be regular, account-owned, unaliased and not writable by others. Both explicit and default logs remain outside immutable releases. These are rendering/startup checks under the existing protected-host assumption, not an executed macOS supervisor/reboot or unrestricted same-owner compromise guarantee.
 
-`pnpm test:stage10-diagnostic` is an additional fixed focused selection using the existing Node/tsx route and built-in TAP reporter. The current author-validation workflow includes the temporary focused step and shared typecheck bound described above. The final ordinary candidate must remove only that step; every full ordinary unit/browser/typecheck/root/Tower command remains. Case/cut traces contain only literal labels, counters and booleans. A diagnostic checkpoint or partial result is not normal-tier acceptance. Deferred gate tests race both early workflow outcomes and release/await settlement in finally before cleanup.
+`pnpm test:stage10-diagnostic` is an additional fixed focused selection using the existing Node/tsx route and built-in TAP reporter. The ordinary Ubuntu Tests workflow does not run that utility; the temporary author-validation step has been removed. Every full ordinary unit/browser/typecheck/root/Tower command remains. Case/cut traces contain only literal labels, counters and booleans. A diagnostic checkpoint or partial result is not normal-tier acceptance. Deferred gate tests race both early workflow outcomes and release/await settlement in finally before cleanup.
 
 The actual accepted runtime uses the existing supported Node predicate (`>=24.21.0 <25`) while its executable path and bytes remain exactly accepted. Simulated process.version tests exercise this boundary; a different actual binary still requires a different accepted identity. Accepted actor IDs must already be canonical positive safe-integer decimal strings before merge authority or configured preflight status is exposed; this local validation performs no actor/auth probe.
 
