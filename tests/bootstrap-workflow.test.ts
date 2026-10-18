@@ -1,3 +1,4 @@
+import { awaitGateEntry, releaseAndSettle, traceCut } from './stage10-diagnostics.js';
 import assert from 'node:assert/strict';
 import { chmodSync, existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
@@ -1551,11 +1552,8 @@ describe('bootstrap actual-spawn admission fences', () => {
         store: storeWithSwitchableCas, github: new QueueGithub(Array.from({ length: 12 }, () => live)), implementation,
         bootstrap, reviewer: new ApprovingReviewer(), validation: new PassingValidation(), hostedCheckPolicy: TEST_HOSTED_POLICY,
       }, runId, options);
-      const reachedPreparationGate = await Promise.race([
-        gate.entered.then(() => true),
-        pending.then(() => false),
-      ]);
-      assert.equal(reachedPreparationGate, true, 'The workflow must reach the intended real Git gate instead of returning early.');
+      try {
+      await awaitGateEntry(gate.entered,pending,`bootstrap/${boundary}`);
       const atBoundary = store.read(runId)!;
       let newerRun: Run | undefined;
       if (boundary === 'initial-worktree-add-admission-revocation') {
@@ -1626,6 +1624,8 @@ describe('bootstrap actual-spawn admission fences', () => {
         assert.ok(planned);
         assert.equal(existsSync(planned.workspacePath), false, 'the workspace is absent at the blocked worktree-add boundary');
       }
+      traceCut('bootstrap',boundary,'completed');
+      } finally { await releaseAndSettle(gate.release,pending); }
     });
   }
 
@@ -1703,7 +1703,8 @@ describe('bootstrap actual-spawn admission fences', () => {
           : {}),
       });
       const commandsBeforeFence = fixture.commands.length;
-      await gated.entered;
+      try {
+      await awaitGateEntry(gated.entered,pending,`validation/${mode}`);
       const atBoundary = store.read(runId)!;
       let newerRun: Run | undefined;
       if (mode === 'run-superseded') {
@@ -1758,6 +1759,8 @@ describe('bootstrap actual-spawn admission fences', () => {
       } else {
         assert.deepEqual(store.read(runId), atBoundary, 'failed reconciliation preserves the complete pre-effect Run value');
       }
+      traceCut('owned-validation',mode,'completed');
+      } finally { await releaseAndSettle(gated.release,pending); }
     });
   }
 });

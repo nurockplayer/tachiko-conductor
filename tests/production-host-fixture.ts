@@ -53,6 +53,8 @@ export async function installedFixture(fullCli = false, compiled = false, enviro
   mkdirSync(release,{recursive:true});
   if(compiled){const config=ts.readConfigFile(path.resolve('tsconfig.json'),ts.sys.readFile);const parsed=ts.parseJsonConfigFileContent(config.config,ts.sys,process.cwd(),{outDir:path.join(release,'dist')});const program=ts.createProgram(parsed.fileNames,parsed.options);const result=program.emit();if(result.emitSkipped || ts.getPreEmitDiagnostics(program).length)throw new Error('Actual production TypeScript compilation failed.');}
   else emitSources(path.resolve('src'),path.join(release,'dist'));
+  mkdirSync(path.join(release,'scripts'));
+  for(const script of ['dispatch-driver.sh','issue-104-deploy.sh'])copyFileSync(path.resolve('scripts',script),path.join(release,'scripts',script));
   writeFileSync(path.join(release,'package.json'),JSON.stringify({type:'module',bin:{tachiko:'dist/production-entry.js'}}));
   copyDependency('@modelcontextprotocol/sdk',process.cwd(),path.join(release,'node_modules'));
   { mkdirSync(path.join(release,'node_modules/closed-dependency'),{recursive:true});writeFileSync(path.join(release,'node_modules/closed-dependency/package.json'),'{}'); }

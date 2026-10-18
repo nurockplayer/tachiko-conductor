@@ -1,3 +1,4 @@
+import { awaitGateEntry, releaseAndSettle, traceCut } from './stage10-diagnostics.js';
 import assert from 'node:assert/strict';
 import { installedFixture } from './production-host-fixture.js';
 import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
@@ -1331,7 +1332,8 @@ describe('runWorkflow', { concurrency: false }, () => {
         };
         const operation = runWorkflow({ store, github: githubAdapter([HEAD]), implementation, reviewer: new FakeReviewer([]) }, run.id,
           { maxReviewAttempts: 2, now: () => T0 });
-        await ready;
+        try {
+        await awaitGateEntry(ready,operation,`worker/${phase}`);
         const winner = applyTransition(store.read(run.id)!, {
           type: 'escalate', reason: 'Concurrent cancellation after worker preparation',
           interrupt: { evidence: 'operator cancellation', choices: ['Cancel the run'] },
@@ -1342,6 +1344,7 @@ describe('runWorkflow', { concurrency: false }, () => {
         assert.equal(result.outcome, 'needs_human');
         assert.deepEqual(store.read(run.id), winner, 'the newer Run remains byte-for-byte authoritative');
         assert.equal(entered, 0, 'the final synchronous boundary refuses provider entry after the CAS loses');
+        } finally { await releaseAndSettle(allowBoundary,operation); }
       });
     }
   });
@@ -1484,7 +1487,8 @@ describe('runWorkflow', { concurrency: false }, () => {
     };
     const operation = runWorkflow({ store, github: githubAdapter([HEAD]), implementation, reviewer: new FakeReviewer([]) }, run.id,
       { maxReviewAttempts: 1, now: () => T0 });
-    await ready;
+    try {
+    await awaitGateEntry(ready,operation,`missing-worker-cas`);
     const handoff = store.read(run.id)!;
     allowBoundary();
     await assert.rejects(operation, (error) => {
@@ -1497,6 +1501,7 @@ describe('runWorkflow', { concurrency: false }, () => {
     });
     assert.deepEqual(store.read(run.id), handoff, 'missing CAS cannot rewrite the persisted handoff');
     assert.equal(entered, 0, 'missing strict CAS fails closed before provider entry');
+    } finally { await releaseAndSettle(allowBoundary,operation); }
   });
 
   it('keeps thrown Run-store authority errors tagged and primary when refusal reconciliation also fails', async () => {
@@ -1992,7 +1997,8 @@ describe('runWorkflow', { concurrency: false }, () => {
       run.id,
       { maxReviewAttempts: 1, now: () => T0 },
     );
-    await readEntered;
+    try {
+    await awaitGateEntry(readEntered,pending,`final-gate-live-read`);
     const concurrent = store.read(run.id)!;
     store.update(applyTransition(concurrent, { type: 'escalate', reason: 'operator cancellation won during live read' }, T0));
     finish(snapshot(HEAD));
@@ -2001,6 +2007,7 @@ describe('runWorkflow', { concurrency: false }, () => {
     assert.equal(outcome.run.state, 'NEEDS_HUMAN');
     assert.equal(store.read(run.id)?.state, 'NEEDS_HUMAN');
     assert.equal(store.read(run.id)?.history.some((entry) => entry.type === 'final_gate_verified'), false);
+    } finally { await releaseAndSettle(()=>finish(snapshot(HEAD)),pending); }
   });
 
   it('does not proceed to a worker when the Run changes during awaited bootstrap planning', async () => {
@@ -2024,7 +2031,8 @@ describe('runWorkflow', { concurrency: false }, () => {
       run.id,
       { maxReviewAttempts: 1, now: () => T0 },
     );
-    await planEntered;
+    try {
+    await awaitGateEntry(planEntered,pending,`bootstrap-plan`);
     const concurrent = store.read(run.id)!;
     store.update(applyTransition(concurrent, { type: 'escalate', reason: 'operator cancellation won during plan' }, T0));
     finish();
@@ -2034,6 +2042,7 @@ describe('runWorkflow', { concurrency: false }, () => {
     assert.equal(store.read(run.id)?.state, 'NEEDS_HUMAN');
     assert.equal(store.read(run.id)?.bootstrap, undefined);
     assert.equal(implementation.requests.length, 0);
+    } finally { await releaseAndSettle(finish,pending); }
   });
 
   it('does not proceed to a worker when the Run changes during awaited bootstrap preparation', async () => {
@@ -2057,7 +2066,8 @@ describe('runWorkflow', { concurrency: false }, () => {
       run.id,
       { maxReviewAttempts: 1, now: () => T0 },
     );
-    await prepareEntered;
+    try {
+    await awaitGateEntry(prepareEntered,pending,`bootstrap-prepare`);
     const concurrent = store.read(run.id)!;
     store.update(applyTransition(concurrent, { type: 'escalate', reason: 'operator cancellation won during prepare' }, T0));
     finish();
@@ -2066,6 +2076,7 @@ describe('runWorkflow', { concurrency: false }, () => {
     assert.equal(outcome.run.state, 'NEEDS_HUMAN');
     assert.equal(store.read(run.id)?.state, 'NEEDS_HUMAN');
     assert.equal(implementation.requests.length, 0);
+    } finally { await releaseAndSettle(finish,pending); }
   });
 
   it('does not record recovered durable output when the Run changes during awaited recovery verification', async () => {
@@ -2095,7 +2106,8 @@ describe('runWorkflow', { concurrency: false }, () => {
       run.id,
       { maxReviewAttempts: 1, now: () => T0 },
     );
-    await verifyEntered;
+    try {
+    await awaitGateEntry(verifyEntered,pending,`durable-verification`);
     const concurrent = store.read(run.id)!;
     store.update(applyTransition(concurrent, { type: 'escalate', reason: 'operator cancellation won during recovery' }, T0));
     finish();
@@ -2104,6 +2116,7 @@ describe('runWorkflow', { concurrency: false }, () => {
     assert.equal(outcome.run.state, 'NEEDS_HUMAN');
     assert.equal(store.read(run.id)?.headSha, undefined);
     assert.equal(implementation.requests.length, 0);
+    } finally { await releaseAndSettle(finish,pending); }
   });
 
   it('rechecks the exact durable Run immediately before standalone publication', async () => {
@@ -3562,14 +3575,14 @@ describe('runWorkflow', { concurrency: false }, () => {
 
 describe('captured production normal effect fence',()=>{
   for(const cut of ['initial-worker','resumed-worker','publication','validation'] as const)it(`removes initiation after awaited ${cut} preparation at the actual workflow callback`,async()=>{
-    const f=await installedFixture();try{const captured=f.resolve();const store=new MemoryStore();let run=createRun(TARGET,T0,`production-final-${cut}`);if(cut==='resumed-worker')run=applyTransition(run,{type:'start'},T0);if(cut==='validation'){run=applyTransition(run,{type:'start'},T0);run=applyTransition(run,{type:'agent_succeeded',agentResult:successResult(HEAD),headSha:HEAD,pullRequest:{number:7,headSha:HEAD}},T0);}store.create(run);let effects=0;const revoke=async()=>{await Promise.resolve();f.enable(false);};const implementation:ImplementationAgent={kind:'implementation-agent',async run(request){if(cut==='initial-worker'||cut==='resumed-worker'){await revoke();request.beforeExecution?.();effects++;}return successResult(HEAD);}};const bootstrap=new class extends FakeBootstrap{override async verifyDurable(request:VerifyDurableRequest){if(cut==='publication'){await revoke();request.beforePublish?.();effects++;}return{headSha:request.expectedHeadSha,branch:this.identity.branch};}}();const validation:ValidationAdapter={kind:'validation',configRevision:'test-config-v1',async validate(request){await revoke();request.beforeExecution?.();effects++;return validationPassed(request.headSha).local;}};const outcome=await runWorkflow({store,github:githubAdapter(cut==='publication'?[null,null,HEAD]:[HEAD]),implementation,reviewer:new FakeReviewer([]),...(cut==='publication'?{bootstrap}:{}),...(cut==='validation'?{validation,hostedCheckPolicy:TEST_HOSTED_POLICY}:{}),assertNormalInitiation:()=>captured.assertInitiation()},run.id,{maxReviewAttempts:1,now:()=>T0});assert.equal(effects,0);assert.equal(outcome.outcome,'needs_human');assert.throws(captured.assertInitiation,/latched/);}finally{f.cleanup();}
+    traceCut('normal-effect',cut,'entered');const f=await installedFixture();try{const captured=f.resolve();const store=new MemoryStore();let run=createRun(TARGET,T0,`production-final-${cut}`);if(cut==='resumed-worker')run=applyTransition(run,{type:'start'},T0);if(cut==='validation'){run=applyTransition(run,{type:'start'},T0);run=applyTransition(run,{type:'agent_succeeded',agentResult:successResult(HEAD),headSha:HEAD,pullRequest:{number:7,headSha:HEAD}},T0);}store.create(run);let effects=0;const revoke=async()=>{await Promise.resolve();f.enable(false);};const implementation:ImplementationAgent={kind:'implementation-agent',async run(request){if(cut==='initial-worker'||cut==='resumed-worker'){await revoke();request.beforeExecution?.();effects++;}return successResult(HEAD);}};const bootstrap=new class extends FakeBootstrap{override async verifyDurable(request:VerifyDurableRequest){if(cut==='publication'){await revoke();request.beforePublish?.();effects++;}return{headSha:request.expectedHeadSha,branch:this.identity.branch};}}();const validation:ValidationAdapter={kind:'validation',configRevision:'test-config-v1',async validate(request){await revoke();request.beforeExecution?.();effects++;return validationPassed(request.headSha).local;}};const outcome=await runWorkflow({store,github:githubAdapter(cut==='publication'?[null,null,HEAD]:[HEAD]),implementation,reviewer:new FakeReviewer([]),...(cut==='publication'?{bootstrap}:{}),...(cut==='validation'?{validation,hostedCheckPolicy:TEST_HOSTED_POLICY}:{}),assertNormalInitiation:()=>captured.assertInitiation()},run.id,{maxReviewAttempts:1,now:()=>T0});assert.equal(effects,0);assert.equal(outcome.outcome,'needs_human');assert.throws(captured.assertInitiation,/latched/);}finally{f.cleanup();}
   });
 });
 
 
 describe('captured production repair bootstrap fence',()=>{
   for(const route of ['promotion','resume'] as const)for(const cut of ['plan-mutation','post-plan-persistence','prepare-mutation'] as const)it(`removes initiation at actual repair ${route} ${cut} after awaited authority`,async()=>{
-    const f=await installedFixture();
+    traceCut('repair-effect',`${route}/${cut}`,'entered');const f=await installedFixture();
     try {
       const captured=f.resolve();const store=new MemoryStore();
       const execution:ResolvedExecutionConfiguration={profile:'routine',revision:'luna-v1',executor:'luna-isolated',model:'gpt-5.6-luna',timeoutMs:60000};
@@ -3596,7 +3609,7 @@ describe('captured production repair bootstrap fence',()=>{
 
 describe('initial planning before physical workspace admission',()=>{
   for(const scenario of ['explicit-workspace','planned-workspace','conflicting-plan','tagged-strengthening','prepare-revocation','prepare-after-mkdir-revocation','plan-owner-revocation','plan-normal-revocation','plan-newer-run'] as const)it(`keeps phase-appropriate initial admission and final fences at ${scenario}`,async()=>{
-    const root=mkdtempSync(path.join(os.tmpdir(),'tachiko-planning-phase-'));
+    traceCut('initial-planning',scenario,'entered');const root=mkdtempSync(path.join(os.tmpdir(),'tachiko-planning-phase-'));
     let releaseGate:()=>void=()=>{};let pending:Promise<Awaited<ReturnType<typeof runWorkflow>>>|undefined;
     try {
       const runId=`planning-${scenario}`;const workspace=path.join(root,'workspace');const store=new MemoryStore();store.create(createRun(TARGET,T0,runId));
@@ -3617,7 +3630,7 @@ describe('initial planning before physical workspace admission',()=>{
       if(scenario==='tagged-strengthening'){await assert.rejects(invoke(),error=>error===primary);assert.equal(strengthening,1);assert.equal(prepareCalls,0);assert.equal(registry.readLane(runId)?.evidence.workspace,undefined);return;}
       pending=invoke();
       if(scenario==='prepare-revocation'||scenario==='prepare-after-mkdir-revocation'){
-        const reached=await Promise.race([entered.then(()=>true),pending.then(()=>false)]);assert.equal(reached,true,'The intended preparation gate must be reached rather than an early parked result');
+        await awaitGateEntry(entered,pending,`initial-planning/${scenario}`);
         registry.release(admitted.token,true);releaseGate();
       }
       const result=await pending;

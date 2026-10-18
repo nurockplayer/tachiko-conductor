@@ -1,4 +1,6 @@
 import path from 'node:path';
+import { lstatSync, realpathSync } from 'node:fs';
+import { assertSafeAccountOwnedPath } from '../account-home.js';
 import {
   PRODUCTION_EXECUTION_PROFILE_CONFIG,
   PRODUCTION_HOSTED_CHECK_POLICY_CONFIG,
@@ -43,6 +45,16 @@ export function renderDispatchLaunchdPlist(options: DispatchLaunchdOptions): str
   if (!/^[A-Za-z0-9][A-Za-z0-9.-]*$/.test(label)) throw new Error('launchd label contains unsupported characters.');
   const program = absolute(options.program, 'launchd program');
   if (!/\/\.tachiko-conductor\/releases\/[A-Za-z0-9][A-Za-z0-9._-]{0,79}\/scripts\/dispatch-driver\.sh$/.test(program) || path.normalize(program) !== program) throw new Error('launchd driver must select one fixed accepted-release distribution.');
+  const release = path.dirname(path.dirname(program));
+  const releasesDirectory = path.dirname(release);
+  const accountRoot = path.dirname(releasesDirectory);
+  const home = path.dirname(accountRoot);
+  if (path.basename(release) === 'current' || realpathSync.native(program) !== program) throw new Error('launchd driver must use a physical fixed accepted-release path without aliases.');
+  for (const file of [program, path.join(release, 'dist/production-entry.js'), path.join(release, 'accepted-release.json')]) {
+    assertSafeAccountOwnedPath(home, file, 'file');
+    const info = lstatSync(file);
+    if (!info.isFile() || info.nlink !== 1 || file === program && (info.mode & 0o100) === 0) throw new Error('launchd accepted-release files must be regular, unaliased and executable where required.');
+  }
   const nodeProgram = absolute(options.nodeProgram, 'launchd node program');
   const pnpmProgram = absolute(options.pnpmProgram, 'launchd pnpm program');
   const gitProgram = absolute(options.gitProgram, 'launchd git program');
@@ -50,11 +62,23 @@ export function renderDispatchLaunchdPlist(options: DispatchLaunchdOptions): str
   const lunaCodexHome = absolute(options.lunaCodexHome, 'launchd Luna CODEX_HOME');
   const playwrightBrowsersPath = absolute(options.playwrightBrowsersPath, 'launchd Playwright browser artifact path');
   const workingDirectory = absolute(options.workingDirectory, 'launchd working directory');
-  const releasesDirectory = path.dirname(path.dirname(path.dirname(program)));
+  if (workingDirectory !== release || realpathSync.native(workingDirectory) !== release) throw new Error('launchd working directory must be the selected physical accepted release.');
+  assertSafeAccountOwnedPath(home, workingDirectory, 'directory');
   const logDirectory = path.join(path.dirname(releasesDirectory), 'dispatch');
   const logPath = (value: string, name: string) => {
     const file = absolute(value, name);
-    const relative = path.relative(releasesDirectory, path.normalize(file));
+    if (path.normalize(file) !== file) throw new Error('launchd log paths must use canonical physical spelling.');
+    const parent = path.dirname(file);
+    if (realpathSync.native(parent) !== parent) throw new Error('launchd log paths must use canonical physical spelling without aliases.');
+    let existing = file;
+    try { const info=lstatSync(file); if(!info.isFile() || info.isSymbolicLink() || info.nlink!==1 || (info.mode&0o7022)!==0 || info.uid!==process.getuid?.()) throw new Error('Unsafe launchd log file.'); }
+    catch(error) { if((error as NodeJS.ErrnoException).code!=='ENOENT')throw error; existing=parent; }
+    for(let current=existing===parent?parent:path.dirname(existing);;current=path.dirname(current)) {
+      const info=lstatSync(current);const mode=info.mode&0o7777;const stickyRoot=info.uid===0&&(mode&0o1000)!==0;
+      if(!info.isDirectory() || info.isSymbolicLink() || info.uid!==0&&info.uid!==process.getuid?.() || (mode&0o022)!==0&&!stickyRoot || (mode&0o6000)!==0)throw new Error('Unsafe launchd log ancestry.');
+      if(current===path.dirname(current))break;
+    }
+    const relative = path.relative(releasesDirectory, file);
     if (relative === '' || relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative)) throw new Error('launchd logs must be outside immutable accepted-release distributions.');
     return file;
   };

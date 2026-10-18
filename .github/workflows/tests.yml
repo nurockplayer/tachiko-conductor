@@ -45,6 +45,9 @@ jobs:
       - name: Install lockfile Playwright Chromium and system dependencies
         run: pnpm exec playwright install --with-deps chromium
 
+      - name: Diagnose Stage10 installed lifecycle and deferred gates
+        run: timeout --signal=TERM --kill-after=5s 890s pnpm test:stage10-diagnostic
+
       - name: Run unit and contract tests
         run: pnpm test
 

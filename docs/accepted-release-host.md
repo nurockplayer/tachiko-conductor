@@ -172,15 +172,16 @@ restore old Run/claim/owner JSON or use restart/lease expiry as stopped proof.
 availability, v7 policy checks and HOLD without model calls or GitHub mutation.
 Its exit is 78 unless an accepted installation, held state and existing v7 preflight
 all pass. Its report explicitly does not establish real binding/native acceptance.
-`scripts/issue-104-deploy.sh preflight` (or `held-check`) invokes that same entry.
+`<accepted-release>/scripts/issue-104-deploy.sh preflight` (or `held-check`) invokes that same entry through its absolute physical path.
 The helper refuses `restart`; it does not install, accept, kickstart launchd, copy
 secrets or release HOLD. Failed verification preserves current state and artifacts.
 The launchd renderer defaults stdout/stderr to the account's `.tachiko-conductor/dispatch/`
 directory and rejects explicit log paths inside `releases/`, including normalized traversal.
-It renders the explicitly supplied working directory. The held helper inherits its caller's
-working directory and output streams; it creates no logs. The entry derives authority from
-the accepted artifact, while Git/gh use the pinned object-root cwd regardless of caller cwd.
-Host acceptance must also ensure configured log paths do not physically alias a release.
+It requires the selected physical release as WorkingDirectory. The held helper also changes
+to its physical release and inherits only its caller's output streams; it creates no logs.
+The entry derives authority from the accepted artifact, while Git/gh use the pinned object-root
+cwd. Rendering checks physical log aliases and ancestry; host confinement must preserve those
+objects after rendering.
 
 Protected filesystem/process confinement and the actual qualified launcher remain
 the root of trust. An unrestricted malicious process with the host owner's write
@@ -204,3 +205,7 @@ Accepted Codex and pnpm runtime directories must be physically disjoint in both 
 Tests provision only their newly created private account tree with private directory/file permissions before accepting either transpiled or TypeScript-compiled artifacts. They never change shared runner/tool/source permissions. Successful controlled JSONL plus exact accepted Git HEAD output is a process-selection proof without a real model; actual compiled-child entry, real Git lifecycle and normal CI are separate checks. No personal Mac executor is connected or qualified in this session; the user's machine existence is unknown.
 
 A first bootstrap plan may precede physical workspace admission. The planning fence checks the exact captured Run, current lane ownership token, and captured production configuration. The existing explicit/planned workspace-strengthening protocol then establishes workspace authority before full mutation admission. Actual prepare, worker and publication boundaries retain their full workspace/current-owner/Run checks; a workspace-less initial lane is not itself physical mutation authority.
+
+The launchd renderer requires an existing physical accepted release (driver, compiled entry and record), rejects lexical/symlink aliases including `current`, and requires WorkingDirectory to equal that selected physical release. The driver and held helper likewise reject alias spellings and explicitly change to their physical release before invoking the compiled entry. Log parents must already exist with safe physical ancestry; existing log files must be regular, account-owned, unaliased and not writable by others. Both explicit and default logs remain outside immutable releases. These are rendering/startup checks under the existing protected-host assumption, not an executed macOS supervisor/reboot or unrestricted same-owner compromise guarantee.
+
+`pnpm test:stage10-diagnostic` is an additional fixed focused selection using the existing Node/tsx route and built-in TAP reporter. The existing Ubuntu Tests workflow bounds it below fifteen minutes before retaining all unchanged ordinary unit/browser/typecheck/root/Tower commands. Case/cut traces contain only literal labels, counters and booleans. A diagnostic checkpoint or partial result is not normal-tier acceptance. Deferred gate tests race both early workflow outcomes and release/await settlement in finally before cleanup.

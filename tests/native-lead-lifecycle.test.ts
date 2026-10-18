@@ -1,3 +1,4 @@
+import { traceCut } from './stage10-diagnostics.js';
 import { ExecutionAdmissionRefusal } from '../src/adapters/agent.js';
 import assert from 'node:assert/strict';
 import { chmodSync, existsSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
@@ -335,6 +336,7 @@ describe('bounded native lead through real persistence / dispatch / isolated rep
     }
   });
   it('starts no writer on a losing start_fix CAS and consumes that incarnation once after a fresh current owner admission', async () => {
+    traceCut('native-lead-losing-start-fix-cas','fixture','entered');
     const f = fixture();
     try {
       const durable = f.store();
@@ -342,16 +344,20 @@ describe('bounded native lead through real persistence / dispatch / isolated rep
       let lost = false;
       durable.updateIfUnchanged = (a, b) => {
         if (!lost && b.history.at(-1)?.type === 'start_fix' && a.history.at(-1)?.type !== 'start_fix') {
-          lost = true;
+          lost = true;traceCut('native-lead-losing-start-fix-cas','CAS','completed',{lost:true});
           return false;
         }
         return original(a, b);
       };
+      traceCut('native-lead-losing-start-fix-cas','first-poll','entered');
       await f.poll(f.lead, durable);
+      traceCut('native-lead-losing-start-fix-cas','first-poll','completed',{lost,boundaries:f.counts().boundaries,repairAdmissions:f.run().repairAdmissions?.length??0});
       assert.equal(f.run().repairAdmissions, undefined);
       assert.equal(f.counts().boundaries, 0);
       f.tick();
+      traceCut('native-lead-losing-start-fix-cas','fresh-owner-poll','entered');
       await f.poll();
+      traceCut('native-lead-losing-start-fix-cas','fresh-owner-poll','completed',{repairAdmissions:f.run().repairAdmissions?.length??0,leadCalls:f.counts().leadCalls});
       assert.equal(f.run().repairAdmissions?.length, 1);
       assert.equal(f.counts().leadCalls, 1);
     }
