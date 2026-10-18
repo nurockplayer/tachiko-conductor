@@ -1999,7 +1999,10 @@ export function buildWorkflowDeps(
     reviewer: resolveNativeReviewer(nativeReviewerHost),
     nativeLead: resolveNativeLead(nativeLeadHost),
     nativeMergeHost: resolveNativeMergeHost(nativeMergeHost),
-    assertNormalInitiation:production===undefined?undefined:(run)=>{production.assertRunInitiation(run);assertOperationalExecutionAdmission(production.runsDirectory);},
+    assertNormalInitiation:production===undefined?undefined:(run)=>{
+      try { production.assertRunInitiation(run);assertOperationalExecutionAdmission(production.runsDirectory); }
+      catch(error){if(error instanceof ExecutionAdmissionRefusal)throw error;throw new ExecutionAdmissionRefusal(error instanceof Error?error.message:'Production execution authority unavailable.',false,{cause:error});}
+    },
     bootstrap: lazyBootstrap,
     bootstrapForExecution: (execution) => {
       if (execution?.executor !== LUNA_ISOLATED_PROVIDER) return lazyBootstrap;

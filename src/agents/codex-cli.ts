@@ -308,7 +308,8 @@ export class CodexCliAdapter implements ImplementationAgent {
       const result = await this.headReadRunner.run(this.gitExecutable, ['rev-parse', 'HEAD'], this.processOptions(signal, cwd));
       const sha = result.stdout.trim();
       return result.exitCode === 0 && FULL_SHA.test(sha) ? sha : null;
-    } catch {
+    } catch (error) {
+      if (isExecutionAdmissionRefusal(error)) throw error;
       return null;
     }
   }

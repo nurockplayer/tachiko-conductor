@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { execFileSync, spawnSync } from 'node:child_process';
+import childProcess, { execFileSync, spawnSync } from 'node:child_process';
 import fs, { cpSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { syncBuiltinESMExports } from 'node:module';
@@ -91,9 +91,10 @@ async function commandFixture(imported?: ImportedHistory) {
 
 
 /** Actual installed direct admission with real private Git and a no-model concrete Luna. */
-async function directExecutionFixture() {
+async function directExecutionFixture(options:{productionWorker?:boolean;commitWorker?:boolean}={}) {
   const jsonl=[{type:'thread.started',thread_id:'direct-hold-proof'},{type:'turn.started'},{type:'item.completed',item:{id:'message',type:'agent_message',text:'Controlled execution completed without a model'}},{type:'turn.completed'}].map(v=>JSON.stringify(v)).join('\n');
-  const codexRuntime="const fs=require('node:fs'),path=require('node:path');const counter=path.resolve(__dirname,'../../controlled-worker-count');fs.writeFileSync(counter,String(Number(fs.existsSync(counter)?fs.readFileSync(counter,'utf8'):'0')+1));process.stdout.write("+JSON.stringify(jsonl)+");\n";
+  const commit=options.commitWorker?"fs.writeFileSync('controlled-worker.txt','controlled no-model commit\\n');require('node:child_process').execFileSync('git',['add','controlled-worker.txt']);require('node:child_process').execFileSync('git',['-c','user.name=Controlled fixture','-c','user.email=fixture@example.invalid','commit','--quiet','-m','controlled worker commit']);":"";
+  const codexRuntime="const fs=require('node:fs'),path=require('node:path');const counter=path.resolve(__dirname,'../../controlled-worker-count');fs.writeFileSync(counter,String(Number(fs.existsSync(counter)?fs.readFileSync(counter,'utf8'):'0')+1));"+commit+"process.stdout.write("+JSON.stringify(jsonl)+");\n";
   const f=await installedFixture(true,false,{}, {lunaHome:true,codexRuntime});
   try {
     const git=(cwd:string,args:readonly string[])=>execFileSync(f.record.git.path,['-c','user.name=Controlled fixture','-c','user.email=fixture@example.invalid',...args],{cwd,encoding:'utf8',stdio:['ignore','pipe','pipe']}).trim();
@@ -125,7 +126,7 @@ async function directExecutionFixture() {
     const {IsolatedLunaAdapter,hasGovernedPublicationConfinement}=await import(new URL('./agents/luna-isolated.js',f.entryUrl).href) as typeof import('../src/agents/luna-isolated.js');
     // The internal implementation seam selects an actual concrete, original
     // process transport, not a fake qualification flag or replacement runner.
-    const implementation=new IsolatedLunaAdapter({codexHome:snapshot.environment.TACHIKO_LUNA_CODEX_HOME!,timeoutMs:900000,path:snapshot.environment.PATH!,executable:f.record.codex.path,gitExecutable:f.record.git.path});
+    const implementation=new IsolatedLunaAdapter({codexHome:snapshot.environment.TACHIKO_LUNA_CODEX_HOME!,timeoutMs:900000,path:snapshot.environment.PATH!,executable:f.record.codex.path,gitExecutable:f.record.git.path,...(options.productionWorker?{production:f.resolve()}:{} )});
     assert.equal(hasGovernedPublicationConfinement(implementation),true);
     const {JsonFileStore:InstalledStore}=await import(new URL('./store/json-file-store.js',f.entryUrl).href) as typeof import('../src/store/json-file-store.js');
     const runtime=await import(new URL('./operational/runtime-projection.js',f.entryUrl).href) as typeof import('../src/operational/runtime-projection.js');
@@ -294,6 +295,59 @@ describe('fixed production entry through real parser and canonical dispatcher',(
     });
   });
 
+
+  it('preserves typed worker and selected HEAD refusals through genuinely claimed installed execution',async(t)=>{
+    for(const cut of ['positive','worker-entry','worker-spawn','head-entry','head-spawn'] as const)for(const drift of (cut==='positive'?['descriptor']:['descriptor','artifact']) as ('descriptor'|'artifact')[])await t.test(cut+'-'+drift,async()=>{
+      const headCut=cut.startsWith('head'),f=await directExecutionFixture({productionWorker:true,commitWorker:headCut});
+      const originalRead=fs.readFileSync,originalExec=childProcess.execFile;
+      let tripped=false,headEntered=false,workerChildren=0,headChildren=0;
+      try{
+        f.runtime.setMaintenanceHold(f.snapshot.runsDirectory,false,T0);
+        fs.readFileSync=((file:fs.PathOrFileDescriptor,...args:unknown[])=>{
+          if(String(file)===f.recordPath){
+            const stack=new Error().stack??'',inHead=stack.includes('assertHead'),inWorker=stack.includes('assertWorkerAccess'),atSpawn=stack.includes('createChild');
+            if(inHead)headEntered=true;
+            const selected=headCut?inHead:inWorker;
+            if(cut!=='positive'&&!tripped&&selected&&(cut.endsWith('spawn')?atSpawn:!atSpawn)){
+              tripped=true;
+              if(drift==='descriptor')f.enable(false);
+              else writeFileSync(path.join(f.record.codex.runtimeDirectory,'runtime.cjs'),'revoked controlled runtime bytes');
+            }
+          }
+          return Reflect.apply(originalRead,fs,[file,...args]);
+        }) as typeof fs.readFileSync;
+        // A transparent observer delegates the original child boundary and
+        // records only controlled command categories; it grants no authority.
+        childProcess.execFile=((...args:unknown[])=>{
+          if(args[0]===f.record.codex.path)workerChildren++;
+          const argv=args[1] as readonly string[]|undefined;
+          if(headEntered&&args[0]===f.record.git.path&&argv?.slice(-2).join('/')==='rev-parse/HEAD')headChildren++;
+          return Reflect.apply(originalExec,childProcess,args);
+        }) as typeof childProcess.execFile;syncBuiltinESMExports();
+        const code=await f.invoke(['dispatch','once'],true);f.facts('typed-'+cut+'-'+drift);
+        const run=f.store().list()[0]!;
+        assert.ok(run.dispatchClaimId);assert.equal(f.claim()!.claimId,run.dispatchClaimId);
+        assert.equal(run.state,'NEEDS_HUMAN');assert.equal(run.interruptedFrom,'IMPLEMENTING');
+        assert.equal(run.history.some(h=>h.type==='agent_failed'),false,'An admission refusal is not a provider failure');
+        if(cut==='positive'){
+          assert.equal(code,0);assert.equal(tripped,false);assert.equal(workerChildren,1);assert.equal(f.workers(),1);
+          assert.ok(headEntered);assert.equal(headChildren,1);assert.match(run.interrupt!.reason,/Worker result did not advance the authorized HEAD/);
+        }else{
+          assert.equal(tripped,true,'The selected concrete authority cut must execute');
+          assert.match(run.interrupt!.reason,/Implementation execution was refused at the current host admission boundary/);
+          assert.equal(run.agentResult,undefined,'Refusal cannot manufacture provider completion');
+          assert.equal(workerChildren,headCut?1:0);assert.equal(f.workers(),headCut?1:0);assert.equal(headChildren,0);
+          if(headCut){
+            const workspace=run.bootstrap!.workspacePath;
+            assert.equal(existsSync(path.join(workspace,'controlled-worker.txt')),true);
+            assert.equal(execFileSync(f.record.git.path,['log','-1','--format=%s'],{cwd:workspace,encoding:'utf8'}).trim(),'controlled worker commit');
+            assert.notEqual(execFileSync(f.record.git.path,['rev-parse','HEAD'],{cwd:workspace,encoding:'utf8'}).trim(),run.bootstrap!.baseSha,'Actual successful worker commit remains in its private workspace');
+          }
+        }
+      }finally{fs.readFileSync=originalRead;childProcess.execFile=originalExec;syncBuiltinESMExports();f.cleanup();}
+    });
+  });
+
   it('reports installed actor binding as not probed without an authentication or user request',async()=>{
     const f=await installedFixture(true);const original=console.log;const output:string[]=[];console.log=(v?:unknown)=>output.push(String(v));let calls=0;
     try{const runner:ProcessRunner={async run(){calls++;throw new Error('Preflight must not probe authentication');}};const snapshot=f.resolve(runner);assert.equal(snapshot.installation,'accepted',snapshot.reason);assert.equal(snapshot.actorBinding.state,'not_probed');assert.equal(snapshot.actorBinding.expectedActorId,'123');assert.equal('GH_TOKEN' in snapshot.environment,false);await f.invoke(['production','preflight'],{runner});const report=JSON.parse(output.at(-1)!);assert.equal(report.host.actorBinding.state,'not_probed');assert.equal(report.host.actorBinding.expectedActorId,'123');assert.match(report.host.mergeAvailabilityMeaning,/not probed/);assert.equal(calls,0);}finally{console.log=original;f.cleanup();}
@@ -406,6 +460,46 @@ describe('fixed production entry through real parser and canonical dispatcher',(
       }finally{f.cleanup();traceCut('production-entry',cut,'finished');}
     });
   });
+
+  it('refuses malformed or unreadable final merge HOLD at capture, actor and PUT cuts without resubmission',async(t)=>{
+    for(const cut of ['positive','capture','actor','put'] as const)for(const failure of (cut==='positive'?['malformed']:['malformed','unreadable']) as ('malformed'|'unreadable')[])await t.test(cut+'-'+failure,async()=>{
+      const f=await commandFixture();const originalRead=fs.readFileSync;let invalidated=false;
+      const projection=operationalRuntimeProjectionPath(path.join(f.accountRoot,'runs'));
+      try{
+        await f.review();const projectionBytes=originalRead(projection);
+        const ownerPath=resolveRunOwnerReceiptPath('acme/widgets',f.runId),owner=readRunOwnerReceipt(ownerPath)!;
+        const invalidate=()=>{invalidated=true;if(failure==='malformed')writeFileSync(projection,'{invalid-runtime-projection');};
+        if(cut==='capture')f.setProcessHook(endpoint=>{if(endpoint==='auth-token')invalidate();});
+        if(cut==='actor')f.afterActor(invalidate);if(cut==='put')f.beforePut(invalidate);
+        fs.readFileSync=((file:fs.PathOrFileDescriptor,...args:unknown[])=>{
+          if(invalidated&&failure==='unreadable'&&String(file)===projection)throw Object.assign(new Error('Controlled projection unavailable'),{code:'EACCES'});
+          return Reflect.apply(originalRead,fs,[file,...args]);
+        }) as typeof fs.readFileSync;syncBuiltinESMExports();
+        let printed:string[]=[];try{printed=(await f.invoke(['dispatch','once'])).printed;}catch(error){assert.match(String(error),/runtime projection|actor binding|merge authority/i);}
+        const current=f.store().read(f.runId)!;
+        if(cut==='positive'){
+          assert.equal(invalidated,false);assert.equal(f.stats().squashes,1);assert.equal(f.stats().captures,1);assert.equal(current.state,'MERGED');
+        }else{
+          assert.equal(invalidated,true);assert.equal(f.stats().squashes,0);assert.equal(f.stats().boundPuts,0);assert.equal(f.stats().captures,1);
+          assert.equal(current.mergeAttempt?.submissionPossible,true,'Late refusal retains the monotonic possible-submission marker');
+          assert.match(current.mergeAttempt!.reason!,/Merge actor binding unavailable/);
+          const retained=readRunOwnerReceipt(ownerPath)!;for(const key of ['missionId','laneId','runId','claimId'] as const)assert.equal(retained[key],owner[key]);
+          assert.equal(f.store().list().length,1);
+          const safe=JSON.stringify({printed,reason:current.mergeAttempt!.reason});
+          for(const token of ['synthetic-private-actor-A','synthetic-private-actor-B'])assert.equal(safe.includes(token),false);
+          // Restore only the controlled projection fault, then use the original
+          // issued observation path under HOLD with current merge disabled.
+          fs.readFileSync=originalRead;syncBuiltinESMExports();invalidated=false;writeFileSync(projection,projectionBytes);
+          await f.invoke(['dispatch','maintenance','hold']);f.enable(false);f.tick();const before=f.stats();
+          await f.invoke(['dispatch','once'],false);
+          assert.equal(f.stats().captures,before.captures);assert.equal(f.stats().boundPuts,0);assert.equal(f.stats().squashes,0);
+          assert.equal(f.store().read(f.runId)!.mergeAttempt!.submissionPossible,true);
+          assert.equal(readOperationalRuntimeProjection(path.join(f.accountRoot,'runs'))!.maintenanceHold.active,true);
+        }
+      }finally{fs.readFileSync=originalRead;syncBuiltinESMExports();f.cleanup();}
+    });
+  });
+
   it('reports sanitized merge-binding refusal through actual entry and stores without resubmission',async()=>{
     const sentinel='synthetic-secret-sentinel';
     for(const cut of ['unsupported','empty','multiline','throw','malformed-actor','mismatch','capture-drift','actor-drift','put-drift'] as const){traceCut('production-entry',cut,'entered');const f=await commandFixture();try{await f.review();if(cut==='unsupported')f.setCaptureFailure({exitCode:1,stdout:sentinel,stderr:sentinel});if(cut==='empty')f.setCaptureFailure({exitCode:0,stdout:'',stderr:''});if(cut==='multiline')f.setCaptureFailure({exitCode:0,stdout:sentinel+'\nextra\n',stderr:''});if(cut==='throw')f.setCaptureFailure(Object.assign(new Error(sentinel),{stdout:sentinel,stderr:sentinel}));if(cut==='malformed-actor')f.setActorResponse({id:sentinel});if(cut==='mismatch')f.setActor('999');if(cut==='capture-drift')f.setProcessHook(endpoint=>{if(endpoint==='auth-token')f.enable(false);});if(cut==='actor-drift')f.afterActor(()=>f.enable(false));if(cut==='put-drift')f.beforePut(()=>f.enable(false));

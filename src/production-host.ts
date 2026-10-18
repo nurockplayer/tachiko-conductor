@@ -3,7 +3,8 @@ import { lstatSync, readFileSync, readdirSync, realpathSync } from 'node:fs';
 import path from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import type { Run } from './domain/types.js';
-import { readOperationalRuntimeProjection } from './operational/runtime-projection.js';
+import { readOperationalRuntimeProjectionState } from './operational/runtime-projection.js';
+import { ExecutionAdmissionRefusal, isExecutionAdmissionRefusal } from './adapters/agent.js';
 import type { NativeCompletionHosts } from './oracle/completion-proof.js';
 import { JsonFileOracleReceiptStore } from './oracle/receipt-store.js';
 import { fileURLToPath } from 'node:url';
@@ -316,17 +317,45 @@ export function resolveProductionHost(entryUrl: string, runner: ProcessRunner = 
     const hostEnv: NodeJS.ProcessEnv = Object.freeze({ HOME: home, PATH: workerPath, LANG:'C', LC_ALL:'C', GH_CONFIG_DIR:r.github.configDirectory, GH_HOST:'github.com', GH_PROMPT_DISABLED:'1', GIT_CONFIG_NOSYSTEM:'1', GIT_CONFIG_GLOBAL:'/dev/null', GIT_CONFIG_COUNT:'0', GIT_TERMINAL_PROMPT:'0', GIT_NO_REPLACE_OBJECTS:'1' });
     const environment = Object.freeze({ ...hostEnv, ...r.environment, ...(dispatchRaw === undefined ? {} : { TACHIKO_DISPATCH_CONFIG: dispatchRaw }) });
     // Validate dispatch only on the ordinary CLI route. Malformed/absent current config must not suppress issued readback.
-    const gitRunner: ProcessRunner = Object.freeze({ run: async (_file: string, args: readonly string[], options: ProcessRunOptions) => { assertInstallation(); return runner.run(r.git.path, ['-c','core.hooksPath=/dev/null','-c','core.fsmonitor=false','-c','core.attributesFile=/dev/null','-c','core.useReplaceRefs=false',...args], { ...options, env:hostEnv, beforeSpawn: () => { assertInstallation(); options.beforeSpawn?.(); } }); } });
+    const workerAuthority = (operation: () => void) => {
+      try { operation(); } catch (error) {
+        if (isExecutionAdmissionRefusal(error)) throw error;
+        throw new ExecutionAdmissionRefusal(error instanceof Error ? error.message : 'Production worker authority unavailable.', false, { cause: error });
+      }
+    };
+    // Shared fixed Git argv/environment, with the caller's distinct authority
+    // check at both nested entry and the last synchronous spawn cut.
+    const runAcceptedGit = (args: readonly string[], options: ProcessRunOptions, assertAccess: () => void) => {
+      assertAccess();
+      return runner.run(r.git.path, ['-c','core.hooksPath=/dev/null','-c','core.fsmonitor=false','-c','core.attributesFile=/dev/null','-c','core.useReplaceRefs=false',...args], { ...options, env:hostEnv, beforeSpawn: () => { assertAccess(); options.beforeSpawn?.(); } });
+    };
+    const gitRunner: ProcessRunner = Object.freeze({ run: async (_file: string, args: readonly string[], options: ProcessRunOptions) => runAcceptedGit(args, options, assertInstallation) });
     const sourceOwnedRunner=Object.getPrototypeOf(runner)===NodeProcessRunner.prototype&&!Object.hasOwn(runner,'run')&&NodeProcessRunner.prototype.run===originalNodeRun;
-    const workerRunner:ProcessRunner=Object.freeze({run:async(file:string,args:readonly string[],options:ProcessRunOptions)=>{assertInitiation();if(sourceOwnedRunner&&(Object.getPrototypeOf(runner)!==NodeProcessRunner.prototype||Object.hasOwn(runner,'run')||NodeProcessRunner.prototype.run!==originalNodeRun))throw new Error('Accepted worker process transport changed.');if(file!==r.codex.path)throw new Error('Worker executable differs from accepted Codex.');return runner.run(file,args,{...options,beforeSpawn:()=>{assertInitiation();options.beforeSpawn?.();}});}});
-    // This is deliberately narrower than the observation-safe shared Git runner.
-    const workerHeadReadRunner:ProcessRunner=Object.freeze({run:async(file:string,args:readonly string[],options:ProcessRunOptions)=>{
+    const assertWorkerAccess=(file:string)=>workerAuthority(()=>{
       assertInitiation();
-      if(sourceOwnedRunner&&(Object.getPrototypeOf(runner)!==NodeProcessRunner.prototype||Object.hasOwn(runner,'run')||NodeProcessRunner.prototype.run!==originalNodeRun))throw new Error('Accepted worker HEAD-read transport changed.');
-      if(file!==r.git.path||args.length!==2||args[0]!=='rev-parse'||args[1]!=='HEAD')throw new Error('Worker HEAD read differs from the accepted exact Git command.');
-      return gitRunner.run(file,args,{...options,beforeSpawn:()=>{assertInitiation();options.beforeSpawn?.();}});
+      if(sourceOwnedRunner&&(Object.getPrototypeOf(runner)!==NodeProcessRunner.prototype||Object.hasOwn(runner,'run')||NodeProcessRunner.prototype.run!==originalNodeRun))throw new Error('Accepted worker process transport changed.');
+      if(file!==r.codex.path)throw new Error('Worker executable differs from accepted Codex.');
+    });
+    const workerRunner:ProcessRunner=Object.freeze({run:async(file:string,args:readonly string[],options:ProcessRunOptions)=>{
+      assertWorkerAccess(file);
+      return runner.run(file,args,{...options,beforeSpawn:()=>workerAuthority(()=>{assertWorkerAccess(file);options.beforeSpawn?.();})});
     }});
-    const transport = new GhCliTransport({ runner, executable:r.gh.path, hostname:'github.com', acceptedActorId:r.github.actorId, cwd:r.repository.objectRoot, env:hostEnv, beforeSpawn:assertInstallation, beforeMerge:()=>{assertInitiation();if(readOperationalRuntimeProjection(runsDirectory)?.maintenanceHold.active)throw new Error('Maintenance HOLD prevents merge initiation.');}, repository:{owner:r.repository.owner,repo:r.repository.repo} });
+    // HEAD reads are execution completion, unlike observation-safe shared Git.
+    const workerHeadReadRunner:ProcessRunner=Object.freeze({run:async(file:string,args:readonly string[],options:ProcessRunOptions)=>{
+      const assertHead=()=>workerAuthority(()=>{
+        assertInitiation();
+        if(sourceOwnedRunner&&(Object.getPrototypeOf(runner)!==NodeProcessRunner.prototype||Object.hasOwn(runner,'run')||NodeProcessRunner.prototype.run!==originalNodeRun))throw new Error('Accepted worker HEAD-read transport changed.');
+        if(file!==r.git.path||args.length!==2||args[0]!=='rev-parse'||args[1]!=='HEAD')throw new Error('Worker HEAD read differs from the accepted exact Git command.');
+      });
+      assertHead();
+      return runAcceptedGit(args,{...options,beforeSpawn:()=>workerAuthority(()=>{assertHead();options.beforeSpawn?.();})},assertHead);
+    }});
+    const transport = new GhCliTransport({ runner, executable:r.gh.path, hostname:'github.com', acceptedActorId:r.github.actorId, cwd:r.repository.objectRoot, env:hostEnv, beforeSpawn:assertInstallation, beforeMerge:()=>{
+      assertInitiation();
+      const hold=readOperationalRuntimeProjectionState(runsDirectory);
+      if(hold.status==='invalid')throw new Error('Operational runtime projection is unreadable or malformed; merge initiation is unavailable.');
+      if(hold.status==='valid'&&hold.projection.maintenanceHold.active)throw new Error('Maintenance HOLD prevents merge initiation.');
+    }, repository:{owner:r.repository.owner,repo:r.repository.repo} });
     const snapshot: ProductionHostSnapshot = Object.freeze({ installation:'accepted', reason, actorBinding:Object.freeze({mechanism:'gh-auth-token-per-merge-v1' as const,configured:nativeMergeHost!==undefined,state:'not_probed' as const,expectedActorId:r.github.actorId,reason:'Source-wired per-merge binding only; live credential and actor not probed or qualified.'}), artifactVerification:'initial-sha256/current-stat-inventory-v1' as const, releaseId:r.releaseId, manifestDigest:r.manifestDigest, repositoryRoot:r.repository.objectRoot, codexExecutable:r.codex.path, gitExecutable:r.git.path, workerHeadReadRunner, workerRunner, workerTransportSourceOwned:sourceOwnedRunner, runsDirectory, initiationPolicy, environment, nativeMergeHost, transport, gitRunner, historicalCompletionHosts, historicalVerification,
       reviewer:Object.freeze({available:false as const,reason:'Oracle service contract unavailable.'}), lead:Object.freeze({available:false as const,reason:'Sol service contract unavailable.'}), assertInstallation, assertInitiation, assertRunInitiation,
       assertRecoveryScope: (owner: string, repo: string) => { assertInstallation(); if (owner !== r.repository.owner || repo !== r.repository.repo) throw new Error('Issued recovery scope differs from the compatible accepted installation.'); },
