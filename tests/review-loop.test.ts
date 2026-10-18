@@ -1203,8 +1203,10 @@ describe('runReviewLoop', () => {
       const store = new CasMemoryStore();
       store.create(expected);
       const originalCas = store.updateIfUnchanged.bind(store);
-      let reconciliationMode: 'available' | 'missing' | 'throws' | 'second-throws' | 'third-throws' = 'available';
+      let reconciliationMode: 'available' | 'missing' | 'throws' | 'reconcile-read-throws' | 'reconcile-write-throws' = 'available';
       let reconciliationCalls = 0;
+      let reconciliationArmed = false;
+      let ownerRefusal: unknown;
       let configCurrent = true;
       const primaryCause = new Error('original final repair admission cause');
       const primaryRefusal = new ExecutionAdmissionRefusal('original final repair admission refusal', false, {
@@ -1216,8 +1218,13 @@ describe('runReviewLoop', () => {
           ? undefined
           : (prior: Run, next: Run) => {
               if (reconciliationMode === 'throws') throw new Error('strict repair Run CAS unavailable');
-              if (reconciliationMode === 'second-throws' && ++reconciliationCalls === 2) throw new Error('repair refusal reconciliation CAS failed');
-              if (reconciliationMode === 'third-throws' && ++reconciliationCalls === 3) throw new Error('repair refusal reconciliation write failed');
+              // Arm only after the real owner check refuses. Earlier exact-Run
+              // checks must never be mistaken for refusal reconciliation.
+              if (reconciliationArmed) {
+                reconciliationCalls += 1;
+                if (reconciliationMode === 'reconcile-read-throws' && prior === next) throw new Error('repair refusal reconciliation CAS failed');
+                if (reconciliationMode === 'reconcile-write-throws' && prior !== next) throw new Error('repair refusal reconciliation write failed');
+              }
               return originalCas(prior, next);
             },
       });
@@ -1276,7 +1283,14 @@ describe('runReviewLoop', () => {
             store.update(newerRun);
           }
         },
-        assertCurrentPlanning: () => registry.assertCurrentOwner(admitted.token),
+        assertCurrentPlanning: () => {
+          try { registry.assertCurrentOwner(admitted.token); }
+          catch (error) {
+            ownerRefusal = error;
+            reconciliationArmed = true;
+            throw error;
+          }
+        },
         assertNormalInitiation: () => { if (!configCurrent) throw new Error('Captured production configuration changed'); },
         assertCurrentMutation: () => registry.assertCanMutate(admitted.token),
       }, id, { maxAttempts: 2, now: () => T0 });
@@ -1299,7 +1313,7 @@ describe('runReviewLoop', () => {
       } else if (boundary === 'repair-plan-cas-throws') {
         reconciliationMode = 'throws';
       } else if (boundary === 'repair-plan-reconciliation-cas-throws' || boundary === 'repair-plan-reconciliation-write-throws') {
-        reconciliationMode = boundary.endsWith('write-throws') ? 'third-throws' : 'second-throws';
+        reconciliationMode = boundary.endsWith('write-throws') ? 'reconcile-write-throws' : 'reconcile-read-throws';
         reconciliationCalls = 0;
         registry.release(admitted.token, true);
       } else if (boundary === 'repair-prepare-tagged-admission-callback') {
@@ -1326,6 +1340,10 @@ describe('runReviewLoop', () => {
             assert.match(String((error as Error).cause), /strict repair Run CAS unavailable|Strict Run compare-and-swap/);
           } else {
             assert.equal((error as { authorityUnknown?: boolean }).authorityUnknown, false);
+            assert.ok(ownerRefusal, 'the real owner read rejected before reconciliation was armed');
+            assert.strictEqual((error as Error).cause, ownerRefusal, 'reconciliation failure preserves the exact original owner-refusal cause');
+            assert.equal(reconciliationCalls, boundary.endsWith('write-throws') ? 2 : 1,
+              'only the intended reconciliation self-CAS or changed parking write reaches the fault');
             assert.match(String((error as Error).cause), /Admission generation token is stale/);
           }
           return true;

@@ -2602,6 +2602,33 @@ export interface CliNativeDependencies {
   readonly nativeLeadHost?: NativeLeadHost;
   readonly nativeMergeHost?: NativeMergeHost;
 }
+/** Read-only shared CLI calculation. Tests may control only the existing policy probes. */
+export function productionPreflightReport(
+  commandEnvironment: NodeJS.ProcessEnv,
+  production?: ProductionHostSnapshot,
+  policyProbe: typeof preflightProductionPolicy = preflightProductionPolicy,
+) {
+  let policy: unknown; let policyReady = false;
+  try { policy = policyProbe(commandEnvironment); policyReady = true; }
+  catch (error) { policy = { unavailable: error instanceof Error ? error.message : String(error) }; }
+  let initiation: { available: boolean; reason: string };
+  try {
+    if (production?.installation !== 'accepted' || !isProductionHostSnapshot(production)) throw new Error('Use a compatible fixed accepted-release entry.');
+    production.assertInitiation();
+    initiation = { available: true, reason: 'Captured production initiation authority is current.' };
+  } catch (error) {
+    initiation = { available: false, reason: error instanceof Error ? error.message : String(error) };
+  }
+  // Policy probes and the host fence may block. This typed HOLD observation
+  // must be last; it is not a guarantee that a future operator will retain HOLD.
+  const holdState = readOperationalRuntimeProjectionState(resolveRunsDir(commandEnvironment));
+  const hold = holdState.status === 'valid' && holdState.projection.maintenanceHold.active;
+  const holdStatus = holdState.status === 'valid' ? hold ? 'active' : 'inactive' : holdState.status;
+  const host = production === undefined ? { installation:'unavailable', reason:'Use the fixed accepted-release entry.' } : { installation:production.installation, reason:production.reason, releaseId:production.releaseId, manifestDigest:production.manifestDigest, artifactVerification:production.artifactVerification, initiationPolicy:production.initiationPolicy, repositoryRoot:production.repositoryRoot, runsDirectory:production.runsDirectory, mergeAvailable:production.nativeMergeHost !== undefined, mergeAvailabilityMeaning:'configured/source-wired only; live actor not probed', actorBinding:production.actorBinding, reviewer:production.reviewer, lead:production.lead, historicalVerification:production.historicalVerification };
+  const ok = policyReady && initiation.available && hold;
+  return { code: ok ? 0 : 78, report: { ok, hold, holdStatus, preflight: policy, initiation, host, bindingQualification: 'external proof required; preflight is not native acceptance' } };
+}
+
 export async function main(argv: string[], native: CliNativeDependencies = {}): Promise<number> {
   const production = native.production;
   if (production !== undefined && !isProductionHostSnapshot(production)) throw new Error('Unvalidated production composition.');
@@ -3066,13 +3093,9 @@ export async function main(argv: string[], native: CliNativeDependencies = {}): 
       console.error(USAGE);
       return 1;
     }
-    const hold = readOperationalRuntimeProjection(resolveRunsDir(commandEnvironment))?.maintenanceHold.active === true;
-    let policy: unknown; let policyReady = false;
-    try { policy = preflightProductionPolicy(commandEnvironment); policyReady = true; } catch (error) { policy = { unavailable: error instanceof Error ? error.message : String(error) }; }
-    const host = production === undefined ? { installation:'unavailable', reason:'Use the fixed accepted-release entry.' } : { installation:production.installation, reason:production.reason, releaseId:production.releaseId, manifestDigest:production.manifestDigest, artifactVerification:production.artifactVerification, initiationPolicy:production.initiationPolicy, repositoryRoot:production.repositoryRoot, runsDirectory:production.runsDirectory, mergeAvailable:production.nativeMergeHost !== undefined, mergeAvailabilityMeaning:'configured/source-wired only; live actor not probed', actorBinding:production.actorBinding, reviewer:production.reviewer, lead:production.lead, historicalVerification:production.historicalVerification };
-    const ok = policyReady && hold && production?.installation === 'accepted';
-    console.log(JSON.stringify({ ok, hold, preflight:policy, host, bindingQualification:'external proof required; preflight is not native acceptance' }, null, 2));
-    return ok ? 0 : 78;
+    const result = productionPreflightReport(commandEnvironment, production);
+    console.log(JSON.stringify(result.report, null, 2));
+    return result.code;
   }
 
   if (command === 'wait') {

@@ -11,12 +11,14 @@ GitHub actor qualification, Oracle/Sol service contract, launchd/reboot proof,
 runtime activation, or native delivery. V1 remains unaccepted, with 0/3 native
 deliveries. #101 remains empty/HOLD and #115 unloaded/HOLD. Held PR93 remains held.
 
-The temporary H1/H2 author-validation checkpoint uses the retained diagnostic
-script on existing Ubuntu CI with fixed affected files/titles, builtin immediate
-TAP, child timeout 880 seconds and outer 890-second timeout plus 5-second kill
-grace. It is not normal acceptance. Remove only that temporary workflow step
-after affected proof; all ordinary test/browser/type/build commands and the
-30-minute job budget remain unchanged.
+The current H1/H2/I1 author-validation checkpoint first runs the existing
+typecheck, then the retained diagnostic script on Ubuntu CI with fixed affected
+files/titles and builtin immediate TAP. Both commands share the existing outer
+890-second timeout plus 5-second kill grace; the diagnostic child retains its
+880-second limit and can be stopped earlier by the shared outer deadline. This
+is not normal acceptance. After affected proof, remove only that temporary
+workflow step for the final ordinary candidate. All ordinary test/browser/type/
+build commands and the 30-minute job budget remain unchanged.
 
 ## Fixed local layout
 
@@ -204,8 +206,13 @@ restore old Run/claim/owner JSON or use restart/lease expiry as stopped proof.
 
 `production preflight` prints installation/artifact/root identities, binding
 availability, v7 policy checks and HOLD without model calls or GitHub mutation.
-Its exit is 78 unless an accepted installation, held state and existing v7 preflight
-all pass. Its report explicitly does not establish real binding/native acceptance.
+After policy probes it checks the captured current initiation fence, then reads
+typed HOLD last. Exit is 78 for unavailable initiation, descriptor/artifact drift,
+or inactive/missing/invalid HOLD. The report includes that final HOLD status and
+the initiation refusal reason. A healthy accepted routine policy with active HOLD
+and a valid DISABLED merge descriptor may succeed; enabled merge, available model
+roles and live actor qualification are not prerequisites. This read-only result
+does not promise future atomic HOLD persistence or establish native acceptance.
 `<accepted-release>/scripts/issue-104-deploy.sh preflight` (or `held-check`) invokes that same entry through its absolute physical path.
 The helper refuses `restart`; it does not install, accept, kickstart launchd, copy
 secrets or release HOLD. Failed verification preserves current state and artifacts.
@@ -242,8 +249,8 @@ A first bootstrap plan may precede physical workspace admission. The planning fe
 
 The launchd renderer requires an existing physical accepted release (driver, compiled entry and record), rejects lexical/symlink aliases including `current`, and requires WorkingDirectory to equal that selected physical release. The driver and held helper likewise reject alias spellings and explicitly change to their physical release before invoking the compiled entry. Log parents must already exist with safe physical ancestry; existing log files must be regular, account-owned, unaliased and not writable by others. Both explicit and default logs remain outside immutable releases. These are rendering/startup checks under the existing protected-host assumption, not an executed macOS supervisor/reboot or unrestricted same-owner compromise guarantee.
 
-`pnpm test:stage10-diagnostic` is an additional fixed focused selection using the existing Node/tsx route and built-in TAP reporter. The utility retains its finite bound, but the final ordinary Ubuntu Tests workflow no longer runs the temporary focused step; every full ordinary unit/browser/typecheck/root/Tower command remains. Case/cut traces contain only literal labels, counters and booleans. A diagnostic checkpoint or partial result is not normal-tier acceptance. Deferred gate tests race both early workflow outcomes and release/await settlement in finally before cleanup.
+`pnpm test:stage10-diagnostic` is an additional fixed focused selection using the existing Node/tsx route and built-in TAP reporter. The current author-validation workflow includes the temporary focused step and shared typecheck bound described above. The final ordinary candidate must remove only that step; every full ordinary unit/browser/typecheck/root/Tower command remains. Case/cut traces contain only literal labels, counters and booleans. A diagnostic checkpoint or partial result is not normal-tier acceptance. Deferred gate tests race both early workflow outcomes and release/await settlement in finally before cleanup.
 
 The actual accepted runtime uses the existing supported Node predicate (`>=24.21.0 <25`) while its executable path and bytes remain exactly accepted. Simulated process.version tests exercise this boundary; a different actual binary still requires a different accepted identity. Accepted actor IDs must already be canonical positive safe-integer decimal strings before merge authority or configured preflight status is exposed; this local validation performs no actor/auth probe.
 
-The retained diagnostic utility selects only the fixed affected installed-entry E1–E4 controls after the earlier full focused run reached its finite timeout. It preserves the real original task via the adapter's canonical REST/conversation/handoff parser before admission; imported immutable history and authenticators are never rewritten. Diagnostic observations remain separate from every ordinary test/build gate.
+The retained diagnostic utility currently selects production-host.test.ts and review-loop.test.ts with twelve fixed H1/H2/I1 title alternatives: accepted worker tools/representation and held-preflight authority, promoted repair planning/reconciliation, and affected deferred-gate lifecycle. Earlier E1–E4 installed-entry selection and its timeout are historical evidence; those full installed-entry cases remain in the unchanged ordinary suite. Their original-task parsing, imported immutable history and original authenticators are never rewritten. Diagnostic observations remain separate from every ordinary test/build gate.

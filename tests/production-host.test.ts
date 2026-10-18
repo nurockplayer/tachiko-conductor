@@ -67,6 +67,70 @@ describe('accepted-release fixed host resolver', () => {
 });
 
 describe('accepted production tool closure and placement',()=>{
+  it('requires current initiation and the last typed HOLD for a policy-positive disabled-merge preflight',async(t)=>{
+    const cuts=['positive','unavailable-initiation','descriptor-probe','artifact-probe','release-probe','missing-probe','malformed-probe','release-fence','missing-fence','malformed-fence'] as const;
+    for(const cut of cuts) await t.test(cut,async()=>{
+      const f=await installedFixture(true,false,{}, {lunaHome:true,...(cut==='unavailable-initiation'?{workerAlias:'missing' as const}:{})});
+      const originalRead=fs.readFileSync;let requests=0;
+      try{
+        f.enable(false);
+        const dependencies=f.record.environment.TACHIKO_PNPM_DEPENDENCY_ARTIFACT!;
+        mkdirSync(path.join(dependencies,'store'),{recursive:true,mode:0o700});writeFileSync(path.join(dependencies,'pnpm-lock.yaml.sha256'),'0'.repeat(64),{mode:0o600});
+        mkdirSync(f.record.environment.TACHIKO_PLAYWRIGHT_BROWSERS_PATH!,{recursive:true,mode:0o700});
+        const runtime=await import(new URL('./operational/runtime-projection.js',f.entryUrl).href) as typeof import('../src/operational/runtime-projection.js');
+        const policy=await import(new URL('./production-policy.js',f.entryUrl).href) as typeof import('../src/production-policy.js');
+        const cli=await import(new URL('./cli.js',f.entryUrl).href) as typeof import('../src/cli.js');
+        const s=f.resolve({async run(){requests++;throw new Error('Preflight must not invoke auth, provider, model or GitHub transport');}});
+        assert.equal(s.installation,'accepted',s.reason);
+        runtime.setMaintenanceHold(s.runsDirectory,true,'2026-10-18T00:00:00.000Z');
+        let nodeProbes=0,gitProbes=0;
+        const probe=(afterGit?:()=>void)=>(env:NodeJS.ProcessEnv)=>policy.preflightProductionPolicy(env,(program)=>{
+          gitProbes++;assert.equal(program,f.record.git.path);afterGit?.();return true;
+        },(program)=>{nodeProbes++;assert.equal(program,f.record.node.path);return true;});
+        const baseline=cli.productionPreflightReport(s.environment,s,probe());
+        assert.deepEqual(baseline.report.preflight,{revision:'issue-104-production-v7',lunaCodexHome:s.environment.TACHIKO_LUNA_CODEX_HOME,checks:['execution-profile','luna-home','playwright-browsers','dependency-artifact','local-validation','hosted-check-policy']});assert.equal(nodeProbes,1);assert.equal(gitProbes,1);
+        assert.ok('mergeAvailable' in baseline.report.host);assert.equal(baseline.report.host.mergeAvailable,false,'A valid DISABLED descriptor is supported');
+        assert.ok('actorBinding' in baseline.report.host);assert.ok(baseline.report.host.actorBinding);assert.ok(baseline.report.host.reviewer);assert.ok(baseline.report.host.lead);assert.equal(baseline.report.host.actorBinding.state,'not_probed');assert.equal(baseline.report.host.reviewer.available,false);assert.equal(baseline.report.host.lead.available,false);
+        if(cut==='unavailable-initiation'){
+          assert.equal(baseline.code,78);assert.equal(baseline.report.initiation.available,false);assert.match(baseline.report.initiation.reason,/policy unavailable/);s.assertInstallation();s.assertRecoveryScope('acme','widgets');
+        }else{
+          assert.equal(baseline.code,0,JSON.stringify(baseline.report));assert.equal(baseline.report.holdStatus,'active');assert.equal(baseline.report.initiation.available,true);
+        }
+        const holdFile=runtime.operationalRuntimeProjectionPath(s.runsDirectory);
+        const change=()=>{
+          if(cut==='descriptor-probe')f.enable();
+          if(cut==='artifact-probe')writeFileSync(path.join(f.release,'node_modules/closed-dependency/package.json'),'[]');
+          if(cut.startsWith('release-'))runtime.setMaintenanceHold(s.runsDirectory,false,'2026-10-18T00:00:01.000Z');
+          if(cut.startsWith('missing-'))unlinkSync(holdFile);
+          if(cut.startsWith('malformed-'))writeFileSync(holdFile,'{malformed');
+        };
+        let fenceCuts=0;
+        if(cut.endsWith('-fence')){
+          Object.defineProperty(fs,'readFileSync',{value:(...args:unknown[])=>{
+            const value=Reflect.apply(originalRead,fs,args);
+            if(args[0]===f.dispatchPath){fenceCuts++;change();}
+            return value;
+          }});syncBuiltinESMExports();
+        }
+        const result=cli.productionPreflightReport(s.environment,s,probe(cut.endsWith('-probe')?change:undefined));
+        assert.equal(nodeProbes,2);assert.equal(gitProbes,2);assert.equal(requests,0);
+        if(cut==='positive')assert.equal(result.code,0);
+        else assert.equal(result.code,78,JSON.stringify(result.report));
+        if(cut.endsWith('-fence'))assert.equal(fenceCuts,1,'The change occurs at the actual final descriptor read in the host fence');
+        if(cut==='descriptor-probe'||cut==='artifact-probe'){
+          assert.equal(result.report.initiation.available,false);assert.match(result.report.initiation.reason,/changed/);assert.equal(result.report.holdStatus,'active');
+        }else if(cut.startsWith('release-')||cut.startsWith('missing-')||cut.startsWith('malformed-')){
+          assert.equal(result.report.initiation.available,true);assert.equal(result.report.hold,false);
+          assert.equal(result.report.holdStatus,cut.startsWith('release-')?'inactive':cut.startsWith('missing-')?'missing':'invalid');
+        }
+        if(cut==='positive'||cut==='unavailable-initiation'){
+          assert.equal(result.report.hold,true);assert.equal(result.report.holdStatus,'active');
+        }
+        assert.equal(result.report.bindingQualification,'external proof required; preflight is not native acceptance');
+      }finally{Object.defineProperty(fs,'readFileSync',{value:originalRead});syncBuiltinESMExports();f.cleanup();}
+    });
+  });
+
   it('validates supported worker shebang and PATH representations',async()=>{
     const node='/protected/node', git='/protected/git/bin/git', bin='/accepted/release/worker-bin';
     assert.equal(workerCommandPath(node,git,bin),bin+':/protected:/protected/git/bin:/usr/bin:/bin');

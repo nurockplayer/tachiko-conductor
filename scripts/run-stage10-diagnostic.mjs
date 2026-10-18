@@ -5,10 +5,11 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { tsxInvocation } from './test-tier.mjs';
 const root=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'..');
-// Cause-directed H1/H2 checkpoint; no unchanged broad diagnostic rerun.
+// Cause-directed H1/H2/I1 checkpoint; no unchanged broad diagnostic rerun.
 // Ordinary tier discovery and commands remain untouched.
 const selected=['production-host.test.ts','review-loop.test.ts'];
 const patterns=[
+  'requires current initiation and the last typed HOLD for a policy-positive disabled-merge preflight',
   'validates supported worker shebang and PATH representations',
   'keeps issued observation available when a valid installation lacks the supported worker launcher',
   'executes exact accepted bare pnpm in the isolated worker ahead of candidate and ambient shadows',
