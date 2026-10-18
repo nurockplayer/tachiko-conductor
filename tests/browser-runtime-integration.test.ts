@@ -188,11 +188,13 @@ describe('managed Playwright MCP integration', () => {
     let second: BrowserRuntimeHandle | undefined;
     const contract = pinnedShutdownContract();
     const lifecycle: { profileDir: string | null; signals: string[]; stdinEnded: boolean; exited: boolean; exitCode: number | null; exitSignal: string | null }[] = [];
+    const selectedCli = path.join(path.dirname(createRequire(import.meta.url).resolve('@playwright/mcp')), 'cli.js');
     const originalSpawn = childProcess.spawn;
     childProcess.spawn = ((...args: Parameters<typeof originalSpawn>) => {
       const argv = Array.isArray(args[1]) ? args[1] : [];
       const child = originalSpawn(...args);
-      if (typeof argv[0] === 'string' && argv[0].startsWith('--title=tachiko-browser-runtime-')) {
+      if (args[0] === process.execPath && argv[0] === '--no-global-search-paths' &&
+          typeof argv[1] === 'string' && argv[1].startsWith('--title=tachiko-browser-runtime-') && argv[2] === selectedCli) {
         const profileIndex = argv.indexOf('--user-data-dir');
         const record = { profileDir: typeof argv[profileIndex + 1] === 'string' ? argv[profileIndex + 1] as string : null,
           signals: [] as string[], stdinEnded: false, exited: false, exitCode: null as number | null, exitSignal: null as string | null };
